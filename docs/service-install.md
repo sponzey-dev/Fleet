@@ -227,7 +227,8 @@ Stable/beta channel policy:
 - Automatic downgrade is not supported; restore the previous binary and backup
   manually when rollback is required.
 
-Package formats not yet implemented and owning phase:
+Package formats not yet implemented (EXT-005/EXT-006 in the
+[current plan](../.docs/plans/plan.md#p-08); Phase numbers below are historical):
 
 - `.deb`: Phase 9, with systemd unit render test and signature/version pinning.
 - `.rpm`: Phase 9, with systemd unit render test and signature/version pinning.

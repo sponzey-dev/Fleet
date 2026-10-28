@@ -235,7 +235,8 @@ The `file.template` primitive uses the same file write path after rendering:
   explicit fixture source supplied by local/test code rather than environment or
   request state,
 - agent runbook execution passes the selected provider as an explicit resolver
-  closure to the runner. The runner does not discover providers itself,
+  closure to the runner. Current runtime entrypoints select DisabledSecretProvider;
+  static-provider tests exercise the helper only. The runner does not discover providers itself,
 - `fleet apply` validates runbook structure and primitive planning only. It
   does not resolve `secretRefs`, read provider configuration, or prove that a
   secret-backed template can execute in a running agent context,
@@ -251,6 +252,15 @@ The `file.template` primitive uses the same file write path after rendering:
   file only; artifact metadata is still reported, but artifact `content_bytes`
   are omitted for secret-backed templates so raw rendered secrets are not sent
   to controller artifact body storage by default.
+
+The next confirmed integration is [OpenBao KV v2](../.docs/domains/security/features/SEC-002-openbao-kv-v2.md)
+with Agent-side AppRole authentication. It is not available yet. Its plan includes sensitive
+plan/file protection and durable body-free metadata reporting before actual provider execution;
+body omission alone is not full secret-handling or replay safety.
+The confirmed next-scope policy does not log in to OpenBao for signed dryRun/checkMode or local
+`fleet apply`. Skipped secret templates will use symbolic planning. Actual execution will require
+successful preparation-token revocation before file application; uncertain revocation is preparation
+failure with no host mutation. This remains planned and does not change current runtime behavior.
 
 Example:
 

@@ -9,38 +9,59 @@ use axum::{
     response::{IntoResponse, Response as AxumResponse},
     routing::get,
 };
+pub mod admin_crypto;
+mod admin_http;
+#[cfg(all(test, unix))]
+mod admin_http_tests;
+mod admin_identity_store;
+mod admin_job_write;
+#[cfg(test)]
+mod admin_kdf_bench;
+pub mod admin_password_worker;
+mod catalog_execution;
 pub mod catalog_fetch;
+#[cfg(all(test, unix))]
+mod controller_lease_tests;
+#[cfg(test)]
+mod dispatch_logging_tests;
+mod output_page;
+pub mod report_receipt;
+use fleet_application::assignment_recovery::{
+    DEFAULT_ASSIGNMENT_RECOVERY_GRACE, RecoverUncertainAssignments,
+    RecoverUncertainAssignmentsError, RecoverUncertainAssignmentsInput,
+    RecoverUncertainAssignmentsOutput,
+};
 use fleet_application::{
     ActivateCatalogRevision, ActivateCatalogRevisionInput, AdminTokenRepository,
     AgentInventoryRepository, AgentLogRepository, AuditWriter, AuthenticateAdminToken,
     CatalogDocumentRecord, CatalogQueryRepository, CatalogRepository, CommandJobRepository,
-    CreateCommandJob, CreateCommandJobError, CreateCommandJobInput, CreateDriftCheckJob,
-    CreateDriftCheckJobError, CreateDriftCheckJobInput, CreateEnrollmentToken,
-    CreateEnrollmentTokenInput, CreateRemediationVerificationJob,
-    CreateRemediationVerificationJobError, CreateRemediationVerificationJobInput, CreateRunbookJob,
-    CreateRunbookJobError, CreateRunbookJobInput, DispatchAssignmentRepository,
-    DispatchPendingAssignments, DispatchPendingAssignmentsInput, DispatchPendingAssignmentsOutput,
-    DriftRepository, EnrollmentTokenRepository, EnrollmentTokenUseCaseError, EnsureAdminToken,
-    ExpireApprovalRequests, ExpireApprovalsInput, ExportAuditEvents, FactsRepository,
+    CreateCommandJobError, CreateCommandJobInput, CreateDriftCheckJobError,
+    CreateDriftCheckJobInput, CreateEnrollmentToken, CreateEnrollmentTokenInput,
+    CreateRemediationVerificationJob, CreateRemediationVerificationJobError,
+    CreateRemediationVerificationJobInput, CreateRunbookJobError, CreateRunbookJobInput,
+    DispatchAssignmentRepository, DispatchPendingAssignments, DispatchPendingAssignmentsInput,
+    DispatchPendingAssignmentsOutput, DriftRepository, EnrollmentTokenRepository,
+    EnrollmentTokenUseCaseError, EnsureAdminToken, ExportAuditEvents, FactsRepository,
     GetCatalogDocumentDetail, GetInventoryAgent, GetJobSummary, GetLatestDrift, GetLatestFacts,
     GetLatestMetrics, JobDispatchGate, JobOutputChunk, JobOutputRepository, JobOutputStream,
     JobQueryRepository, JobRepository, ListAgentLogChunks, ListApprovalRequests, ListAuditEvents,
     ListCatalogDocuments, ListCatalogRevisions, ListCatalogSources, ListDriftReports,
     ListDueScheduledDrift, ListEnrollmentTokens, ListFactsSnapshots, ListInventoryAgents,
     ListJobOutputForJob, ListJobSummaries, ListMetricsSnapshots,
-    ListPendingRemediationVerificationRecovery, MAX_REMEDIATION_VERIFICATION_RECOVERY_BATCH,
-    MetricsRepository, PendingAssignmentDispatcher, PendingTaskAssignment,
-    PersistVerifiedDriftProposal, PersistVerifiedDriftProposalUseCaseInput,
+    ListPendingRemediationVerificationRecovery, ListPendingRemediationVerificationResolutions,
+    MAX_REMEDIATION_VERIFICATION_RECOVERY_BATCH, MetricsRepository, PendingAssignmentDispatcher,
+    PendingTaskAssignment, PersistVerifiedDriftProposal, PersistVerifiedDriftProposalUseCaseInput,
     PolicyRepository as AppPolicyRepository, PrepareRemediationExecutionTransition,
     PreviewSelector, RegisterCatalogSource, RegisterCatalogSourceInput,
-    RemediationApprovalRequestError, RemediationExecutionPersistenceInput,
-    RemediationExecutionTransition, RemediationJobResultStatus, RemediationRequestRecord,
-    RemediationRequestRepository, RemediationResultUseCaseError,
-    RemediationVerificationJobPersistenceInput, RemediationVerificationJobRepository,
-    RemediationVerificationJobSave, RemediationVerificationRecoveryRepository,
+    RemediationExecutionPersistenceInput, RemediationExecutionTransition,
+    RemediationJobResultStatus, RemediationRequestRecord, RemediationRequestRepository,
+    RemediationResultUseCaseError, RemediationVerificationJobPersistenceInput,
+    RemediationVerificationJobRepository, RemediationVerificationJobSave,
+    RemediationVerificationRecoveryRepository, RemediationVerificationResolutionCandidate,
+    RemediationVerificationResolutionRecoveryRepository,
     RemediationVerificationResolutionRepository, RequestAgentCertificateIssuance,
-    RequestAgentCertificateIssuanceInput, RequestRemediationApproval,
-    RequestRemediationApprovalInput, RequestSigningKeyRotation, RequestSigningKeyRotationInput,
+    RequestAgentCertificateIssuanceInput, RequestRemediationApprovalInput,
+    RequestSigningKeyRotation, RequestSigningKeyRotationInput,
     ResolveRemediationVerificationEvidence, ResolveRemediationVerificationEvidenceInput,
     RetireSigningKeyRotation, RetireSigningKeyRotationInput, RevokeAgentKey, RevokeAgentKeyError,
     RevokeAgentKeyInput, RevokeEnrollmentToken, RevokeEnrollmentTokenInput, RunDueScheduledDrift,
@@ -57,12 +78,11 @@ use fleet_application::{
     ActivateSigningKeyRotation, ActivateSigningKeyRotationInput,
     AgentCertificateLifecycleRepository, AgentCertificateLifecycleUseCaseError,
     ApprovalRepository as AppApprovalRepository, ApprovalRequestRecord as AppApprovalRequestRecord,
-    ApprovalUseCaseError, ApproveApprovalInput, ApproveApprovalRequest,
-    ApproveRemediationRunbookJob, ApproveRemediationRunbookJobError,
-    ApproveRemediationRunbookJobInput, ArtifactStore, ControllerSigningRotationStatus,
+    ApproveRemediationRunbookJobInput, ArtifactStore, ControllerDeliveryIdentity,
+    ControllerDeliveryIdentityRepository, ControllerSigningRotationStatus,
     ControllerSigningRotationStatusInput, ControllerSigningStagedRolloutRecord,
     ControllerSigningStagedRolloutRepository, FailSigningKeyRotation, FailSigningKeyRotationInput,
-    QueryControllerSigningRotationStatus, RejectApprovalInput, RejectApprovalRequest,
+    QueryControllerSigningRotationStatus,
 };
 use fleet_application::{AssignPolicyToAgent, AssignPolicyToAgentInput, RetentionPolicy};
 use fleet_application::{
@@ -74,6 +94,7 @@ use fleet_core::{
     ControllerTrustSettings, DatabaseBackend, DatabaseSettings, SecretProviderBackend,
     SecretProviderSettings,
 };
+use fleet_domain::admin_identity::{AdminPermission, AdminRole};
 use fleet_domain::{
     Agent, AgentCapability, AgentCapabilitySnapshot, AgentFingerprint, AgentId, AgentIdentity,
     AgentLabel, AgentName, AgentPublicKey, AgentRuntimeProfile, AgentStatus, ArtifactChecksum,
@@ -114,6 +135,12 @@ const ADMIN_INDEX_HTML: &str = include_str!("../../../web-admin/index.html");
 const ADMIN_STYLES_CSS: &str = include_str!("../../../web-admin/styles.css");
 const ADMIN_APP_JS: &str = include_str!("../../../web-admin/app.js");
 const ADMIN_API_CLIENT_JS: &str = include_str!("../../../web-admin/api-client.js");
+const ADMIN_ACCOUNTS_JS: &str = include_str!("../../../web-admin/admin-accounts.js");
+const ADMIN_JOB_OBSERVER_JS: &str = include_str!("../../../web-admin/job-observer.js");
+const ADMIN_JOB_OUTPUT_READER_JS: &str = include_str!("../../../web-admin/job-output-reader.js");
+const ADMIN_CATALOG_EXPLORER_JS: &str = include_str!("../../../web-admin/catalog-explorer.js");
+const ADMIN_CATALOG_ACTIONS_JS: &str = include_str!("../../../web-admin/catalog-actions.js");
+const ADMIN_CATALOG_JOB_JS: &str = include_str!("../../../web-admin/catalog-job.js");
 const ADMIN_API_SCHEMA_JSON: &str = include_str!("../../../web-admin/api.schema.json");
 const OPENAPI_JSON: &str = include_str!("../../../docs/openapi.json");
 const SWAGGER_UI_HTML: &str = include_str!("../../../docs/swagger-ui.html");
@@ -129,6 +156,10 @@ const SCHEDULED_DRIFT_WORKER_GRACE: Duration = Duration::from_secs(60);
 const SCHEDULED_DRIFT_WORKER_LIMIT: usize = 100;
 const SCHEDULED_DRIFT_JOB_TIMEOUT: Duration = Duration::from_secs(30);
 const SCHEDULED_DRIFT_JOB_EXPIRES_IN: Duration = Duration::from_secs(300);
+const ASSIGNMENT_RECOVERY_WORKER_INTERVAL: Duration = Duration::from_secs(30);
+const ASSIGNMENT_RECOVERY_BATCH_LIMIT: usize = 100;
+const PENDING_FINAL_RESULT_RECOVERY_WORKER_INTERVAL: Duration = Duration::from_secs(30);
+const PENDING_FINAL_RESULT_RECOVERY_BATCH_LIMIT: u32 = 100;
 const CONTROLLER_SIGNING_STAGED_ROLLOUT_WORKER_INTERVAL: Duration = Duration::from_secs(30);
 const RETENTION_WORKER_INTERVAL: Duration = Duration::from_secs(3_600);
 const DEFAULT_MAX_ARTIFACT_BODY_BYTES: usize = 1024 * 1024;
@@ -157,12 +188,211 @@ struct ControllerAppState {
     metadata: Arc<ControllerRuntimeMetadata>,
     sessions: Arc<Mutex<AgentSessionRegistry>>,
     catalog_sync_submitter: Option<CatalogSyncSubmitter>,
+    admin_auth: Option<Arc<admin_http::AdminHttpRuntime>>,
 }
 
 enum ControllerStore {
     Sqlite(SqliteStore),
     #[cfg(feature = "postgres")]
     Postgres(Box<std::cell::RefCell<PostgresStore>>),
+}
+
+impl fleet_application::delivery::ControllerInboxRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn stage_report(
+        &mut self,
+        report: &fleet_application::delivery::ControllerInboxReport,
+    ) -> Result<fleet_application::delivery::InboxStageOutcome, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::delivery::ControllerInboxRepository::stage_report(store, report)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Err(report_delivery_postgres_unsupported()),
+        }
+    }
+}
+
+impl fleet_application::delivery::ControllerInboxOutputRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn commit_output_effect(
+        &mut self,
+        effect: &fleet_application::delivery::ControllerInboxOutputEffect,
+    ) -> Result<fleet_application::delivery::InboxEffectOutcome, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::delivery::ControllerInboxOutputRepository::commit_output_effect(
+                    store, effect,
+                )
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Err(report_delivery_postgres_unsupported()),
+        }
+    }
+}
+
+impl fleet_application::delivery::ControllerInboxEvidenceRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn commit_evidence_effect(
+        &mut self,
+        effect: &fleet_application::delivery::ControllerInboxEvidenceEffect,
+    ) -> Result<fleet_application::delivery::InboxEffectOutcome, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::delivery::ControllerInboxEvidenceRepository::commit_evidence_effect(
+                    store, effect,
+                )
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Err(report_delivery_postgres_unsupported()),
+        }
+    }
+}
+
+impl fleet_application::delivery::ControllerInboxTaskAckRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn commit_task_ack_effect(
+        &mut self,
+        effect: &fleet_application::delivery::ControllerInboxTaskAckEffect,
+    ) -> Result<fleet_application::delivery::InboxEffectOutcome, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::delivery::ControllerInboxTaskAckRepository::commit_task_ack_effect(
+                    store, effect,
+                )
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Err(report_delivery_postgres_unsupported()),
+        }
+    }
+}
+
+impl fleet_application::delivery::ControllerInboxTaskStartedRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn commit_task_started_effect(
+        &mut self,
+        effect: &fleet_application::delivery::ControllerInboxTaskStartedEffect,
+    ) -> Result<fleet_application::delivery::InboxEffectOutcome, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::delivery::ControllerInboxTaskStartedRepository::commit_task_started_effect(
+                    store, effect,
+                )
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Err(report_delivery_postgres_unsupported()),
+        }
+    }
+}
+
+impl fleet_application::delivery::ControllerInboxTaskRejectedRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn commit_task_rejected_effect(
+        &mut self,
+        effect: &fleet_application::delivery::ControllerInboxTaskRejectedEffect,
+    ) -> Result<fleet_application::delivery::InboxEffectOutcome, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::delivery::ControllerInboxTaskRejectedRepository::commit_task_rejected_effect(
+                    store, effect,
+                )
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Err(report_delivery_postgres_unsupported()),
+        }
+    }
+}
+
+impl fleet_application::delivery::ControllerInboxFinalRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn commit_final_effect(
+        &mut self,
+        effect: &fleet_application::delivery::ControllerInboxFinalEffect,
+    ) -> Result<fleet_application::delivery::InboxEffectOutcome, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::delivery::ControllerInboxFinalRepository::commit_final_effect(
+                    store, effect,
+                )
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Err(report_delivery_postgres_unsupported()),
+        }
+    }
+}
+
+impl fleet_application::delivery::ControllerInboxFinalRecoveryRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn load_pending_final_reports(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<fleet_application::delivery::ControllerInboxReport>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::delivery::ControllerInboxFinalRecoveryRepository::load_pending_final_reports(
+                    store, limit,
+                )
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Err(report_delivery_postgres_unsupported()),
+        }
+    }
+}
+
+impl fleet_application::delivery::ControllerCommittedFinalReceiptRecoveryRepository
+    for ControllerStore
+{
+    type Error = fleet_store::StoreError;
+
+    fn load_committed_final_reports_missing_receipt(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<fleet_application::delivery::CommittedFinalReportMissingReceipt>, Self::Error>
+    {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::delivery::ControllerCommittedFinalReceiptRecoveryRepository::load_committed_final_reports_missing_receipt(
+                    store, limit,
+                )
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Err(report_delivery_postgres_unsupported()),
+        }
+    }
+}
+
+impl fleet_application::delivery::ControllerStoredReceiptRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn persist_stored_receipt(
+        &mut self,
+        receipt: &fleet_application::delivery::StoredReportReceipt,
+    ) -> Result<fleet_application::delivery::StoredReceiptOutcome, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::delivery::ControllerStoredReceiptRepository::persist_stored_receipt(
+                    store, receipt,
+                )
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Err(report_delivery_postgres_unsupported()),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn report_delivery_postgres_unsupported() -> fleet_store::StoreError {
+    fleet_store::StoreError::Domain(
+        "controller report delivery is unavailable for the Postgres adapter".to_owned(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -429,8 +659,37 @@ impl CatalogRepository for ControllerStore {
     }
 }
 
+impl fleet_application::CatalogRunbookJobCreationRepository for ControllerStore {
+    fn commit_catalog_runbook_job(
+        &mut self,
+        creation: fleet_application::CatalogRunbookJobCreation<'_>,
+    ) -> Result<fleet_application::CatalogRunbookJobCreationOutcome, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                fleet_application::CatalogRunbookJobCreationRepository::commit_catalog_runbook_job(
+                    store, creation,
+                )
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                fleet_application::CatalogRunbookJobCreationRepository::commit_catalog_runbook_job(
+                    &mut *store.borrow_mut(),
+                    creation,
+                )
+            }
+        }
+    }
+}
+
 impl CatalogQueryRepository for ControllerStore {
     type Error = fleet_store::StoreError;
+
+    fn find_catalog_sync_operation_status(
+        &self,
+        operation_id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+        CatalogRepository::find_catalog_sync_operation(self, operation_id)
+    }
 
     fn list_catalog_sources_after(
         &self,
@@ -553,6 +812,21 @@ impl<'a> From<&'a std::sync::MutexGuard<'_, ControllerStore>> for ControllerStor
 
 impl CatalogQueryRepository for ControllerStoreRef<'_> {
     type Error = fleet_store::StoreError;
+
+    fn find_catalog_sync_operation_status(
+        &self,
+        operation_id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                CatalogRepository::find_catalog_sync_operation(*store, operation_id)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogRepository::find_catalog_sync_operation(&*store.borrow(), operation_id)
+            }
+        }
+    }
     fn list_catalog_sources_after(
         &self,
         after: Option<&CatalogSourceId>,
@@ -768,6 +1042,26 @@ impl ControllerStore {
         )
     }
 
+    fn update_active_task_assignment_status_for_owner(
+        &self,
+        task_id: &str,
+        job_id: &str,
+        agent_id: &str,
+        status: AssignmentStatus,
+        occurred_at: SystemTime,
+        last_error: Option<&str>,
+    ) -> Result<bool, fleet_store::StoreError> {
+        self.store_ref()
+            .update_active_task_assignment_status_for_owner(
+                task_id,
+                job_id,
+                agent_id,
+                status,
+                occurred_at,
+                last_error,
+            )
+    }
+
     fn update_task_assignment_status(
         &self,
         task_id: &str,
@@ -930,6 +1224,20 @@ impl ControllerStore {
 
 #[allow(dead_code)]
 impl ControllerStoreRef<'_> {
+    fn controller_delivery_identity(
+        &self,
+    ) -> Result<ControllerDeliveryIdentity, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                ControllerDeliveryIdentityRepository::controller_delivery_identity(*store)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                ControllerDeliveryIdentityRepository::controller_delivery_identity(store)
+            }),
+        }
+    }
+
     fn find_task_assignment_state_for_job(
         &self,
         job_id: &str,
@@ -1941,8 +2249,8 @@ impl ControllerStoreRef<'_> {
                 RemediationVerificationResolutionRepository::resolve_remediation_verification_evidence(
                     store,
                     remediation.clone(),
-                    origin_drift_report_id.clone(),
-                    evidence_report_id.clone(),
+                    *origin_drift_report_id,
+                    *evidence_report_id,
                     verification_job_id,
                     verification_task_id,
                     audit.clone(),
@@ -2072,6 +2380,38 @@ impl ControllerStoreRef<'_> {
             #[cfg(feature = "postgres")]
             Self::Postgres(_) => self.with_postgres(|store| {
                 store.update_active_task_assignment_status(task_id, status, occurred_at, last_error)
+            }),
+        }
+    }
+
+    fn update_active_task_assignment_status_for_owner(
+        &self,
+        task_id: &str,
+        job_id: &str,
+        agent_id: &str,
+        status: AssignmentStatus,
+        occurred_at: SystemTime,
+        last_error: Option<&str>,
+    ) -> Result<bool, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.update_active_task_assignment_status_for_owner(
+                task_id,
+                job_id,
+                agent_id,
+                status,
+                occurred_at,
+                last_error,
+            ),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                store.update_active_task_assignment_status_for_owner(
+                    task_id,
+                    job_id,
+                    agent_id,
+                    status,
+                    occurred_at,
+                    last_error,
+                )
             }),
         }
     }
@@ -2405,6 +2745,23 @@ impl ControllerStoreRef<'_> {
         }
     }
 
+    fn list_pending_remediation_verification_resolution_records(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemediationVerificationResolutionCandidate>, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                store.list_pending_remediation_verification_resolution_records(limit)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                RemediationVerificationResolutionRecoveryRepository::list_pending_remediation_verification_resolutions(
+                    store, limit,
+                )
+            }),
+        }
+    }
+
     fn update_remediation_request_status_record(
         &self,
         request_id: &str,
@@ -2623,96 +2980,11 @@ struct ControllerRuntimeMetadata {
     tls_key_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdminRole {
-    Owner,
-    Admin,
-    Operator,
-    Viewer,
-}
-
-impl AdminRole {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "owner" => Some(Self::Owner),
-            "admin" => Some(Self::Admin),
-            "operator" => Some(Self::Operator),
-            "viewer" => Some(Self::Viewer),
-            _ => None,
-        }
-    }
-
-    fn allows(self, permission: AdminPermission) -> bool {
-        match self {
-            Self::Owner | Self::Admin => true,
-            Self::Operator => matches!(
-                permission,
-                AdminPermission::AgentRead
-                    | AdminPermission::ApprovalRead
-                    | AdminPermission::JobRead
-                    | AdminPermission::JobCreate
-                    | AdminPermission::JobApprove
-                    | AdminPermission::JobCancel
-                    | AdminPermission::AuditRead
-                    | AdminPermission::PolicyRead
-            ),
-            Self::Viewer => matches!(
-                permission,
-                AdminPermission::AgentRead
-                    | AdminPermission::ApprovalRead
-                    | AdminPermission::JobRead
-                    | AdminPermission::AuditRead
-                    | AdminPermission::PolicyRead
-            ),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdminPermission {
-    AgentRead,
-    AgentWrite,
-    AgentRevoke,
-    ApprovalRead,
-    JobRead,
-    JobCreate,
-    JobApprove,
-    JobCancel,
-    EnrollmentTokenRead,
-    EnrollmentTokenCreate,
-    EnrollmentTokenRevoke,
-    AuditRead,
-    PolicyRead,
-    PolicyWrite,
-    SigningRotationWrite,
-}
-
-impl AdminPermission {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AgentRead => "agent_read",
-            Self::AgentWrite => "agent_write",
-            Self::AgentRevoke => "agent_revoke",
-            Self::ApprovalRead => "approval_read",
-            Self::JobRead => "job_read",
-            Self::JobCreate => "job_create",
-            Self::JobApprove => "job_approve",
-            Self::JobCancel => "job_cancel",
-            Self::EnrollmentTokenRead => "enrollment_token_read",
-            Self::EnrollmentTokenCreate => "enrollment_token_create",
-            Self::EnrollmentTokenRevoke => "enrollment_token_revoke",
-            Self::AuditRead => "audit_read",
-            Self::PolicyRead => "policy_read",
-            Self::PolicyWrite => "policy_write",
-            Self::SigningRotationWrite => "signing_rotation_write",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AdminRequestContext {
     actor_id: String,
     role: AdminRole,
+    principal: fleet_application::admin_identity::AdminMutationPrincipal,
 }
 
 impl AdminRequestContext {
@@ -3158,11 +3430,21 @@ impl Drop for RegisteredAgentSessionGuard {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ControllerIdentity {
     pub public_key: String,
     pub fingerprint: String,
     private_key: String,
+}
+
+impl std::fmt::Debug for ControllerIdentity {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControllerIdentity")
+            .field("fingerprint", &self.fingerprint)
+            .field("private_key", &"[redacted]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl ControllerIdentity {
@@ -4069,6 +4351,7 @@ pub struct AuditExportPageResponse {
 
 #[derive(Debug)]
 pub enum ControllerError {
+    DataLease(fleet_core::controller_data::ControllerDataError),
     Io(std::io::Error),
     Store(fleet_store::StoreError),
     Protocol(fleet_protocol::ProtocolError),
@@ -4083,6 +4366,7 @@ pub enum ControllerError {
 impl Display for ControllerError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::DataLease(error) => Display::fmt(error, formatter),
             Self::Io(error) => write!(formatter, "{error}"),
             Self::Store(error) => write!(formatter, "store error: {error:?}"),
             Self::Protocol(error) => write!(formatter, "{error}"),
@@ -4102,6 +4386,12 @@ impl Display for ControllerError {
 }
 
 impl std::error::Error for ControllerError {}
+
+impl From<fleet_core::controller_data::ControllerDataError> for ControllerError {
+    fn from(value: fleet_core::controller_data::ControllerDataError) -> Self {
+        Self::DataLease(value)
+    }
+}
 
 impl From<std::io::Error> for ControllerError {
     fn from(value: std::io::Error) -> Self {
@@ -4278,10 +4568,11 @@ pub fn start_controller_server_until<F>(
 where
     F: Fn() -> bool + Send + Sync + 'static,
 {
+    let _data_lease = fleet_core::controller_data::ControllerDataLease::acquire(&config.data_dir)?;
     validate_transport(&config)?;
     let trust_settings = controller_trust_settings(&config)?;
     let database = controller_database_settings(&config)?;
-    let store = open_controller_store(&database)?;
+    let mut store = open_controller_store(&database)?;
     let artifact_settings = controller_artifact_store_settings(&config)?;
     let artifact_store = open_controller_artifact_store(&artifact_settings)?;
     let secret_provider_settings = controller_secret_provider_settings(&config);
@@ -4297,14 +4588,29 @@ where
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run_axum_controller_server(
+    let (admin_auth, password_worker) =
+        admin_http::AdminHttpRuntime::bootstrap((&store).into(), &config).map_err(|_| {
+            ControllerError::Json("administrator authentication bootstrap unavailable".to_owned())
+        })?;
+    admin_identity_store::cleanup_bootstrap(&mut store).map_err(|_| {
+        ControllerError::Json("administrator credential cleanup unavailable".to_owned())
+    })?;
+    let result = runtime.block_on(run_axum_controller_server(
         config,
         trust_settings,
         store,
         artifact_store,
         identity,
+        Some(admin_auth),
         should_shutdown,
-    ))
+    ));
+    // Native CPU workers are always joined on the bootstrap thread, after HTTP shutdown.
+    let stopped = password_worker.map(|worker| worker.shutdown()).transpose();
+    result?;
+    stopped.map_err(|_| {
+        ControllerError::Json("administrator authentication shutdown failed".to_owned())
+    })?;
+    Ok(())
 }
 
 async fn run_axum_controller_server<F>(
@@ -4313,6 +4619,7 @@ async fn run_axum_controller_server<F>(
     store: ControllerStore,
     artifact_store: LocalArtifactStore,
     identity: ControllerIdentity,
+    admin_auth: Option<Arc<admin_http::AdminHttpRuntime>>,
     should_shutdown: F,
 ) -> Result<(), ControllerError>
 where
@@ -4352,6 +4659,7 @@ where
         }),
         sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
         catalog_sync_submitter: None,
+        admin_auth,
     };
     let recovery = recover_pending_remediation_verifications(
         &state,
@@ -4364,6 +4672,54 @@ where
         skipped = recovery.skipped,
         "remediation_verification_startup_recovery_completed"
     );
+    let resolution_recovery = recover_pending_remediation_verification_resolutions(
+        &state,
+        MAX_REMEDIATION_VERIFICATION_RECOVERY_BATCH,
+    )?;
+    tracing::info!(
+        discovered = resolution_recovery.discovered,
+        resolved = resolution_recovery.resolved,
+        unchanged = resolution_recovery.unchanged,
+        "remediation_verification_resolution_startup_recovery_completed"
+    );
+    let assignment_recovery =
+        run_assignment_recovery_pass(Arc::clone(&state.store), SystemTime::now()).await?;
+    tracing::info!(
+        scanned_count = assignment_recovery.scanned_count,
+        recovered_count = assignment_recovery.recovered_count,
+        skipped_count = assignment_recovery.skipped_count,
+        "assignment_execution_startup_recovery_completed"
+    );
+    let sqlite_backend = lock_store(&state)?.backend_name() == "sqlite";
+    let final_report_recovery = if sqlite_backend {
+        let recovery = {
+            let mut store = lock_store(&state)?;
+            run_pending_final_result_recovery_pass(
+                &mut store,
+                &state.artifact_store,
+                &state.identity,
+                epoch_millis() as u64,
+            )
+        };
+        match recovery {
+            Ok(output) => {
+                tracing::info!(
+                    scanned_count = output.scanned_count,
+                    committed_count = output.committed_count,
+                    receipt_recovered_count = output.receipt_recovered_count,
+                    failed_count = output.failed_count,
+                    "pending_final_result_startup_recovery_completed"
+                );
+            }
+            Err(_) => {
+                tracing::error!("pending_final_result_startup_recovery_failed");
+            }
+        }
+        true
+    } else {
+        tracing::warn!("pending_final_result_recovery_unavailable_for_database_backend");
+        false
+    };
     let bind_addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -4384,6 +4740,15 @@ where
         )),
     );
     state.catalog_sync_submitter = Some(catalog_sync_worker.submitter());
+    let assignment_recovery_worker = start_assignment_recovery_worker(Arc::clone(&state.store));
+    let pending_final_result_recovery_worker = final_report_recovery.then(|| {
+        start_pending_final_result_recovery_worker(
+            Arc::clone(&state.store),
+            Arc::clone(&state.artifact_store),
+            Arc::clone(&state.identity),
+            Arc::clone(&state.sessions),
+        )
+    });
     start_scheduled_drift_worker(state.store.clone(), state.identity.clone());
     start_controller_signing_staged_rollout_worker(
         state.store.clone(),
@@ -4418,8 +4783,23 @@ where
             .map_err(ControllerError::Io)
     };
 
+    let assignment_recovery_shutdown = assignment_recovery_worker.shutdown().await;
+    let pending_final_result_recovery_shutdown = match pending_final_result_recovery_worker {
+        Some(worker) => Some(worker.shutdown().await),
+        None => None,
+    };
     catalog_sync_worker.shutdown().await;
     serve_result?;
+    assignment_recovery_shutdown.map_err(|_| {
+        ControllerError::Store(fleet_store::StoreError::Domain(
+            "assignment recovery worker did not shut down cleanly".to_owned(),
+        ))
+    })?;
+    if pending_final_result_recovery_shutdown.is_some_and(|result| result.is_err()) {
+        return Err(ControllerError::Store(fleet_store::StoreError::Domain(
+            "pending final result recovery worker did not shut down cleanly".to_owned(),
+        )));
+    }
     tracing::info!("controller_stopped");
     Ok(())
 }
@@ -4509,12 +4889,81 @@ impl axum::serve::Listener for TlsControllerListener {
 
 async fn axum_http_fallback(
     State(state): State<ControllerAppState>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> AxumResponse {
-    let request = raw_http_request_from_axum(method, uri, headers, body);
+    let path = request.uri().path();
+    let private = path.starts_with("/api/")
+        && !matches!(
+            path,
+            "/api/agents/enroll" | "/api/agents/ws" | "/api/controller/identity"
+        );
+    let mut response = axum_http_dispatch(State(state), request).await;
+    if private {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+    }
+    response
+}
+
+async fn axum_http_dispatch(
+    State(state): State<ControllerAppState>,
+    request: axum::extract::Request,
+) -> AxumResponse {
+    let (parts, body) = request.into_parts();
+    let auth_route = admin_http::is_route(parts.uri.path());
+    let limit = if auth_route {
+        admin_http::BODY_LIMIT
+    } else {
+        2 * 1024 * 1024
+    };
+    let body = match axum::body::to_bytes(body, limit).await {
+        Ok(body) => body,
+        Err(_) => {
+            return axum_response_from_raw(&admin_http::error_response((413, "request_too_large")));
+        }
+    };
+    if auth_route && std::str::from_utf8(&body).is_err() {
+        return axum_response_from_raw(&admin_http::error_response((400, "invalid_request")));
+    }
+    for name in [
+        "authorization",
+        "cookie",
+        "origin",
+        "x-fleet-csrf",
+        "content-type",
+    ] {
+        if parts
+            .headers
+            .get_all(name)
+            .iter()
+            .any(|value| value.to_str().is_err())
+        {
+            return axum_response_from_raw(&admin_http::error_response((400, "invalid_request")));
+        }
+    }
+    let request = zeroize::Zeroizing::new(raw_http_request_from_axum(
+        parts.method,
+        parts.uri,
+        parts.headers,
+        body,
+    ));
+    if auth_route {
+        return axum_response_from_raw(&admin_http::handle(request, &state).await);
+    }
+    if let Err(error) = admin_http::preflight(&request, &state) {
+        return axum_response_from_raw(&admin_http::rejection_response(
+            error,
+            &request,
+            &state.metadata,
+        ));
+    }
+    if request.starts_with("POST /api/jobs/catalog-runbook ")
+        || request.starts_with("POST /api/jobs/catalog-runbook?")
+    {
+        return axum_response_from_raw(&catalog_execution::create_http(&request, &state));
+    }
     if request.starts_with("POST /api/catalog/sources ") {
         return match register_catalog_source_http(&request, &state) {
             Ok(response) => axum_response_from_raw(&response),
@@ -4586,7 +5035,9 @@ fn register_catalog_source_http(
             "store lock poisoned".to_owned(),
         ))
     })?;
-    let Some(context) = authenticate_admin_request(request, &*store)? else {
+    let Some(context) =
+        authenticate_admin_request_with_metadata(request, &*store, &state.metadata)?
+    else {
         return Ok(response(
             401,
             "application/json",
@@ -4664,7 +5115,9 @@ fn start_catalog_sync_http(
             "store lock poisoned".to_owned(),
         ))
     })?;
-    let Some(context) = authenticate_admin_request(request, &*store)? else {
+    let Some(context) =
+        authenticate_admin_request_with_metadata(request, &*store, &state.metadata)?
+    else {
         return Ok(response(
             401,
             "application/json",
@@ -4738,7 +5191,9 @@ fn activate_catalog_revision_http(
             "store lock poisoned".to_owned(),
         ))
     })?;
-    let Some(context) = authenticate_admin_request(request, &*store)? else {
+    let Some(context) =
+        authenticate_admin_request_with_metadata(request, &*store, &state.metadata)?
+    else {
         return Ok(response(
             401,
             "application/json",
@@ -4857,14 +5312,10 @@ async fn handle_agent_websocket_axum(
         return Ok(());
     }
 
-    let accepted = fleet_protocol::WireMessage::new(
-        fleet_core::generate_prefixed_ulid("msg")
-            .map_err(|error| ControllerError::Json(error.to_string()))?,
-        auth_response.correlation_id.0,
-        Some(agent_id.clone()),
-        epoch_millis() as u64,
-        fleet_protocol::WirePayload::AuthAccepted,
-    );
+    let accepted = {
+        let store = lock_store(&state)?;
+        controller_auth_accepted_message(&*store, agent_id.clone(), auth_response.correlation_id.0)?
+    };
     send_axum_wire_message(&mut socket, &accepted).await?;
 
     let (writer, mut reader) = socket.split();
@@ -4899,8 +5350,13 @@ async fn handle_agent_websocket_axum(
     }
     dispatch_pending_assignments_for_agent(&state, &agent_id, 1)?;
 
-    let read_loop =
-        read_authenticated_agent_session_loop(&mut reader, &state, &agent_id, &connection_id);
+    let read_loop = read_authenticated_agent_session_loop(
+        &mut reader,
+        &state,
+        &agent_id,
+        &connection_id,
+        &outbound_sender,
+    );
     tokio::pin!(read_loop);
 
     let close_reason = tokio::select! {
@@ -4962,6 +5418,7 @@ async fn read_task_data_until_close_axum(
     agent_id: &str,
     connection_id: &str,
     stop_after_idle: bool,
+    outbound_sender: &AgentSessionOutboundSender,
 ) -> Result<AgentSessionCloseReason, ControllerError> {
     loop {
         let read_result = if stop_after_idle {
@@ -4982,6 +5439,15 @@ async fn read_task_data_until_close_axum(
             Err(ControllerError::Json(error)) if error == "websocket closed" => {
                 return Ok(AgentSessionCloseReason::NormalShutdown);
             }
+            Err(
+                error @ ControllerError::Protocol(fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::IdentityMismatch,
+                )),
+            ) => {
+                let store = lock_store(state)?;
+                audit_security(&*store, "websocket_task_report_identity_mismatch", agent_id)?;
+                return Err(error);
+            }
             Err(error) => return Err(error),
         };
         {
@@ -4999,8 +5465,60 @@ async fn read_task_data_until_close_axum(
                 sessions.record_agent_certificate_lifecycle_ack(agent_id, connection_id, ack);
             }
         }
-        let done = handle_agent_task_data_message_from_state(state, agent_id, message)?;
-        if done {
+        let report_receipt =
+            if let fleet_protocol::WirePayload::TaskReport(report) = &message.payload {
+                let mut store = lock_store(state)?;
+                let signed_at_ms = epoch_millis() as u64;
+                Some(match report.class {
+                    fleet_protocol::delivery_v2::V2ReportClassWire::Output => {
+                        commit_authenticated_output_report(
+                            &mut store,
+                            agent_id,
+                            &message.correlation_id.0,
+                            report,
+                            &state.identity,
+                            signed_at_ms,
+                        )?
+                    }
+                    fleet_protocol::delivery_v2::V2ReportClassWire::FinalResult => {
+                        commit_authenticated_final_result_report_with_artifact_store(
+                            &mut store,
+                            agent_id,
+                            &message.correlation_id.0,
+                            report,
+                            &state.identity,
+                            signed_at_ms,
+                            Some(&state.artifact_store),
+                        )?
+                    }
+                    fleet_protocol::delivery_v2::V2ReportClassWire::Lifecycle => {
+                        commit_authenticated_task_lifecycle_report(
+                            &mut store,
+                            agent_id,
+                            &message.correlation_id.0,
+                            report,
+                            &state.identity,
+                            signed_at_ms,
+                        )?
+                    }
+                    fleet_protocol::delivery_v2::V2ReportClassWire::DriftEvidence => {
+                        commit_authenticated_drift_evidence_report(
+                            &mut store,
+                            agent_id,
+                            &message.correlation_id.0,
+                            report,
+                            &state.identity,
+                            signed_at_ms,
+                            SystemTime::now(),
+                        )?
+                    }
+                })
+            } else {
+                None
+            };
+        if let Some(receipt) = report_receipt {
+            queue_agent_session_message(outbound_sender, receipt)?;
+        } else if handle_agent_task_data_message_from_state(state, agent_id, message)? {
             return Ok(AgentSessionCloseReason::NormalShutdown);
         }
         {
@@ -5142,6 +5660,13 @@ struct RemediationVerificationRecoverySummary {
     skipped: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RemediationVerificationResolutionRecoverySummary {
+    discovered: usize,
+    resolved: usize,
+    unchanged: usize,
+}
+
 /// Reconciles one bounded durable verification backlog before accepting controller traffic.
 fn recover_pending_remediation_verifications(
     state: &ControllerAppState,
@@ -5202,6 +5727,89 @@ fn recover_pending_remediation_verifications(
         }
     }
     Ok(summary)
+}
+
+/// Resolves a bounded set of persisted verification final/evidence pairs before listener readiness.
+fn recover_pending_remediation_verification_resolutions(
+    state: &ControllerAppState,
+    limit: usize,
+) -> Result<RemediationVerificationResolutionRecoverySummary, ControllerError> {
+    let candidates = {
+        let store = lock_store(state)?;
+        let repo = ControllerJobRepository {
+            store: (&*store).into(),
+        };
+        ListPendingRemediationVerificationResolutions::execute(&repo, limit)
+            .map_err(ControllerError::Store)?
+    };
+    let mut summary = RemediationVerificationResolutionRecoverySummary {
+        discovered: candidates.len(),
+        ..Default::default()
+    };
+    for candidate in candidates {
+        let store = lock_store(state)?;
+        if resolve_remediation_from_verification_evidence(
+            (&*store).into(),
+            &candidate.verification_job_id,
+            &candidate.verification_task_id,
+        )? {
+            summary.resolved += 1;
+        } else {
+            summary.unchanged += 1;
+        }
+    }
+    Ok(summary)
+}
+
+fn run_assignment_recovery_once(
+    store: &mut ControllerStore,
+    now: SystemTime,
+) -> Result<RecoverUncertainAssignmentsOutput, ControllerError> {
+    match store {
+        ControllerStore::Sqlite(store) => RecoverUncertainAssignments::execute(
+            store,
+            RecoverUncertainAssignmentsInput {
+                now,
+                grace: DEFAULT_ASSIGNMENT_RECOVERY_GRACE,
+                limit: ASSIGNMENT_RECOVERY_BATCH_LIMIT,
+            },
+        )
+        .map_err(|error| match error {
+            RecoverUncertainAssignmentsError::Repository(error) => ControllerError::Store(error),
+            RecoverUncertainAssignmentsError::InvalidBatchLimit => ControllerError::Store(
+                fleet_store::StoreError::Domain("invalid assignment recovery batch limit".into()),
+            ),
+            RecoverUncertainAssignmentsError::RepositoryExceededBatchLimit => {
+                ControllerError::Store(fleet_store::StoreError::Domain(
+                    "assignment recovery repository exceeded its batch limit".into(),
+                ))
+            }
+        }),
+        #[cfg(feature = "postgres")]
+        ControllerStore::Postgres(_) => Err(ControllerError::UnsupportedDatabaseBackend(
+            "Postgres assignment recovery".to_owned(),
+        )),
+    }
+}
+
+async fn run_assignment_recovery_pass(
+    store: Arc<Mutex<ControllerStore>>,
+    now: SystemTime,
+) -> Result<RecoverUncertainAssignmentsOutput, ControllerError> {
+    tokio::task::spawn_blocking(move || {
+        let mut store = store.lock().map_err(|_| {
+            ControllerError::Store(fleet_store::StoreError::Domain(
+                "store lock poisoned".to_owned(),
+            ))
+        })?;
+        run_assignment_recovery_once(&mut store, now)
+    })
+    .await
+    .map_err(|_| {
+        ControllerError::Store(fleet_store::StoreError::Domain(
+            "assignment recovery blocking operation failed".to_owned(),
+        ))
+    })?
 }
 
 fn remediation_verification_recovery_skip_reason(
@@ -5285,6 +5893,7 @@ async fn read_authenticated_agent_session_loop(
     state: &ControllerAppState,
     agent_id: &str,
     connection_id: &str,
+    outbound_sender: &AgentSessionOutboundSender,
 ) -> Result<AgentSessionCloseReason, ControllerError> {
     let heartbeat = read_axum_wire_message_from_stream(reader).await?;
     if let fleet_protocol::WirePayload::Heartbeat {
@@ -5301,12 +5910,36 @@ async fn read_authenticated_agent_session_loop(
             let store = lock_store(state)?;
             store.mark_agent_online(agent_id, SystemTime::now())?;
         }
-        read_task_data_until_close_axum(reader, state, agent_id, connection_id, false).await
+        read_task_data_until_close_axum(
+            reader,
+            state,
+            agent_id,
+            connection_id,
+            false,
+            outbound_sender,
+        )
+        .await
     } else {
         let store = lock_store(state)?;
         audit_security(&store, "websocket_invalid_heartbeat", agent_id)?;
         Ok(AgentSessionCloseReason::ProtocolError)
     }
+}
+
+fn queue_agent_session_message(
+    outbound_sender: &AgentSessionOutboundSender,
+    message: fleet_protocol::WireMessage,
+) -> Result<(), ControllerError> {
+    outbound_sender
+        .try_send(AgentSessionOutboundMessage::Wire(Box::new(message)))
+        .map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                ControllerError::Json("agent session outbound queue is full".to_owned())
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                ControllerError::Json("agent session outbound queue is closed".to_owned())
+            }
+        })
 }
 
 fn close_reason_from_session_read_result(
@@ -5322,6 +5955,7 @@ fn close_reason_from_session_read_result(
             AgentSessionCloseReason::ProtocolError
         }
         Err(ControllerError::Io(_))
+        | Err(ControllerError::DataLease(_))
         | Err(ControllerError::Tls(_))
         | Err(ControllerError::SigningKeyRotation(_))
         | Err(ControllerError::SecretProvider(_))
@@ -5403,6 +6037,964 @@ async fn send_axum_wire_message(
         ))
         .await
         .map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn controller_auth_accepted_message<'a>(
+    store: impl Into<ControllerStoreRef<'a>> + Copy,
+    agent_id: String,
+    correlation_id: String,
+) -> Result<fleet_protocol::WireMessage, ControllerError> {
+    let delivery_identity = store.into().controller_delivery_identity()?;
+    Ok(fleet_protocol::WireMessage::new(
+        fleet_core::generate_prefixed_ulid("msg")
+            .map_err(|error| ControllerError::Json(error.to_string()))?,
+        correlation_id,
+        Some(agent_id),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::AuthAccepted {
+            controller_namespace: delivery_identity.namespace,
+            store_epoch: delivery_identity.store_epoch,
+        },
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerOutputReportBody {
+    stream: fleet_protocol::OutputStream,
+    sequence: u64,
+    data: String,
+}
+
+type ControllerFinalResultReportBody = fleet_protocol::delivery_v2::V2FinalResultReportBody;
+
+fn commit_authenticated_drift_evidence_report(
+    store: &mut ControllerStore,
+    authenticated_agent_id: &str,
+    correlation_id: &str,
+    report: &fleet_protocol::delivery_v2::V2TaskReportWire,
+    signing_identity: &ControllerIdentity,
+    signed_at_ms: u64,
+    checked_at: SystemTime,
+) -> Result<fleet_protocol::WireMessage, ControllerError> {
+    use fleet_application::delivery::{
+        CommitControllerInboxEvidence, ControllerInboxEvidenceEffect, ControllerInboxReport,
+        InboxEffectOutcome, InboxStageOutcome, StageControllerInboxReport,
+    };
+    use fleet_domain::delivery::{ReportClass, ReportDigest, ReportKey};
+
+    if report.class != fleet_protocol::delivery_v2::V2ReportClassWire::DriftEvidence {
+        return Err(ControllerError::Protocol(
+            fleet_protocol::ProtocolError::Json("unsupported task report class".to_owned()),
+        ));
+    }
+    let key = ReportKey::new(
+        &report.controller_namespace,
+        &report.agent_id,
+        &report.job_id,
+        &report.task_id,
+        &report.report_id,
+    )
+    .map_err(|_| {
+        ControllerError::Protocol(fleet_protocol::ProtocolError::InvalidV2Payload(
+            fleet_protocol::delivery_v2::V2ProtocolError::InvalidIdentity,
+        ))
+    })?;
+    let body = report
+        .body_bytes()
+        .map_err(fleet_protocol::ProtocolError::InvalidV2Payload)?;
+    let parsed: fleet_protocol::delivery_v2::V2DriftEvidenceReportBody =
+        serde_json::from_slice(&body)
+            .map_err(|_| ControllerError::Json("invalid drift evidence report body".to_owned()))?;
+    let delivery = store.store_ref().controller_delivery_identity()?;
+    let staged = StageControllerInboxReport::execute(
+        store,
+        authenticated_agent_id,
+        &delivery.namespace,
+        fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES,
+        &ControllerInboxReport::new(key.clone(), ReportClass::DriftEvidence, body.clone()),
+    );
+    let staged = match staged {
+        Ok(outcome) => outcome,
+        Err(fleet_application::delivery::InboxAdmissionError::Repository(error)) => {
+            return Err(ControllerError::Store(error));
+        }
+        Err(
+            fleet_application::delivery::InboxAdmissionError::ControllerMismatch
+            | fleet_application::delivery::InboxAdmissionError::AgentMismatch,
+        ) => {
+            audit_security(
+                &*store,
+                "websocket_task_report_identity_mismatch",
+                authenticated_agent_id,
+            )?;
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::IdentityMismatch,
+                ),
+            ));
+        }
+        Err(fleet_application::delivery::InboxAdmissionError::InvalidBody) => {
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::EmptyBody,
+                ),
+            ));
+        }
+        Err(fleet_application::delivery::InboxAdmissionError::BodyTooLarge) => {
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::BodyTooLarge,
+                ),
+            ));
+        }
+    };
+    match staged {
+        InboxStageOutcome::StagedPendingEffects | InboxStageOutcome::DuplicatePendingEffects => {}
+        InboxStageOutcome::AlreadyCommitted => {
+            let [_, _, job_id, task_id, _] = key.parts();
+            resolve_remediation_from_verification_evidence(store.store_ref(), job_id, task_id)?;
+            let digest = ReportDigest(Sha256::digest(&body).into());
+            let receipt = crate::report_receipt::issue_and_persist_stored_receipt(
+                store,
+                &delivery,
+                &key,
+                authenticated_agent_id,
+                InboxEffectOutcome::AlreadyCommitted(digest),
+                signing_identity,
+                signed_at_ms,
+            )
+            .map_err(|error| {
+                ControllerError::Protocol(fleet_protocol::ProtocolError::Json(error.to_string()))
+            })?;
+            return Ok(fleet_protocol::WireMessage::new(
+                fleet_core::generate_prefixed_ulid("msg")
+                    .map_err(|error| ControllerError::Json(error.to_string()))?,
+                correlation_id.to_owned(),
+                Some(authenticated_agent_id.to_owned()),
+                signed_at_ms,
+                fleet_protocol::WirePayload::ReportReceipt(receipt),
+            ));
+        }
+        InboxStageOutcome::ConflictingBody => {
+            audit_security(
+                &*store,
+                "websocket_task_report_conflict",
+                authenticated_agent_id,
+            )?;
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::Json(
+                    "task report body conflicts with stored identity".to_owned(),
+                ),
+            ));
+        }
+        InboxStageOutcome::CapacityExceeded => {
+            return Err(ControllerError::Json(
+                "controller report capacity exceeded".to_owned(),
+            ));
+        }
+    }
+
+    let [_, _, job_id, task_id, _] = key.parts();
+    let Some(provenance) = verified_drift_report_provenance(
+        &store.store_ref(),
+        authenticated_agent_id,
+        Some(job_id),
+        Some(task_id),
+    )?
+    else {
+        audit_security(
+            &*store,
+            "websocket_drift_provenance_mismatch",
+            authenticated_agent_id,
+        )?;
+        return Err(ControllerError::Json(
+            "drift evidence provenance mismatch".to_owned(),
+        ));
+    };
+    let status = match parsed.status {
+        fleet_protocol::delivery_v2::V2DriftStatusWire::Compliant => DriftStatus::Compliant,
+        fleet_protocol::delivery_v2::V2DriftStatusWire::Drifted => DriftStatus::Drifted,
+        fleet_protocol::delivery_v2::V2DriftStatusWire::Unknown => DriftStatus::Unknown,
+    };
+    let policy_id = provenance
+        .policy_id
+        .as_deref()
+        .ok_or_else(|| ControllerError::Json("drift policy provenance is missing".to_owned()))?;
+    let drift_report = DriftReport {
+        policy_name: policy_id.to_owned(),
+        severity: DriftSeverity::for_status(status.clone()),
+        status,
+        acknowledgement: DriftAcknowledgement::Open,
+        expected: parsed.expected,
+        actual: parsed.actual,
+    };
+    let mut effect = ControllerInboxEvidenceEffect::new(
+        key.clone(),
+        body.clone(),
+        drift_report.clone(),
+        provenance.clone(),
+        checked_at,
+    );
+    if let Some(proposal) = prepare_verified_drifted_proposal(
+        store.store_ref(),
+        authenticated_agent_id,
+        &drift_report,
+        &provenance,
+        checked_at,
+    )? {
+        effect = effect.with_remediation_proposal(proposal);
+    }
+    let outcome = CommitControllerInboxEvidence::execute(store, &effect)?;
+    if matches!(
+        outcome,
+        InboxEffectOutcome::ConflictingBody | InboxEffectOutcome::NotStaged
+    ) {
+        audit_security(
+            &*store,
+            "websocket_task_report_effect_conflict",
+            authenticated_agent_id,
+        )?;
+        return Err(ControllerError::Protocol(
+            fleet_protocol::ProtocolError::Json("task report effect was not committed".to_owned()),
+        ));
+    }
+    resolve_remediation_from_verification_evidence(store.store_ref(), job_id, task_id)?;
+    let receipt = crate::report_receipt::issue_and_persist_stored_receipt(
+        store,
+        &delivery,
+        &key,
+        authenticated_agent_id,
+        outcome,
+        signing_identity,
+        signed_at_ms,
+    )
+    .map_err(|error| {
+        ControllerError::Protocol(fleet_protocol::ProtocolError::Json(error.to_string()))
+    })?;
+    Ok(fleet_protocol::WireMessage::new(
+        fleet_core::generate_prefixed_ulid("msg")
+            .map_err(|error| ControllerError::Json(error.to_string()))?,
+        correlation_id.to_owned(),
+        Some(authenticated_agent_id.to_owned()),
+        signed_at_ms,
+        fleet_protocol::WirePayload::ReportReceipt(receipt),
+    ))
+}
+
+fn prepare_verified_drifted_proposal(
+    store: ControllerStoreRef<'_>,
+    agent_id: &str,
+    report: &DriftReport,
+    provenance: &DriftReportProvenance,
+    checked_at: SystemTime,
+) -> Result<Option<fleet_application::PersistVerifiedDriftProposalInput>, ControllerError> {
+    if report.status != DriftStatus::Drifted {
+        return Ok(None);
+    }
+    let (Some(policy_id), Some(policy_version), Some(task_id)) = (
+        provenance.policy_id.as_deref(),
+        provenance.policy_version,
+        provenance.task_id.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(stored_policy) = store.find_policy(policy_id)? else {
+        return Ok(None);
+    };
+    if stored_policy.version != policy_version {
+        return Ok(None);
+    }
+    let policy = fleet_domain::parse_policy_document(&stored_policy.source).map_err(|error| {
+        ControllerError::Store(fleet_store::StoreError::Domain(error.to_string()))
+    })?;
+    if policy.id != policy_id || policy.version != policy_version || policy.remediation.is_none() {
+        return Ok(None);
+    }
+    let prepared =
+        PersistVerifiedDriftProposal::prepare(PersistVerifiedDriftProposalUseCaseInput {
+            remediation_id: format!("remediation-{policy_id}-{}", task_id.as_str()),
+            policy,
+            agent_id: agent_id.to_owned(),
+            report: report.clone(),
+            provenance: provenance.clone(),
+            actor: "controller".to_owned(),
+            requested_at: checked_at,
+        })
+        .map_err(ControllerError::Json)?;
+    Ok(Some(prepared))
+}
+
+fn commit_authenticated_task_lifecycle_report(
+    store: &mut ControllerStore,
+    authenticated_agent_id: &str,
+    correlation_id: &str,
+    report: &fleet_protocol::delivery_v2::V2TaskReportWire,
+    signing_identity: &ControllerIdentity,
+    signed_at_ms: u64,
+) -> Result<fleet_protocol::WireMessage, ControllerError> {
+    use fleet_application::delivery::{
+        CommitControllerInboxTaskAck, CommitControllerInboxTaskRejected,
+        CommitControllerInboxTaskStarted, ControllerInboxReport, ControllerInboxTaskAckEffect,
+        ControllerInboxTaskRejectedEffect, ControllerInboxTaskStartedEffect, InboxEffectOutcome,
+        InboxStageOutcome, StageControllerInboxReport,
+    };
+    use fleet_domain::delivery::{ReportClass, ReportKey};
+
+    if report.class != fleet_protocol::delivery_v2::V2ReportClassWire::Lifecycle {
+        return Err(ControllerError::Protocol(
+            fleet_protocol::ProtocolError::Json("unsupported task report class".to_owned()),
+        ));
+    }
+    let key = ReportKey::new(
+        &report.controller_namespace,
+        &report.agent_id,
+        &report.job_id,
+        &report.task_id,
+        &report.report_id,
+    )
+    .map_err(|_| {
+        ControllerError::Protocol(fleet_protocol::ProtocolError::InvalidV2Payload(
+            fleet_protocol::delivery_v2::V2ProtocolError::InvalidIdentity,
+        ))
+    })?;
+    let body = report
+        .body_bytes()
+        .map_err(fleet_protocol::ProtocolError::InvalidV2Payload)?;
+    let parsed: fleet_protocol::delivery_v2::V2TaskLifecycleReportBody =
+        serde_json::from_slice(&body)
+            .map_err(|_| ControllerError::Json("invalid task lifecycle report body".to_owned()))?;
+    let report_id = key.parts()[4];
+    if !matches!(
+        (&parsed, report_id),
+        (
+            fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskAck {},
+            "task-ack"
+        ) | (
+            fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskStarted {},
+            "task-started"
+        ) | (
+            fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskRejected { .. },
+            "task-rejected"
+        )
+    ) {
+        return Err(ControllerError::Json(
+            "unsupported task lifecycle report event".to_owned(),
+        ));
+    }
+    let delivery = store.store_ref().controller_delivery_identity()?;
+    let staged = StageControllerInboxReport::execute(
+        store,
+        authenticated_agent_id,
+        &delivery.namespace,
+        fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES,
+        &ControllerInboxReport::new(key.clone(), ReportClass::Lifecycle, body.clone()),
+    );
+    let staged = match staged {
+        Ok(outcome) => outcome,
+        Err(fleet_application::delivery::InboxAdmissionError::Repository(error)) => {
+            return Err(ControllerError::Store(error));
+        }
+        Err(
+            fleet_application::delivery::InboxAdmissionError::ControllerMismatch
+            | fleet_application::delivery::InboxAdmissionError::AgentMismatch,
+        ) => {
+            audit_security(
+                &*store,
+                "websocket_task_report_identity_mismatch",
+                authenticated_agent_id,
+            )?;
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::IdentityMismatch,
+                ),
+            ));
+        }
+        Err(fleet_application::delivery::InboxAdmissionError::InvalidBody) => {
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::EmptyBody,
+                ),
+            ));
+        }
+        Err(fleet_application::delivery::InboxAdmissionError::BodyTooLarge) => {
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::BodyTooLarge,
+                ),
+            ));
+        }
+    };
+    match staged {
+        InboxStageOutcome::StagedPendingEffects
+        | InboxStageOutcome::DuplicatePendingEffects
+        | InboxStageOutcome::AlreadyCommitted => {}
+        InboxStageOutcome::ConflictingBody => {
+            audit_security(
+                &*store,
+                "websocket_task_report_conflict",
+                authenticated_agent_id,
+            )?;
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::Json(
+                    "task report body conflicts with stored identity".to_owned(),
+                ),
+            ));
+        }
+        InboxStageOutcome::CapacityExceeded => {
+            return Err(ControllerError::Json(
+                "controller report capacity exceeded".to_owned(),
+            ));
+        }
+    }
+    let outcome = match parsed {
+        fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskAck {} => {
+            CommitControllerInboxTaskAck::execute(
+                store,
+                &ControllerInboxTaskAckEffect::new(
+                    key.clone(),
+                    body,
+                    millis_to_system_time(signed_at_ms),
+                ),
+            )?
+        }
+        fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskStarted {} => {
+            let [_, _, job_id, _, _] = key.parts();
+            let remediation_transition = match store
+                .store_ref()
+                .find_remediation_request_by_job_id_record(job_id)?
+            {
+                Some(record) => PrepareRemediationExecutionTransition::execute(
+                    record,
+                    job_id,
+                    RemediationExecutionTransition::Started,
+                    authenticated_agent_id,
+                    millis_to_system_time(signed_at_ms),
+                )
+                .map_err(ControllerError::Json)?,
+                None => None,
+            };
+            CommitControllerInboxTaskStarted::execute(
+                store,
+                &ControllerInboxTaskStartedEffect::new(
+                    key.clone(),
+                    body,
+                    millis_to_system_time(signed_at_ms),
+                )
+                .with_remediation_transition(remediation_transition),
+            )?
+        }
+        fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskRejected {
+            reason_code,
+            reason,
+        } => {
+            if reason.trim().is_empty() {
+                return Err(ControllerError::Json(
+                    "task rejection reason must not be empty".to_owned(),
+                ));
+            }
+            let reason_code = task_rejection_reason_code_to_str(reason_code).to_owned();
+            let reason = fleet_core::redact_secret(&reason);
+            CommitControllerInboxTaskRejected::execute(
+                store,
+                &ControllerInboxTaskRejectedEffect::new(
+                    key.clone(),
+                    body,
+                    reason_code,
+                    reason,
+                    millis_to_system_time(signed_at_ms),
+                ),
+            )?
+        }
+    };
+    if matches!(
+        outcome,
+        InboxEffectOutcome::ConflictingBody | InboxEffectOutcome::NotStaged
+    ) {
+        audit_security(
+            &*store,
+            "websocket_task_report_effect_conflict",
+            authenticated_agent_id,
+        )?;
+        return Err(ControllerError::Protocol(
+            fleet_protocol::ProtocolError::Json("task report effect was not committed".to_owned()),
+        ));
+    }
+    let receipt = crate::report_receipt::issue_and_persist_stored_receipt(
+        store,
+        &delivery,
+        &key,
+        authenticated_agent_id,
+        outcome,
+        signing_identity,
+        signed_at_ms,
+    )
+    .map_err(|error| {
+        ControllerError::Protocol(fleet_protocol::ProtocolError::Json(error.to_string()))
+    })?;
+    Ok(fleet_protocol::WireMessage::new(
+        fleet_core::generate_prefixed_ulid("msg")
+            .map_err(|error| ControllerError::Json(error.to_string()))?,
+        correlation_id.to_owned(),
+        Some(authenticated_agent_id.to_owned()),
+        signed_at_ms,
+        fleet_protocol::WirePayload::ReportReceipt(receipt),
+    ))
+}
+
+fn commit_authenticated_output_report(
+    store: &mut ControllerStore,
+    authenticated_agent_id: &str,
+    correlation_id: &str,
+    report: &fleet_protocol::delivery_v2::V2TaskReportWire,
+    signing_identity: &ControllerIdentity,
+    signed_at_ms: u64,
+) -> Result<fleet_protocol::WireMessage, ControllerError> {
+    use fleet_application::delivery::{
+        CommitControllerInboxOutput, ControllerInboxOutputEffect, ControllerInboxReport,
+        InboxEffectOutcome, InboxStageOutcome, StageControllerInboxReport,
+    };
+    use fleet_domain::delivery::{ReportClass, ReportKey};
+
+    if report.class != fleet_protocol::delivery_v2::V2ReportClassWire::Output {
+        return Err(ControllerError::Protocol(
+            fleet_protocol::ProtocolError::Json("unsupported task report class".to_owned()),
+        ));
+    }
+    let key = ReportKey::new(
+        &report.controller_namespace,
+        &report.agent_id,
+        &report.job_id,
+        &report.task_id,
+        &report.report_id,
+    )
+    .map_err(|_| {
+        ControllerError::Protocol(fleet_protocol::ProtocolError::InvalidV2Payload(
+            fleet_protocol::delivery_v2::V2ProtocolError::InvalidIdentity,
+        ))
+    })?;
+    let body = report
+        .body_bytes()
+        .map_err(fleet_protocol::ProtocolError::InvalidV2Payload)?;
+    let parsed: ControllerOutputReportBody = serde_json::from_slice(&body)
+        .map_err(|_| ControllerError::Json("invalid output report body".to_owned()))?;
+    if parsed.data.is_empty() {
+        return Err(ControllerError::Json(
+            "output report chunk is empty".to_owned(),
+        ));
+    }
+    let delivery = store.store_ref().controller_delivery_identity()?;
+    let staged = StageControllerInboxReport::execute(
+        store,
+        authenticated_agent_id,
+        &delivery.namespace,
+        fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES,
+        &ControllerInboxReport::new(key.clone(), ReportClass::Output, body.clone()),
+    );
+    let staged = match staged {
+        Ok(outcome) => outcome,
+        Err(fleet_application::delivery::InboxAdmissionError::Repository(error)) => {
+            return Err(ControllerError::Store(error));
+        }
+        Err(
+            fleet_application::delivery::InboxAdmissionError::ControllerMismatch
+            | fleet_application::delivery::InboxAdmissionError::AgentMismatch,
+        ) => {
+            audit_security(
+                &*store,
+                "websocket_task_report_identity_mismatch",
+                authenticated_agent_id,
+            )?;
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::IdentityMismatch,
+                ),
+            ));
+        }
+        Err(fleet_application::delivery::InboxAdmissionError::InvalidBody) => {
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::EmptyBody,
+                ),
+            ));
+        }
+        Err(fleet_application::delivery::InboxAdmissionError::BodyTooLarge) => {
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::BodyTooLarge,
+                ),
+            ));
+        }
+    };
+    match staged {
+        InboxStageOutcome::StagedPendingEffects
+        | InboxStageOutcome::DuplicatePendingEffects
+        | InboxStageOutcome::AlreadyCommitted => {}
+        InboxStageOutcome::ConflictingBody => {
+            audit_security(
+                &*store,
+                "websocket_task_report_conflict",
+                authenticated_agent_id,
+            )?;
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::Json(
+                    "task report body conflicts with stored identity".to_owned(),
+                ),
+            ));
+        }
+        InboxStageOutcome::CapacityExceeded => {
+            return Err(ControllerError::Json(
+                "controller report capacity exceeded".to_owned(),
+            ));
+        }
+    }
+    let effect = ControllerInboxOutputEffect::new(
+        key.clone(),
+        body,
+        match parsed.stream {
+            fleet_protocol::OutputStream::Stdout => JobOutputStream::Stdout,
+            fleet_protocol::OutputStream::Stderr => JobOutputStream::Stderr,
+        },
+        parsed.sequence,
+        parsed.data,
+    );
+    let outcome = CommitControllerInboxOutput::execute(store, &effect)?;
+    if matches!(
+        outcome,
+        InboxEffectOutcome::ConflictingBody | InboxEffectOutcome::NotStaged
+    ) {
+        audit_security(
+            &*store,
+            "websocket_task_report_effect_conflict",
+            authenticated_agent_id,
+        )?;
+        return Err(ControllerError::Protocol(
+            fleet_protocol::ProtocolError::Json("task report effect was not committed".to_owned()),
+        ));
+    }
+    let receipt = crate::report_receipt::issue_and_persist_stored_receipt(
+        store,
+        &delivery,
+        &key,
+        authenticated_agent_id,
+        outcome,
+        signing_identity,
+        signed_at_ms,
+    )
+    .map_err(|error| {
+        ControllerError::Protocol(fleet_protocol::ProtocolError::Json(error.to_string()))
+    })?;
+    Ok(fleet_protocol::WireMessage::new(
+        fleet_core::generate_prefixed_ulid("msg")
+            .map_err(|error| ControllerError::Json(error.to_string()))?,
+        correlation_id.to_owned(),
+        Some(authenticated_agent_id.to_owned()),
+        signed_at_ms,
+        fleet_protocol::WirePayload::ReportReceipt(receipt),
+    ))
+}
+
+#[cfg(test)]
+fn commit_authenticated_final_result_report(
+    store: &mut ControllerStore,
+    authenticated_agent_id: &str,
+    correlation_id: &str,
+    report: &fleet_protocol::delivery_v2::V2TaskReportWire,
+    signing_identity: &ControllerIdentity,
+    signed_at_ms: u64,
+) -> Result<fleet_protocol::WireMessage, ControllerError> {
+    commit_authenticated_final_result_report_with_artifact_store(
+        store,
+        authenticated_agent_id,
+        correlation_id,
+        report,
+        signing_identity,
+        signed_at_ms,
+        None,
+    )
+}
+
+fn commit_authenticated_final_result_report_with_artifact_store(
+    store: &mut ControllerStore,
+    authenticated_agent_id: &str,
+    correlation_id: &str,
+    report: &fleet_protocol::delivery_v2::V2TaskReportWire,
+    signing_identity: &ControllerIdentity,
+    signed_at_ms: u64,
+    artifact_store: Option<&Mutex<LocalArtifactStore>>,
+) -> Result<fleet_protocol::WireMessage, ControllerError> {
+    use fleet_application::delivery::{
+        CommitControllerInboxFinal, ControllerInboxFinalEffect, ControllerInboxReport,
+        InboxEffectOutcome, InboxStageOutcome, StageControllerInboxReport,
+    };
+    use fleet_domain::delivery::{ReportClass, ReportKey};
+
+    if report.class != fleet_protocol::delivery_v2::V2ReportClassWire::FinalResult {
+        return Err(ControllerError::Protocol(
+            fleet_protocol::ProtocolError::Json("unsupported task report class".to_owned()),
+        ));
+    }
+    let key = ReportKey::new(
+        &report.controller_namespace,
+        &report.agent_id,
+        &report.job_id,
+        &report.task_id,
+        &report.report_id,
+    )
+    .map_err(|_| {
+        ControllerError::Protocol(fleet_protocol::ProtocolError::InvalidV2Payload(
+            fleet_protocol::delivery_v2::V2ProtocolError::InvalidIdentity,
+        ))
+    })?;
+    let body = report
+        .body_bytes()
+        .map_err(fleet_protocol::ProtocolError::InvalidV2Payload)?;
+    let parsed: ControllerFinalResultReportBody = serde_json::from_slice(&body)
+        .map_err(|_| ControllerError::Json("invalid final result report body".to_owned()))?;
+    let [_, agent_id, job_id, task_id, _] = key.parts();
+    if parsed.output.truncated && parsed.status == fleet_protocol::TaskResultStatus::Succeeded {
+        return Err(ControllerError::Json(
+            "truncated command output cannot be reported as succeeded".to_owned(),
+        ));
+    }
+    let artifact_metadata = validate_final_report_artifact_metadata(
+        &parsed.artifacts,
+        job_id,
+        agent_id,
+        task_id,
+        SystemTime::UNIX_EPOCH + Duration::from_millis(signed_at_ms),
+    )?;
+    let delivery = store.store_ref().controller_delivery_identity()?;
+    let staged = StageControllerInboxReport::execute(
+        store,
+        authenticated_agent_id,
+        &delivery.namespace,
+        fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES,
+        &ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone()),
+    );
+    let staged = match staged {
+        Ok(outcome) => outcome,
+        Err(fleet_application::delivery::InboxAdmissionError::Repository(error)) => {
+            return Err(ControllerError::Store(error));
+        }
+        Err(
+            fleet_application::delivery::InboxAdmissionError::ControllerMismatch
+            | fleet_application::delivery::InboxAdmissionError::AgentMismatch,
+        ) => {
+            audit_security(
+                &*store,
+                "websocket_task_report_identity_mismatch",
+                authenticated_agent_id,
+            )?;
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::IdentityMismatch,
+                ),
+            ));
+        }
+        Err(fleet_application::delivery::InboxAdmissionError::InvalidBody) => {
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::EmptyBody,
+                ),
+            ));
+        }
+        Err(fleet_application::delivery::InboxAdmissionError::BodyTooLarge) => {
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::BodyTooLarge,
+                ),
+            ));
+        }
+    };
+    match staged {
+        InboxStageOutcome::StagedPendingEffects
+        | InboxStageOutcome::DuplicatePendingEffects
+        | InboxStageOutcome::AlreadyCommitted => {}
+        InboxStageOutcome::ConflictingBody => {
+            audit_security(
+                &*store,
+                "websocket_task_report_conflict",
+                authenticated_agent_id,
+            )?;
+            return Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::Json(
+                    "task report body conflicts with stored identity".to_owned(),
+                ),
+            ));
+        }
+        InboxStageOutcome::CapacityExceeded => {
+            return Err(ControllerError::Json(
+                "controller report capacity exceeded".to_owned(),
+            ));
+        }
+    }
+    let prepared_artifacts =
+        prepare_final_report_artifacts(&parsed.artifacts, artifact_metadata, artifact_store)?;
+    let (status, _) = task_result_status_to_domain(parsed.status);
+    let last_error = (parsed.status != fleet_protocol::TaskResultStatus::Succeeded)
+        .then(|| task_result_last_error(parsed.exit_code, &parsed.reason));
+    let effect = ControllerInboxFinalEffect::new(
+        key.clone(),
+        body,
+        status,
+        SystemTime::UNIX_EPOCH + Duration::from_millis(signed_at_ms),
+        last_error,
+        prepared_artifacts.len(),
+    )
+    .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+        parsed.output.stdout_chunks,
+        parsed.output.stderr_chunks,
+        parsed.output.truncated,
+    ))
+    .with_prepared_artifacts(prepared_artifacts);
+    let outcome = CommitControllerInboxFinal::execute(store, &effect)?;
+    if matches!(
+        outcome,
+        InboxEffectOutcome::ConflictingBody | InboxEffectOutcome::NotStaged
+    ) {
+        audit_security(
+            &*store,
+            "websocket_task_report_effect_conflict",
+            authenticated_agent_id,
+        )?;
+        return Err(ControllerError::Protocol(
+            fleet_protocol::ProtocolError::Json("task report effect was not committed".to_owned()),
+        ));
+    }
+    let receipt = crate::report_receipt::issue_and_persist_stored_receipt(
+        store,
+        &delivery,
+        &key,
+        authenticated_agent_id,
+        outcome,
+        signing_identity,
+        signed_at_ms,
+    )
+    .map_err(|error| {
+        ControllerError::Protocol(fleet_protocol::ProtocolError::Json(error.to_string()))
+    })?;
+    Ok(fleet_protocol::WireMessage::new(
+        fleet_core::generate_prefixed_ulid("msg")
+            .map_err(|error| ControllerError::Json(error.to_string()))?,
+        correlation_id.to_owned(),
+        Some(authenticated_agent_id.to_owned()),
+        signed_at_ms,
+        fleet_protocol::WirePayload::ReportReceipt(receipt),
+    ))
+}
+
+fn validate_final_report_artifact_metadata(
+    artifacts: &[fleet_protocol::TaskResultArtifactWire],
+    job_id: &str,
+    agent_id: &str,
+    task_id: &str,
+    created_at: SystemTime,
+) -> Result<Vec<RenderedArtifactMetadata>, ControllerError> {
+    let mut ids = BTreeSet::new();
+    artifacts
+        .iter()
+        .map(|artifact| {
+            if artifact.step_id.trim().is_empty()
+                || artifact.step_id.len() > 256
+                || artifact.step_id.chars().any(char::is_control)
+                || !ids.insert(artifact.artifact_id.as_str())
+            {
+                return Err(ControllerError::Json(
+                    "final result artifact metadata is invalid".to_owned(),
+                ));
+            }
+            let id = ArtifactId::new(artifact.artifact_id.clone()).map_err(|_| {
+                ControllerError::Json("final result artifact identity is invalid".to_owned())
+            })?;
+            let checksum =
+                ArtifactChecksum::sha256(artifact.checksum_sha256.clone()).map_err(|_| {
+                    ControllerError::Json("final result artifact checksum is invalid".to_owned())
+                })?;
+            let retention_class = ArtifactRetentionClass::parse(&artifact.retention_class)
+                .map_err(|_| {
+                    ControllerError::Json("final result artifact retention is invalid".to_owned())
+                })?;
+            if let Some(content_bytes) = &artifact.content_bytes {
+                if content_bytes.len() > DEFAULT_MAX_ARTIFACT_BODY_BYTES
+                    || content_bytes.len() as u64 != artifact.size_bytes
+                {
+                    return Err(ControllerError::Json(
+                        "final result artifact body size is invalid".to_owned(),
+                    ));
+                }
+                let actual =
+                    ArtifactChecksum::sha256(format!("{:x}", Sha256::digest(content_bytes)))
+                        .map_err(|_| {
+                            ControllerError::Json(
+                                "final result artifact checksum is invalid".to_owned(),
+                            )
+                        })?;
+                if actual != checksum {
+                    return Err(ControllerError::Json(
+                        "final result artifact body checksum does not match".to_owned(),
+                    ));
+                }
+            }
+            RenderedArtifactMetadata::new(
+                id,
+                JobId::new(job_id.to_owned())
+                    .map_err(|_| ControllerError::Json("final result job is invalid".to_owned()))?,
+                AgentId::new(agent_id.to_owned()).map_err(|_| {
+                    ControllerError::Json("final result agent is invalid".to_owned())
+                })?,
+                TaskId::new(task_id.to_owned()).map_err(|_| {
+                    ControllerError::Json("final result task is invalid".to_owned())
+                })?,
+                artifact.destination.clone(),
+                checksum,
+                artifact.size_bytes,
+                retention_class,
+                created_at,
+            )
+            .map_err(|_| {
+                ControllerError::Json("final result artifact metadata is invalid".to_owned())
+            })
+        })
+        .collect()
+}
+
+fn prepare_final_report_artifacts(
+    artifacts: &[fleet_protocol::TaskResultArtifactWire],
+    metadata: Vec<RenderedArtifactMetadata>,
+    artifact_store: Option<&Mutex<LocalArtifactStore>>,
+) -> Result<Vec<fleet_application::delivery::ControllerPreparedArtifact>, ControllerError> {
+    artifacts
+        .iter()
+        .zip(metadata)
+        .map(|(artifact, metadata)| {
+            let stored_body = if let Some(bytes) = &artifact.content_bytes {
+                let artifact_store = artifact_store.ok_or_else(|| {
+                    ControllerError::Store(fleet_store::StoreError::Domain(
+                        "artifact body store is not configured".to_owned(),
+                    ))
+                })?;
+                let mut artifact_store = artifact_store.lock().map_err(|_| {
+                    ControllerError::Store(fleet_store::StoreError::Domain(
+                        "artifact store lock poisoned".to_owned(),
+                    ))
+                })?;
+                Some(
+                    artifact_store
+                        .put(fleet_application::ArtifactStorePut {
+                            id: metadata.id.clone(),
+                            retention_class: metadata.retention_class,
+                            expected_checksum: metadata.checksum.clone(),
+                            bytes: bytes.clone(),
+                        })
+                        .map_err(ControllerError::Store)?,
+                )
+            } else {
+                None
+            };
+            Ok(fleet_application::delivery::ControllerPreparedArtifact::new(metadata, stored_body))
+        })
+        .collect()
 }
 
 struct ControllerPendingAssignmentDispatcher<'a> {
@@ -5492,19 +7084,29 @@ fn dispatch_pending_assignments<'a>(
         }
     })?;
 
-    tracing::info!(
-        job_id = %job_id_label,
-        agent_id = %agent_id_label,
-        dispatched_count = output.dispatched_count,
-        queued_count = output.queued_count,
-        failed_count = output.failed_count,
-        skipped_concurrency_count = output.skipped_concurrency_count,
-        skipped_max_failures_count = output.skipped_max_failures_count,
-        skipped_expired_count = output.skipped_expired_count,
-        skipped_disabled_count = output.skipped_disabled_count,
-        dispatch_latency_ms = started_at.elapsed().as_millis(),
-        "task_dispatch_checked"
-    );
+    // Idle polls are FieldDebug detail; only new dispatch/failure effects are Product events.
+    macro_rules! log_dispatch_check {
+        ($level:ident) => {
+            tracing::$level!(
+                job_id = %job_id_label,
+                agent_id = %agent_id_label,
+                dispatched_count = output.dispatched_count,
+                queued_count = output.queued_count,
+                failed_count = output.failed_count,
+                skipped_concurrency_count = output.skipped_concurrency_count,
+                skipped_max_failures_count = output.skipped_max_failures_count,
+                skipped_expired_count = output.skipped_expired_count,
+                skipped_disabled_count = output.skipped_disabled_count,
+                dispatch_latency_ms = started_at.elapsed().as_millis(),
+                "task_dispatch_checked"
+            );
+        };
+    }
+    if output.dispatched_count > 0 || output.failed_count > 0 {
+        log_dispatch_check!(info);
+    } else {
+        log_dispatch_check!(debug);
+    }
 
     Ok(output)
 }
@@ -6106,6 +7708,25 @@ fn handle_agent_task_data_message_with_artifact_store<'a>(
     let store = store.into();
     let agent_message_time = millis_to_system_time(message.timestamp_ms);
     match message.payload {
+        fleet_protocol::WirePayload::Heartbeat {
+            agent_id: event_agent_id,
+            ..
+        } => {
+            if event_agent_id != agent_id {
+                audit_security(store, "websocket_heartbeat_agent_mismatch", agent_id)?;
+            } else {
+                // Liveness uses receipt time; the peer cannot clear an observed health fault.
+                let received_at = SystemTime::now();
+                if store
+                    .find_agent_by_id(agent_id)?
+                    .is_some_and(|agent| agent.status() == AgentStatus::Degraded)
+                {
+                    store.mark_agent_degraded(agent_id, received_at)?;
+                } else {
+                    store.mark_agent_online(agent_id, received_at)?;
+                }
+            }
+        }
         fleet_protocol::WirePayload::OutputChunk {
             job_id,
             task_id: _,
@@ -6127,7 +7748,10 @@ fn handle_agent_task_data_message_with_artifact_store<'a>(
             )?;
         }
         fleet_protocol::WirePayload::TaskAck { job_id, task_id } => {
-            let changed = store.update_active_task_assignment_status(
+            let changed = persist_agent_ack_or_rejection(
+                store,
+                agent_id,
+                &job_id,
                 &task_id,
                 AssignmentStatus::Accepted,
                 agent_message_time,
@@ -6177,7 +7801,10 @@ fn handle_agent_task_data_message_with_artifact_store<'a>(
             reason,
         } => {
             let reason_code = task_rejection_reason_code_to_str(reason_code);
-            let changed = store.update_active_task_assignment_status(
+            let changed = persist_agent_ack_or_rejection(
+                store,
+                agent_id,
+                &job_id,
                 &task_id,
                 AssignmentStatus::Rejected,
                 agent_message_time,
@@ -6526,45 +8153,45 @@ fn resolve_remediation_from_verification_evidence(
     store: ControllerStoreRef<'_>,
     verification_job_id: &str,
     task_id: &str,
-) -> Result<(), ControllerError> {
+) -> Result<bool, ControllerError> {
     let Some(remediation) =
         store.find_remediation_request_by_verification_job_id_record(verification_job_id)?
     else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(assignment) = store.find_task_assignment_state_for_job(verification_job_id)? else {
-        return Ok(());
+        return Ok(false);
     };
     if assignment.status != "succeeded" || assignment.task_id != task_id {
-        return Ok(());
+        return Ok(false);
     }
     let Some(execution_job_id) = remediation.job_id.as_deref() else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(execution_assignment) = store.find_task_assignment_state_for_job(execution_job_id)?
     else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(remediation_execution_completed_at) = execution_assignment.completed_at else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(evidence) = store.find_drift_report_by_correlation(verification_job_id, task_id)?
     else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(policy_id) = evidence.provenance.policy_id.clone() else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(policy_version) = evidence.provenance.policy_version else {
-        return Ok(());
+        return Ok(false);
     };
     if evidence.provenance.purpose != Some(fleet_domain::DriftCheckPurpose::RemediationVerification)
     {
-        return Ok(());
+        return Ok(false);
     }
     let mut repo = ControllerJobRepository { store };
     let mut audit = ControllerAuditWriter { store };
-    ResolveRemediationVerificationEvidence::execute(
+    let resolution = ResolveRemediationVerificationEvidence::execute(
         &mut repo,
         &mut audit,
         ResolveRemediationVerificationEvidenceInput {
@@ -6586,7 +8213,7 @@ fn resolve_remediation_from_verification_evidence(
         RemediationResultUseCaseError::Repository(error) => ControllerError::Store(error),
         _ => ControllerError::Json("remediation verification resolution rejected".to_owned()),
     })?;
-    Ok(())
+    Ok(resolution.is_some())
 }
 
 fn persist_verified_drifted_proposal(
@@ -6908,6 +8535,32 @@ struct TaskExecutionTransitionInput<'a> {
     occurred_at: SystemTime,
 }
 
+fn persist_agent_ack_or_rejection(
+    store: ControllerStoreRef<'_>,
+    agent_id: &str,
+    job_id: &str,
+    task_id: &str,
+    status: AssignmentStatus,
+    occurred_at: SystemTime,
+    last_error: Option<&str>,
+) -> Result<bool, ControllerError> {
+    let result = store.update_active_task_assignment_status_for_owner(
+        task_id,
+        job_id,
+        agent_id,
+        status,
+        occurred_at,
+        last_error,
+    );
+    if matches!(
+        &result,
+        Err(fleet_store::StoreError::AssignmentOwnershipMismatch)
+    ) {
+        audit_security(store, "task_assignment_owner_mismatch", agent_id)?;
+    }
+    result.map_err(ControllerError::Store)
+}
+
 fn persist_task_execution_transition(
     store: ControllerStoreRef<'_>,
     input: TaskExecutionTransitionInput<'_>,
@@ -6926,16 +8579,24 @@ fn persist_task_execution_transition(
         .unwrap_or((None, None)),
         _ => (None, None),
     };
-    store
-        .persist_remediation_execution_transition(RemediationExecutionPersistenceInput {
+    let result =
+        store.persist_remediation_execution_transition(RemediationExecutionPersistenceInput {
             task_id: input.task_id.to_owned(),
+            job_id: input.job_id.to_owned(),
+            agent_id: input.actor.to_owned(),
             assignment_status: input.assignment_status.to_owned(),
             assignment_last_error: input.assignment_last_error,
             occurred_at: input.occurred_at,
             remediation,
             remediation_audit,
-        })
-        .map_err(ControllerError::Store)
+        });
+    if matches!(
+        &result,
+        Err(fleet_store::StoreError::AssignmentOwnershipMismatch)
+    ) {
+        audit_security(store, "task_assignment_owner_mismatch", input.actor)?;
+    }
+    result.map_err(ControllerError::Store)
 }
 
 fn store_task_result_artifacts<'a>(
@@ -7265,6 +8926,223 @@ struct CatalogSyncWorker<F> {
     task: tokio::task::JoinHandle<()>,
     current_cancellation: Arc<Mutex<Option<ControllerCatalogFetchCancellation>>>,
     fetcher: std::marker::PhantomData<F>,
+}
+
+struct AssignmentRecoveryWorker {
+    shutdown: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct PendingFinalResultRecoveryWorker {
+    shutdown: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct PendingFinalResultRecoveryOutput {
+    scanned_count: usize,
+    committed_count: usize,
+    receipt_recovered_count: usize,
+    failed_count: usize,
+    receipts: Vec<(String, fleet_protocol::WireMessage)>,
+}
+
+fn run_pending_final_result_recovery_pass(
+    store: &mut ControllerStore,
+    artifact_store: &Mutex<LocalArtifactStore>,
+    signing_identity: &ControllerIdentity,
+    signed_at_ms: u64,
+) -> Result<PendingFinalResultRecoveryOutput, ControllerError> {
+    use fleet_application::delivery::{
+        LoadCommittedFinalReportsMissingReceipt, LoadPendingFinalReports,
+    };
+    use fleet_domain::delivery::ReportClass;
+
+    let reports =
+        LoadPendingFinalReports::execute(store, PENDING_FINAL_RESULT_RECOVERY_BATCH_LIMIT)
+            .map_err(ControllerError::Store)?;
+    let mut output = PendingFinalResultRecoveryOutput {
+        scanned_count: reports.len(),
+        ..PendingFinalResultRecoveryOutput::default()
+    };
+    for report in reports {
+        if report.class != ReportClass::FinalResult {
+            output.failed_count += 1;
+            continue;
+        }
+        let wire_report = match fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &report.key,
+            report.class,
+            report.body(),
+        ) {
+            Ok(report) => report,
+            Err(_) => {
+                output.failed_count += 1;
+                continue;
+            }
+        };
+        let [_, agent_id, _, _, _] = report.key.parts();
+        match commit_authenticated_final_result_report_with_artifact_store(
+            store,
+            agent_id,
+            "pending-final-recovery",
+            &wire_report,
+            signing_identity,
+            signed_at_ms,
+            Some(artifact_store),
+        ) {
+            Ok(receipt) => {
+                output.committed_count += 1;
+                output.receipts.push((agent_id.to_owned(), receipt));
+            }
+            Err(_) => output.failed_count += 1,
+        }
+    }
+
+    let receipt_candidates = LoadCommittedFinalReportsMissingReceipt::execute(
+        store,
+        PENDING_FINAL_RESULT_RECOVERY_BATCH_LIMIT,
+    )
+    .map_err(ControllerError::Store)?;
+    output.scanned_count += receipt_candidates.len();
+    let delivery = store
+        .store_ref()
+        .controller_delivery_identity()
+        .map_err(ControllerError::Store)?;
+    for candidate in receipt_candidates {
+        let [controller, agent_id, _, _, _] = candidate.key.parts();
+        if controller != delivery.namespace {
+            output.failed_count += 1;
+            continue;
+        }
+        let outcome =
+            fleet_application::delivery::InboxEffectOutcome::AlreadyCommitted(candidate.digest);
+        let receipt = crate::report_receipt::issue_and_persist_stored_receipt(
+            store,
+            &delivery,
+            &candidate.key,
+            agent_id,
+            outcome,
+            signing_identity,
+            signed_at_ms,
+        );
+        match receipt {
+            Ok(receipt) => {
+                output.receipt_recovered_count += 1;
+                let message = fleet_protocol::WireMessage::new(
+                    fleet_core::generate_prefixed_ulid("msg")
+                        .map_err(|error| ControllerError::Json(error.to_string()))?,
+                    "pending-final-receipt-recovery",
+                    Some(agent_id.to_owned()),
+                    signed_at_ms,
+                    fleet_protocol::WirePayload::ReportReceipt(receipt),
+                );
+                output.receipts.push((agent_id.to_owned(), message));
+            }
+            Err(_) => output.failed_count += 1,
+        }
+    }
+    Ok(output)
+}
+
+impl PendingFinalResultRecoveryWorker {
+    async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        let _ = self.shutdown.send(());
+        self.task.await
+    }
+}
+
+fn start_pending_final_result_recovery_worker(
+    store: Arc<Mutex<ControllerStore>>,
+    artifact_store: Arc<Mutex<LocalArtifactStore>>,
+    signing_identity: Arc<ControllerIdentity>,
+    sessions: Arc<Mutex<AgentSessionRegistry>>,
+) -> PendingFinalResultRecoveryWorker {
+    start_pending_final_result_recovery_worker_with_interval(
+        store,
+        artifact_store,
+        signing_identity,
+        sessions,
+        PENDING_FINAL_RESULT_RECOVERY_WORKER_INTERVAL,
+    )
+}
+
+fn start_pending_final_result_recovery_worker_with_interval(
+    store: Arc<Mutex<ControllerStore>>,
+    artifact_store: Arc<Mutex<LocalArtifactStore>>,
+    signing_identity: Arc<ControllerIdentity>,
+    sessions: Arc<Mutex<AgentSessionRegistry>>,
+    interval: Duration,
+) -> PendingFinalResultRecoveryWorker {
+    let (shutdown, mut shutdown_receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        tracing::info!("pending_final_result_recovery_worker_started");
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_receiver => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+
+            let pass_store = Arc::clone(&store);
+            let pass_artifact_store = Arc::clone(&artifact_store);
+            let pass_identity = Arc::clone(&signing_identity);
+            let pass = tokio::task::spawn_blocking(move || {
+                let mut store = pass_store.lock().map_err(|_| {
+                    ControllerError::Store(fleet_store::StoreError::Domain(
+                        "store lock poisoned".to_owned(),
+                    ))
+                })?;
+                run_pending_final_result_recovery_pass(
+                    &mut store,
+                    &pass_artifact_store,
+                    &pass_identity,
+                    epoch_millis() as u64,
+                )
+            })
+            .await;
+
+            let output = match pass {
+                Ok(Ok(output)) => output,
+                Ok(Err(_)) | Err(_) => {
+                    tracing::error!("pending_final_result_recovery_pass_failed");
+                    continue;
+                }
+            };
+            if output.scanned_count > 0 {
+                tracing::info!(
+                    scanned_count = output.scanned_count,
+                    committed_count = output.committed_count,
+                    receipt_recovered_count = output.receipt_recovered_count,
+                    failed_count = output.failed_count,
+                    "pending_final_result_recovery_completed"
+                );
+            }
+            let mut delivery_failures = 0usize;
+            for (agent_id, receipt) in output.receipts {
+                let send_result = sessions
+                    .lock()
+                    .map(|sessions| sessions.try_send(&agent_id, receipt));
+                if !matches!(send_result, Ok(Ok(()))) {
+                    delivery_failures += 1;
+                }
+            }
+            if delivery_failures > 0 {
+                tracing::warn!(
+                    delivery_failures,
+                    "pending_final_result_receipt_delivery_deferred"
+                );
+            }
+        }
+        tracing::info!("pending_final_result_recovery_worker_stopped");
+    });
+    PendingFinalResultRecoveryWorker { shutdown, task }
+}
+
+impl AssignmentRecoveryWorker {
+    async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        let _ = self.shutdown.send(());
+        self.task.await
+    }
 }
 
 struct CatalogSyncWorkerRequest {
@@ -7600,6 +9478,54 @@ fn persist_catalog_sync_audit(
     .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)
 }
 
+fn start_assignment_recovery_worker(
+    store: Arc<Mutex<ControllerStore>>,
+) -> AssignmentRecoveryWorker {
+    start_assignment_recovery_worker_with_clock(
+        store,
+        ASSIGNMENT_RECOVERY_WORKER_INTERVAL,
+        SystemTime::now,
+    )
+}
+
+fn start_assignment_recovery_worker_with_clock<F>(
+    store: Arc<Mutex<ControllerStore>>,
+    interval: Duration,
+    clock: F,
+) -> AssignmentRecoveryWorker
+where
+    F: Fn() -> SystemTime + Send + Sync + 'static,
+{
+    let (shutdown, mut shutdown_receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        tracing::info!("assignment_recovery_worker_started");
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_receiver => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+
+            let result = run_assignment_recovery_pass(Arc::clone(&store), clock()).await;
+            match result {
+                Ok(output) if output.scanned_count > 0 => {
+                    tracing::info!(
+                        scanned_count = output.scanned_count,
+                        recovered_count = output.recovered_count,
+                        skipped_count = output.skipped_count,
+                        "assignment_execution_recovery_completed"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(error = %error, "assignment_execution_recovery_failed");
+                }
+            }
+        }
+        tracing::info!("assignment_recovery_worker_stopped");
+    });
+    AssignmentRecoveryWorker { shutdown, task }
+}
+
 fn start_scheduled_drift_worker(
     store: Arc<Mutex<ControllerStore>>,
     identity: Arc<ControllerIdentity>,
@@ -7776,6 +9702,13 @@ fn route_request_with_identity_and_sessions<'a>(
     let method = parts.next().unwrap_or_default();
     let raw_path = parts.next().unwrap_or_default();
     let route_path = path_without_query(raw_path);
+    let output_page_request = method == "GET"
+        && route_path.starts_with("/api/jobs/")
+        && route_path.ends_with("/output-page");
+    let catalog_sync_status_request = method == "GET"
+        && route_path.starts_with("/api/catalog/sources/")
+        && route_path.contains("/sync-operations/");
+    let no_store_read = output_page_request || catalog_sync_status_request;
 
     if method == "GET" && route_path == "/healthz" {
         return Ok(response(200, "application/json", "{\"status\":\"ok\"}\n"));
@@ -7815,17 +9748,34 @@ fn route_request_with_identity_and_sessions<'a>(
     let protected_api = route_path.starts_with("/api/")
         && !matches!(route_path, "/api/agents/enroll" | "/api/agents/ws");
     let admin_context = if protected_api {
-        let Some(context) = authenticate_admin_request(request, store)? else {
-            return Ok(response(
-                401,
-                "application/json",
-                "{\"error\":\"unauthorized\"}\n",
-            ));
+        let authenticated = match authenticate_admin_request_with_metadata(request, store, metadata)
+        {
+            Ok(context) => context,
+            Err(_) if catalog_sync_status_request => {
+                return Ok(catalog_sync_status_error(
+                    500,
+                    "catalog_sync_status_unavailable",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(context) = authenticated else {
+            let response = response(401, "application/json", "{\"error\":\"unauthorized\"}\n");
+            return Ok(if no_store_read {
+                no_store(response)
+            } else {
+                response
+            });
         };
         if let Some(permission) = required_permission_for_route(method, route_path)
             && !context.allows(permission)
         {
-            return Ok(forbidden_response(permission));
+            let response = forbidden_response(permission);
+            return Ok(if no_store_read {
+                no_store(response)
+            } else {
+                response
+            });
         }
         Some(context)
     } else {
@@ -7987,7 +9937,7 @@ fn route_request_with_identity_and_sessions<'a>(
             }
         }
         ("POST", "/api/selectors/preview") => {
-            match preview_selector(request_body(request), store) {
+            match preview_selector(request_body(request), store, sessions) {
                 Ok(body) => Ok(response(200, "application/json", &format!("{body}\n"))),
                 Err(ControllerError::Json(message)) => Ok(response(
                     400,
@@ -8003,7 +9953,10 @@ fn route_request_with_identity_and_sessions<'a>(
             }
         }
         ("POST", "/api/jobs/command") => {
-            match create_command_job(request_body(request), store, identity, admin_actor) {
+            let Some(context) = admin_context.as_ref() else {
+                return Ok(admin_http::error_response((401, "unauthorized")));
+            };
+            match create_command_job(request_body(request), store, identity, context) {
                 Ok(output) => {
                     if let Some(sessions) = sessions {
                         dispatch_pending_assignments_for_created_job(
@@ -8028,11 +9981,21 @@ fn route_request_with_identity_and_sessions<'a>(
                     "application/json",
                     &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
                 )),
+                Err(CreateCommandJobHttpError::Authorization(error)) => Ok(
+                    admin_http::error_response(admin_http::failure(error, "session_limit")),
+                ),
                 Err(CreateCommandJobHttpError::Internal(error)) => Err(error),
             }
         }
         ("POST", "/api/jobs/drift-check") => {
-            match create_drift_check_job(request_body(request), store, identity, admin_actor) {
+            match create_drift_check_job(
+                request_body(request),
+                store,
+                identity,
+                admin_context
+                    .as_ref()
+                    .ok_or_else(|| ControllerError::Json("unauthorized".to_owned()))?,
+            ) {
                 Ok(output) => {
                     if let Some(sessions) = sessions {
                         dispatch_pending_assignments_for_created_job(
@@ -8057,11 +10020,21 @@ fn route_request_with_identity_and_sessions<'a>(
                     "application/json",
                     &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
                 )),
+                Err(CreateCommandJobHttpError::Authorization(error)) => Ok(
+                    admin_http::error_response(admin_http::failure(error, "session_limit")),
+                ),
                 Err(CreateCommandJobHttpError::Internal(error)) => Err(error),
             }
         }
         ("POST", "/api/jobs/runbook") => {
-            match create_runbook_job(request_body(request), store, identity, admin_actor) {
+            match create_runbook_job(
+                request_body(request),
+                store,
+                identity,
+                admin_context
+                    .as_ref()
+                    .ok_or_else(|| ControllerError::Json("unauthorized".to_owned()))?,
+            ) {
                 Ok(output) => {
                     if let Some(sessions) = sessions {
                         dispatch_pending_assignments_for_created_job(
@@ -8086,6 +10059,9 @@ fn route_request_with_identity_and_sessions<'a>(
                     "application/json",
                     &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
                 )),
+                Err(CreateCommandJobHttpError::Authorization(error)) => Ok(
+                    admin_http::error_response(admin_http::failure(error, "session_limit")),
+                ),
                 Err(CreateCommandJobHttpError::Internal(error)) => Err(error),
             }
         }
@@ -8097,9 +10073,25 @@ fn route_request_with_identity_and_sessions<'a>(
             let body = list_approvals(raw_path, store)?;
             Ok(response(200, "application/json", &format!("{body}\n")))
         }
-        ("POST", "/api/approvals/expire") => match expire_approvals(store) {
+        ("POST", "/api/approvals/expire") => match expire_approvals(
+            store,
+            admin_context
+                .as_ref()
+                .ok_or_else(|| ControllerError::Json("unauthorized".to_owned()))?,
+        ) {
             Ok(body) => Ok(response(200, "application/json", &format!("{body}\n"))),
-            Err(error) => Err(error),
+            Err(CreateCommandJobHttpError::Authorization(error)) => Ok(admin_http::error_response(
+                admin_http::failure(error, "credential_limit"),
+            )),
+            Err(CreateCommandJobHttpError::BadRequest(message)) => Ok(response(
+                400,
+                "application/json",
+                &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+            )),
+            Err(CreateCommandJobHttpError::Conflict(_)) => {
+                Ok(admin_http::error_response((409, "state_conflict")))
+            }
+            Err(CreateCommandJobHttpError::Internal(error)) => Err(error),
         },
         ("GET", "/api/remediations") => match list_remediations(raw_path, store) {
             Ok(body) => Ok(response(200, "application/json", &format!("{body}\n"))),
@@ -8131,7 +10123,9 @@ fn route_request_with_identity_and_sessions<'a>(
                 remediation_id,
                 request_body(request),
                 store,
-                admin_actor,
+                admin_context
+                    .as_ref()
+                    .ok_or_else(|| ControllerError::Json("unauthorized".to_owned()))?,
             ) {
                 Ok(body) => Ok(response(201, "application/json", &format!("{body}\n"))),
                 Err(error) => remediation_http_error_response(error),
@@ -8144,7 +10138,9 @@ fn route_request_with_identity_and_sessions<'a>(
                 request_body(request),
                 store,
                 identity,
-                admin_actor,
+                admin_context
+                    .as_ref()
+                    .ok_or_else(|| ControllerError::Json("unauthorized".to_owned()))?,
             ) {
                 Ok((body, job_id)) => {
                     if let Some(sessions) = sessions {
@@ -8191,7 +10187,14 @@ fn route_request_with_identity_and_sessions<'a>(
                 .trim_start_matches("/api/approvals/")
                 .trim_end_matches("/approve")
                 .trim_end_matches('/');
-            match approve_approval(approval_id, request_body(request), store, admin_actor) {
+            match approve_approval(
+                approval_id,
+                request_body(request),
+                store,
+                admin_context
+                    .as_ref()
+                    .ok_or_else(|| ControllerError::Json("unauthorized".to_owned()))?,
+            ) {
                 Ok(Some((body, job_id))) => {
                     if let Some(sessions) = sessions {
                         dispatch_pending_assignments_for_created_job(store, sessions, &job_id)?;
@@ -8203,12 +10206,20 @@ fn route_request_with_identity_and_sessions<'a>(
                     "application/json",
                     "{\"error\":\"not_found\"}\n",
                 )),
-                Err(ControllerError::Json(message)) => Ok(response(
+                Err(CreateCommandJobHttpError::BadRequest(message)) => Ok(response(
                     400,
                     "application/json",
                     &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
                 )),
-                Err(error) => Err(error),
+                Err(CreateCommandJobHttpError::Authorization(error)) => Ok(
+                    admin_http::error_response(admin_http::failure(error, "credential_limit")),
+                ),
+                Err(CreateCommandJobHttpError::Conflict(_)) => Ok(response(
+                    409,
+                    "application/json",
+                    "{\"error\":\"state_conflict\"}\n",
+                )),
+                Err(CreateCommandJobHttpError::Internal(error)) => Err(error),
             }
         }
         ("POST", path) if path.starts_with("/api/approvals/") && path.ends_with("/reject") => {
@@ -8216,21 +10227,37 @@ fn route_request_with_identity_and_sessions<'a>(
                 .trim_start_matches("/api/approvals/")
                 .trim_end_matches("/reject")
                 .trim_end_matches('/');
-            match reject_approval(approval_id, request_body(request), store, admin_actor) {
+            match reject_approval(
+                approval_id,
+                request_body(request),
+                store,
+                admin_context
+                    .as_ref()
+                    .ok_or_else(|| ControllerError::Json("unauthorized".to_owned()))?,
+            ) {
                 Ok(Some(body)) => Ok(response(200, "application/json", &format!("{body}\n"))),
                 Ok(None) => Ok(response(
                     404,
                     "application/json",
                     "{\"error\":\"not_found\"}\n",
                 )),
-                Err(ControllerError::Json(message)) => Ok(response(
+                Err(CreateCommandJobHttpError::BadRequest(message)) => Ok(response(
                     400,
                     "application/json",
                     &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
                 )),
-                Err(error) => Err(error),
+                Err(CreateCommandJobHttpError::Authorization(error)) => Ok(
+                    admin_http::error_response(admin_http::failure(error, "credential_limit")),
+                ),
+                Err(CreateCommandJobHttpError::Conflict(_)) => Ok(response(
+                    409,
+                    "application/json",
+                    "{\"error\":\"state_conflict\"}\n",
+                )),
+                Err(CreateCommandJobHttpError::Internal(error)) => Err(error),
             }
         }
+        ("GET", _) if output_page_request => Ok(output_page::handle(raw_path, store)),
         ("GET", path) if path.starts_with("/api/jobs/") && path.ends_with("/output") => {
             let job_id = path
                 .trim_start_matches("/api/jobs/")
@@ -8273,19 +10300,33 @@ fn route_request_with_identity_and_sessions<'a>(
                 .trim_start_matches("/api/jobs/")
                 .trim_end_matches("/cancel")
                 .trim_end_matches('/');
-            match cancel_job(job_id, request_body(request), store, sessions) {
+            match cancel_job(
+                job_id,
+                request_body(request),
+                store,
+                sessions,
+                admin_context
+                    .as_ref()
+                    .ok_or_else(|| ControllerError::Json("unauthorized".to_owned()))?,
+            ) {
                 Ok(Some(body)) => Ok(response(200, "application/json", &format!("{body}\n"))),
                 Ok(None) => Ok(response(
                     404,
                     "application/json",
                     "{\"error\":\"not_found\"}\n",
                 )),
-                Err(ControllerError::Json(message)) => Ok(response(
+                Err(CreateCommandJobHttpError::BadRequest(message)) => Ok(response(
                     400,
                     "application/json",
                     &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
                 )),
-                Err(error) => Err(error),
+                Err(CreateCommandJobHttpError::Authorization(error)) => Ok(
+                    admin_http::error_response(admin_http::failure(error, "credential_limit")),
+                ),
+                Err(CreateCommandJobHttpError::Conflict(_)) => {
+                    Ok(admin_http::error_response((409, "state_conflict")))
+                }
+                Err(CreateCommandJobHttpError::Internal(error)) => Err(error),
             }
         }
         ("GET", path) if path.starts_with("/api/jobs/") => {
@@ -8305,6 +10346,9 @@ fn route_request_with_identity_and_sessions<'a>(
         }
         ("GET", "/api/catalog/sources") => {
             catalog_http_response(list_catalog_sources(raw_path, store))
+        }
+        ("GET", _) if catalog_sync_status_request => {
+            Ok(catalog_sync_operation_status_http(raw_path, store))
         }
         ("GET", path)
             if path.starts_with("/api/catalog/sources/") && path.ends_with("/revisions") =>
@@ -9975,10 +12019,40 @@ fn admin_static_response(path: &str) -> String {
             "application/javascript; charset=utf-8",
             ADMIN_API_CLIENT_JS,
         ),
+        "/admin/admin-accounts.js" => response(
+            200,
+            "application/javascript; charset=utf-8",
+            ADMIN_ACCOUNTS_JS,
+        ),
+        "/admin/job-observer.js" => response(
+            200,
+            "application/javascript; charset=utf-8",
+            ADMIN_JOB_OBSERVER_JS,
+        ),
+        "/admin/job-output-reader.js" => response(
+            200,
+            "application/javascript; charset=utf-8",
+            ADMIN_JOB_OUTPUT_READER_JS,
+        ),
         "/admin/api.schema.json" => response(
             200,
             "application/json; charset=utf-8",
             ADMIN_API_SCHEMA_JSON,
+        ),
+        "/admin/catalog-explorer.js" => response(
+            200,
+            "application/javascript; charset=utf-8",
+            ADMIN_CATALOG_EXPLORER_JS,
+        ),
+        "/admin/catalog-actions.js" => response(
+            200,
+            "application/javascript; charset=utf-8",
+            ADMIN_CATALOG_ACTIONS_JS,
+        ),
+        "/admin/catalog-job.js" => response(
+            200,
+            "application/javascript; charset=utf-8",
+            ADMIN_CATALOG_JOB_JS,
         ),
         _ => response(404, "application/json", "{\"error\":\"not_found\"}\n"),
     }
@@ -10081,10 +12155,12 @@ fn next_snapshot_cursor(last_cursor: Option<SnapshotPageCursor>, has_more: bool)
 enum CreateCommandJobHttpError {
     BadRequest(String),
     Conflict(String),
+    Authorization(fleet_application::admin_identity::AdminAccessError),
     Internal(ControllerError),
 }
 
 enum RemediationHttpError {
+    Authorization(fleet_application::admin_identity::AdminAccessError),
     BadRequest(String),
     NotFound,
     Conflict(String),
@@ -10216,6 +12292,7 @@ fn map_enrollment_token_use_case_error(
 fn preview_selector<'a>(
     body: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
 ) -> Result<String, ControllerError> {
     let request: SelectorPreviewRequest =
         serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
@@ -10228,7 +12305,11 @@ fn preview_selector<'a>(
     let repo = ControllerAgentInventoryRepository {
         store: store.into(),
     };
-    let output = PreviewSelector::execute(&repo, SelectorPreviewInput { selector })?;
+    let output = PreviewSelector::execute_with_connected_agents(
+        &repo,
+        SelectorPreviewInput { selector },
+        &connected_agent_ids(sessions),
+    )?;
     let response = SelectorPreviewResponse {
         matched_count: output.matched_count,
         selected_count: output.selected_count,
@@ -10265,8 +12346,15 @@ fn create_command_job<'a>(
     body: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
     identity: &ControllerIdentity,
-    actor: &str,
+    actor: &AdminRequestContext,
 ) -> Result<CreateJobHttpOutput, CreateCommandJobHttpError> {
+    let mut store = store.into();
+    let owner = admin_password_worker::AdminAuthRequest::new(
+        admin_crypto::AdminAuthSettings::new(1)
+            .map_err(CreateCommandJobHttpError::Authorization)?,
+    )
+    .map_err(CreateCommandJobHttpError::Authorization)?;
+    let operation = owner.operation();
     let request: CreateCommandJobRequest = serde_json::from_str(body)
         .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
     let issued_at = SystemTime::now();
@@ -10296,28 +12384,34 @@ fn create_command_job<'a>(
         args: request.args,
         timeout: Duration::from_secs(request.timeout_seconds),
         confirmed_high_risk: request.confirmed_high_risk,
-        confirmed_by: actor.to_owned(),
+        confirmed_by: actor.actor_id.clone(),
         issued_at,
         expires_at,
         nonce_prefix,
         approval_request_id,
         approval_expires_at: expires_at,
     };
-    let mut job_repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit_writer = ControllerAuditWriter {
-        store: store.into(),
-    };
+    let metadata = fleet_application::CommandCreationMetadata::new(
+        strategy.concurrency,
+        strategy.max_failures,
+        &selector_snapshot.0,
+        selector_snapshot.1,
+    )
+    .map_err(CreateCommandJobHttpError::Authorization)?;
     let mut signer = ControllerTaskSigner {
         private_key: &identity.private_key,
         signing_fingerprint: &identity.fingerprint,
     };
 
-    let output = CreateCommandJob::execute(&mut job_repo, &mut audit_writer, &mut signer, input)
-        .map_err(map_create_command_job_error)?;
-    persist_job_strategy(store, &job_id, strategy)?;
-    persist_job_selector_snapshot(store, &job_id, selector_snapshot)?;
+    let output = fleet_application::CreateAuthorizedCommandJob::execute(
+        &mut store,
+        &actor.principal,
+        &operation,
+        &mut signer,
+        input,
+        &metadata,
+    )
+    .map_err(admin_job_write::command_error)?;
     let body = serde_json::to_string(&CreateCommandJobResponse {
         job_id: job_id.clone(),
         target_count: output.targets.len(),
@@ -10339,8 +12433,15 @@ fn create_drift_check_job<'a>(
     body: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
     identity: &ControllerIdentity,
-    actor: &str,
+    actor: &AdminRequestContext,
 ) -> Result<CreateJobHttpOutput, CreateCommandJobHttpError> {
+    let mut store = store.into();
+    let owner = admin_password_worker::AdminAuthRequest::new(
+        admin_crypto::AdminAuthSettings::new(1)
+            .map_err(CreateCommandJobHttpError::Authorization)?,
+    )
+    .map_err(CreateCommandJobHttpError::Authorization)?;
+    let operation = owner.operation();
     let request: CreateDriftCheckJobRequest = serde_json::from_str(body)
         .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
     fleet_domain::parse_policy_document(&request.policy_document)
@@ -10371,32 +12472,38 @@ fn create_drift_check_job<'a>(
         policy_document: request.policy_document,
         provenance: None,
         timeout: Duration::from_secs(request.timeout_seconds),
-        created_by: actor.to_owned(),
+        created_by: actor.actor_id.clone(),
         issued_at,
         expires_at,
         nonce_prefix,
         approval_request_id,
         approval_expires_at: expires_at,
     };
-    let mut job_repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit_writer = ControllerAuditWriter {
-        store: store.into(),
-    };
+    let metadata = fleet_application::JobCreationMetadata::new(
+        strategy.concurrency,
+        strategy.max_failures,
+        &selector_snapshot.0,
+        selector_snapshot.1,
+    )
+    .map_err(CreateCommandJobHttpError::Authorization)?;
     let mut signer = ControllerTaskSigner {
         private_key: &identity.private_key,
         signing_fingerprint: &identity.fingerprint,
     };
 
-    let output = CreateDriftCheckJob::execute(&mut job_repo, &mut audit_writer, &mut signer, input)
-        .map_err(map_create_drift_check_job_error)?;
-    persist_job_strategy(store, &job_id, strategy)?;
-    persist_job_selector_snapshot(store, &job_id, selector_snapshot)?;
+    let output = fleet_application::CreateAuthorizedStructuredJob::drift(
+        &mut store,
+        &actor.principal,
+        &operation,
+        &mut signer,
+        input,
+        &metadata,
+    )
+    .map_err(admin_job_write::structured_error)?;
     let body = serde_json::to_string(&CreateDriftCheckJobResponse {
         job_id: job_id.clone(),
-        target_count: output.targets.len(),
-        assignment_count: output.envelopes.len(),
+        target_count: output.target_count,
+        assignment_count: output.assignment_count,
         status: if output.approval_request.is_some() {
             "pending_approval".to_owned()
         } else {
@@ -10414,8 +12521,15 @@ fn create_runbook_job<'a>(
     body: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
     identity: &ControllerIdentity,
-    actor: &str,
+    actor: &AdminRequestContext,
 ) -> Result<CreateJobHttpOutput, CreateCommandJobHttpError> {
+    let mut store = store.into();
+    let owner = admin_password_worker::AdminAuthRequest::new(
+        admin_crypto::AdminAuthSettings::new(1)
+            .map_err(CreateCommandJobHttpError::Authorization)?,
+    )
+    .map_err(CreateCommandJobHttpError::Authorization)?;
+    let operation = owner.operation();
     let request: CreateRunbookJobRequest = serde_json::from_str(body)
         .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
     let runbook = fleet_domain::parse_runbook_document(&request.runbook_document)
@@ -10441,32 +12555,38 @@ fn create_runbook_job<'a>(
         runbook_document: request.runbook_document,
         timeout: Duration::from_secs(request.timeout_seconds),
         confirmed_high_risk: request.confirmed_high_risk,
-        confirmed_by: actor.to_owned(),
+        confirmed_by: actor.actor_id.clone(),
         issued_at,
         expires_at,
         nonce_prefix,
         approval_request_id,
         approval_expires_at: expires_at,
     };
-    let mut job_repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit_writer = ControllerAuditWriter {
-        store: store.into(),
-    };
+    let metadata = fleet_application::JobCreationMetadata::new(
+        strategy.concurrency,
+        strategy.max_failures,
+        &selector_snapshot.0,
+        selector_snapshot.1,
+    )
+    .map_err(CreateCommandJobHttpError::Authorization)?;
     let mut signer = ControllerTaskSigner {
         private_key: &identity.private_key,
         signing_fingerprint: &identity.fingerprint,
     };
 
-    let output = CreateRunbookJob::execute(&mut job_repo, &mut audit_writer, &mut signer, input)
-        .map_err(map_create_runbook_job_error)?;
-    persist_job_strategy(store, &job_id, strategy)?;
-    persist_job_selector_snapshot(store, &job_id, selector_snapshot)?;
+    let output = fleet_application::CreateAuthorizedStructuredJob::runbook(
+        &mut store,
+        &actor.principal,
+        &operation,
+        &mut signer,
+        input,
+        &metadata,
+    )
+    .map_err(admin_job_write::structured_error)?;
     let body = serde_json::to_string(&CreateRunbookJobResponse {
         job_id: job_id.clone(),
-        target_count: output.targets.len(),
-        assignment_count: output.envelopes.len(),
+        target_count: output.target_count,
+        assignment_count: output.assignment_count,
         status: if output.approval_request.is_some() {
             "pending_approval".to_owned()
         } else {
@@ -10695,30 +12815,6 @@ fn normalize_job_strategy(
     })
 }
 
-fn persist_job_strategy<'a>(
-    store: impl Into<ControllerStoreRef<'a>> + Copy,
-    job_id: &str,
-    strategy: JobStrategyConfig,
-) -> Result<(), CreateCommandJobHttpError> {
-    let store = store.into();
-    store
-        .update_job_strategy(job_id, strategy.concurrency, strategy.max_failures)
-        .map_err(|error| CreateCommandJobHttpError::Internal(ControllerError::Store(error)))?;
-    Ok(())
-}
-
-fn persist_job_selector_snapshot<'a>(
-    store: impl Into<ControllerStoreRef<'a>> + Copy,
-    job_id: &str,
-    selector_snapshot: (String, String),
-) -> Result<(), CreateCommandJobHttpError> {
-    let store = store.into();
-    store
-        .update_job_selector_snapshot(job_id, &selector_snapshot.0, &selector_snapshot.1)
-        .map_err(|error| CreateCommandJobHttpError::Internal(ControllerError::Store(error)))?;
-    Ok(())
-}
-
 fn list_job_output<'a>(
     job_id: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
@@ -10839,99 +12935,68 @@ fn cancel_job<'a>(
     body: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
     sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
-) -> Result<Option<String>, ControllerError> {
-    let store = store.into();
-    let Some(job_status) = store.find_job_status_value(job_id)? else {
-        return Ok(None);
-    };
+    actor: &AdminRequestContext,
+) -> Result<Option<String>, CreateCommandJobHttpError> {
     let request = if body.trim().is_empty() {
         CancelJobRequest { reason: None }
     } else {
-        serde_json::from_str::<CancelJobRequest>(body)
-            .map_err(|error| ControllerError::Json(error.to_string()))?
+        serde_json::from_str::<CancelJobRequest>(body).map_err(|_| {
+            CreateCommandJobHttpError::BadRequest("invalid_cancel_request".to_owned())
+        })?
     };
     let reason = request
         .reason
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "operator requested cancel".to_owned());
-    let now = SystemTime::now();
-    let assignments = store.list_task_assignment_summaries_for_job(job_id)?;
-    let mut canceled_count = 0;
-    let mut cancel_delivered_count = 0;
-    let mut first_canceled_assignment = None;
-
-    for assignment in assignments
-        .iter()
-        .filter(|assignment| assignment_status_accepts_cancel(&assignment.status))
-    {
-        store.update_task_assignment_status(
-            &assignment.task_id,
-            AssignmentStatus::Canceled,
-            now,
-            Some(&reason),
-        )?;
-        canceled_count += 1;
-        if first_canceled_assignment.is_none() {
-            first_canceled_assignment = Some(assignment.clone());
-        }
-        if matches!(
-            assignment.status.as_str(),
-            "dispatched" | "accepted" | "started"
-        ) && deliver_task_cancel(
-            sessions,
-            &assignment.agent_id,
-            &assignment.job_id,
-            &assignment.task_id,
-            &reason,
-        ) {
-            cancel_delivered_count += 1;
-        }
-    }
-
-    if !matches!(
-        job_status.as_str(),
-        "success" | "failed" | "canceled" | "expired"
+    let owner = admin_password_worker::AdminAuthRequest::new(
+        admin_crypto::AdminAuthSettings::new(1)
+            .map_err(CreateCommandJobHttpError::Authorization)?,
+    )
+    .map_err(CreateCommandJobHttpError::Authorization)?;
+    let output = match fleet_application::admin_cancel::CancelAdminJob::execute(
+        &mut store.into(),
+        &actor.principal,
+        &owner.operation(),
+        job_id,
+        reason,
+        fleet_core::redact_secret,
     ) {
-        store.recompute_job_status_from_assignments(job_id)?;
-        audit_job(
-            store,
-            "job_canceled",
-            job_id,
-            AuditValue::Plain(format!(
-                "reason={},canceled_count={canceled_count},cancel_delivered_count={cancel_delivered_count}",
-                fleet_core::redact_secret(&reason)
-            )),
-        )?;
-    }
-
-    let current_assignment_status = first_canceled_assignment
-        .as_ref()
-        .and_then(|assignment| store.find_task_assignment_status(&assignment.task_id).ok())
-        .flatten();
-    let final_job_status = store
-        .find_job_status_value(job_id)?
-        .unwrap_or_else(|| job_status.clone());
-    let response = CancelJobResponse {
-        job_id: job_id.to_owned(),
-        status: final_job_status,
-        task_id: first_canceled_assignment
-            .as_ref()
-            .map(|assignment| assignment.task_id.clone()),
-        agent_id: first_canceled_assignment
-            .as_ref()
-            .map(|assignment| assignment.agent_id.clone()),
-        assignment_status: current_assignment_status,
-        canceled_count,
+        Ok(output) => output,
+        Err(fleet_application::admin_identity::AdminAccessError::NotFound) => return Ok(None),
+        Err(error) => return Err(CreateCommandJobHttpError::Authorization(error)),
+    };
+    // Durable cancellation and its human audit have committed. Queue failure cannot
+    // undo that state and never causes another task execution or credential check.
+    let cancel_delivered_count = output
+        .canceled
+        .iter()
+        .filter(|assignment| {
+            assignment.status != AssignmentStatus::Queued
+                && deliver_task_cancel(
+                    sessions,
+                    assignment.agent_id.as_str(),
+                    assignment.job_id.as_str(),
+                    assignment.task_id.as_str(),
+                    &output.reason,
+                )
+        })
+        .count();
+    let first = output.canceled.first();
+    let result = CancelJobResponse {
+        job_id: output.job_id.as_str().to_owned(),
+        status: output.status.as_str().to_owned(),
+        task_id: first.map(|assignment| assignment.task_id.as_str().to_owned()),
+        agent_id: first.map(|assignment| assignment.agent_id.as_str().to_owned()),
+        assignment_status: first.map(|_| "canceled".to_owned()),
+        canceled_count: output.canceled.len(),
         cancel_delivered_count,
         cancel_delivered: cancel_delivered_count > 0,
     };
-    serde_json::to_string(&response)
-        .map(Some)
-        .map_err(|error| ControllerError::Json(error.to_string()))
-}
-
-fn assignment_status_accepts_cancel(status: &str) -> bool {
-    matches!(status, "queued" | "dispatched" | "accepted" | "started")
+    serde_json::to_string(&result).map(Some).map_err(|_| {
+        CreateCommandJobHttpError::Internal(ControllerError::Json(
+            "cancel_response_unavailable".to_owned(),
+        ))
+    })
 }
 
 fn deliver_task_cancel(
@@ -11015,6 +13080,85 @@ fn list_policies<'a>(
         .map(app_policy_to_response)
         .collect::<Vec<_>>();
     serde_json::to_string(&policies).map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+#[derive(Serialize)]
+struct CatalogSyncOperationStatusResponse {
+    id: String,
+    source_id: String,
+    commit: Option<String>,
+    state: &'static str,
+    failure: Option<&'static str>,
+}
+
+fn catalog_sync_status_error(status: u16, code: &'static str) -> String {
+    no_store(response(
+        status,
+        "application/json",
+        &format!("{{\"error\":\"{code}\"}}\n"),
+    ))
+}
+
+fn catalog_sync_operation_status_http(raw_path: &str, store: ControllerStoreRef<'_>) -> String {
+    if raw_path.contains('?') {
+        return catalog_sync_status_error(400, "invalid_query");
+    }
+    let Some((source_id, operation_id)) = raw_path
+        .strip_prefix("/api/catalog/sources/")
+        .and_then(|path| path.split_once("/sync-operations/"))
+    else {
+        return catalog_sync_status_error(404, "not_found");
+    };
+    if source_id.contains('/') || operation_id.contains('/') {
+        return catalog_sync_status_error(404, "not_found");
+    }
+    let (Ok(source_id), Ok(operation_id)) = (
+        CatalogSourceId::new(source_id),
+        CatalogSyncOperationId::new(operation_id),
+    ) else {
+        return catalog_sync_status_error(400, "invalid_catalog_identifier");
+    };
+    catalog_sync_operation_status_reply(fleet_application::GetCatalogSyncOperation::execute(
+        &store,
+        &source_id,
+        &operation_id,
+    ))
+}
+
+fn catalog_sync_operation_status_reply(
+    result: Result<Option<CatalogSyncOperation>, fleet_store::StoreError>,
+) -> String {
+    let operation = match result {
+        Ok(Some(operation)) => operation,
+        Ok(None) => return catalog_sync_status_error(404, "not_found"),
+        Err(_) => return catalog_sync_status_error(500, "catalog_sync_status_unavailable"),
+    };
+    let (state, failure) = match operation.state() {
+        fleet_domain::CatalogSyncOperationState::InProgress => ("in_progress", None),
+        fleet_domain::CatalogSyncOperationState::Completed => ("completed", None),
+        fleet_domain::CatalogSyncOperationState::Cancelled => ("cancelled", None),
+        fleet_domain::CatalogSyncOperationState::Failed(failure) => (
+            "failed",
+            Some(match failure {
+                fleet_domain::CatalogSyncFailure::FetchRejected => "fetch_rejected",
+                fleet_domain::CatalogSyncFailure::FetchFailed => "fetch_failed",
+                fleet_domain::CatalogSyncFailure::ValidationFailed => "validation_failed",
+                fleet_domain::CatalogSyncFailure::LimitExceeded => "limit_exceeded",
+                fleet_domain::CatalogSyncFailure::Cancelled => "cancelled",
+            }),
+        ),
+    };
+    let dto = CatalogSyncOperationStatusResponse {
+        id: operation.id().as_str().to_owned(),
+        source_id: operation.source_id().as_str().to_owned(),
+        commit: operation.commit().map(|commit| commit.as_str().to_owned()),
+        state,
+        failure,
+    };
+    match serde_json::to_string(&dto) {
+        Ok(body) => no_store(response(200, "application/json", &format!("{body}\n"))),
+        Err(_) => catalog_sync_status_error(500, "catalog_sync_status_unavailable"),
+    }
 }
 
 fn catalog_http_response(
@@ -11944,11 +14088,11 @@ fn get_job<'a>(
         return Ok(None);
     };
     let connected_agent_ids = connected_agent_ids(sessions);
-    serde_json::to_string(&job_summary_response_with_artifacts(
-        job,
-        &connected_agent_ids,
-        store,
-    )?)
+    let provenance = catalog_execution::job_provenance(store, job_id)?;
+    serde_json::to_string(&catalog_execution::JobDetailResponse {
+        summary: job_summary_response_with_artifacts(job, &connected_agent_ids, store)?,
+        catalog_provenance: provenance,
+    })
     .map(Some)
     .map_err(|error| ControllerError::Json(error.to_string()))
 }
@@ -11969,34 +14113,52 @@ fn list_approvals<'a>(
     serde_json::to_string(&response).map_err(|error| ControllerError::Json(error.to_string()))
 }
 
+fn decide_approval<'a>(
+    approval_id: &str,
+    body: &str,
+    store: impl Into<ControllerStoreRef<'a>> + Copy,
+    actor: &AdminRequestContext,
+    decision: fleet_application::admin_approval::AdminApprovalDecision,
+) -> Result<AppApprovalRequestRecord, CreateCommandJobHttpError> {
+    let request: ApprovalDecisionRequest = serde_json::from_str(body).map_err(|_| {
+        CreateCommandJobHttpError::BadRequest("invalid_approval_request".to_owned())
+    })?;
+    let owner = admin_password_worker::AdminAuthRequest::new(
+        admin_crypto::AdminAuthSettings::new(1)
+            .map_err(CreateCommandJobHttpError::Authorization)?,
+    )
+    .map_err(CreateCommandJobHttpError::Authorization)?;
+    fleet_application::admin_approval::DecideAdminApproval::execute(
+        &mut store.into(),
+        &actor.principal,
+        &owner.operation(),
+        approval_id,
+        decision,
+        request.reason,
+    )
+    .map(|output| output.approval)
+    .map_err(admin_job_write::approval_error)
+}
+
 fn approve_approval<'a>(
     approval_id: &str,
     body: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
-    actor: &str,
-) -> Result<Option<(String, String)>, ControllerError> {
-    let request: ApprovalDecisionRequest =
-        serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
-    let mut repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit = ControllerAuditWriter {
-        store: store.into(),
-    };
-    let output = ApproveApprovalRequest::execute(
-        &mut repo,
-        &mut audit,
-        ApproveApprovalInput {
-            approval_id: approval_id.to_owned(),
-            approver: actor.to_owned(),
-            reason: request.reason,
-            occurred_at: SystemTime::now(),
-        },
-    )
-    .map_err(map_approval_use_case_error)?;
-    let job_id = output.approval.job_id.clone();
-    let body = serde_json::to_string(&approval_response(output.approval))
-        .map_err(|error| ControllerError::Json(error.to_string()))?;
+    actor: &AdminRequestContext,
+) -> Result<Option<(String, String)>, CreateCommandJobHttpError> {
+    let approval = decide_approval(
+        approval_id,
+        body,
+        store,
+        actor,
+        fleet_application::admin_approval::AdminApprovalDecision::Approve,
+    )?;
+    let job_id = approval.job_id.clone();
+    let body = serde_json::to_string(&approval_response(approval)).map_err(|_| {
+        CreateCommandJobHttpError::Internal(ControllerError::Json(
+            "approval_response_unavailable".to_owned(),
+        ))
+    })?;
     Ok(Some((body, job_id)))
 }
 
@@ -12004,49 +14166,39 @@ fn reject_approval<'a>(
     approval_id: &str,
     body: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
-    actor: &str,
-) -> Result<Option<String>, ControllerError> {
-    let request: ApprovalDecisionRequest =
-        serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
-    let mut repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit = ControllerAuditWriter {
-        store: store.into(),
-    };
-    let output = RejectApprovalRequest::execute(
-        &mut repo,
-        &mut audit,
-        RejectApprovalInput {
-            approval_id: approval_id.to_owned(),
-            approver: actor.to_owned(),
-            reason: request.reason,
-            occurred_at: SystemTime::now(),
-        },
-    )
-    .map_err(map_approval_use_case_error)?;
-    serde_json::to_string(&approval_response(output.approval))
+    actor: &AdminRequestContext,
+) -> Result<Option<String>, CreateCommandJobHttpError> {
+    let approval = decide_approval(
+        approval_id,
+        body,
+        store,
+        actor,
+        fleet_application::admin_approval::AdminApprovalDecision::Reject,
+    )?;
+    serde_json::to_string(&approval_response(approval))
         .map(Some)
-        .map_err(|error| ControllerError::Json(error.to_string()))
+        .map_err(|_| {
+            CreateCommandJobHttpError::Internal(ControllerError::Json(
+                "approval_response_unavailable".to_owned(),
+            ))
+        })
 }
 
 fn expire_approvals<'a>(
     store: impl Into<ControllerStoreRef<'a>> + Copy,
-) -> Result<String, ControllerError> {
-    let mut repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit = ControllerAuditWriter {
-        store: store.into(),
-    };
-    let output = ExpireApprovalRequests::execute(
-        &mut repo,
-        &mut audit,
-        ExpireApprovalsInput {
-            occurred_at: SystemTime::now(),
-        },
+    actor: &AdminRequestContext,
+) -> Result<String, CreateCommandJobHttpError> {
+    let owner = admin_password_worker::AdminAuthRequest::new(
+        admin_crypto::AdminAuthSettings::new(1)
+            .map_err(CreateCommandJobHttpError::Authorization)?,
     )
-    .map_err(map_approval_use_case_error)?;
+    .map_err(CreateCommandJobHttpError::Authorization)?;
+    let output = fleet_application::admin_approval::ExpireAdminApprovals::execute(
+        &mut store.into(),
+        &actor.principal,
+        &owner.operation(),
+    )
+    .map_err(admin_job_write::approval_error)?;
     let approvals = output
         .expired
         .into_iter()
@@ -12056,7 +14208,11 @@ fn expire_approvals<'a>(
         expired_count: approvals.len(),
         approvals,
     })
-    .map_err(|error| ControllerError::Json(error.to_string()))
+    .map_err(|_| {
+        CreateCommandJobHttpError::Internal(ControllerError::Json(
+            "approval_expiry_response_unavailable".to_owned(),
+        ))
+    })
 }
 
 fn approval_response(record: AppApprovalRequestRecord) -> ApprovalRequestResponse {
@@ -12173,8 +14329,14 @@ fn create_remediation_approval_request<'a>(
     remediation_id: &str,
     body: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
-    actor: &str,
+    actor: &AdminRequestContext,
 ) -> Result<String, RemediationHttpError> {
+    let mut store = store.into();
+    let owner = admin_password_worker::AdminAuthRequest::new(
+        admin_crypto::AdminAuthSettings::new(1).map_err(RemediationHttpError::Authorization)?,
+    )
+    .map_err(RemediationHttpError::Authorization)?;
+    let operation = owner.operation();
     let request: CreateRemediationApprovalRequest = serde_json::from_str(body)
         .map_err(|error| RemediationHttpError::BadRequest(error.to_string()))?;
     let now = SystemTime::now();
@@ -12190,26 +14352,23 @@ fn create_remediation_approval_request<'a>(
             RemediationHttpError::Internal(ControllerError::Json(error.to_string()))
         })?,
     };
-    let mut repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit = ControllerAuditWriter {
-        store: store.into(),
-    };
-    let output = RequestRemediationApproval::execute(
-        &mut repo,
-        &mut audit,
+    let output = fleet_application::admin_remediation::RequestAdminRemediationApproval::execute(
+        &mut store,
+        &actor.principal,
+        &operation,
         RequestRemediationApprovalInput {
             remediation_id: remediation_id.to_owned(),
             approval_id,
             job_id,
-            requester: actor.to_owned(),
+            requester: actor.actor_id.clone(),
             reason: request.reason,
-            expires_at: now + Duration::from_secs(request.expires_in_seconds),
+            expires_at: now
+                .checked_add(Duration::from_secs(request.expires_in_seconds))
+                .ok_or_else(|| RemediationHttpError::BadRequest("invalid_expiry".to_owned()))?,
             now,
         },
     )
-    .map_err(map_remediation_approval_request_error)?;
+    .map_err(admin_job_write::remediation_error)?;
     serde_json::to_string(&CreateRemediationApprovalResponse {
         remediation: remediation_response(output.remediation),
         approval: approval_response(output.approval),
@@ -12222,12 +14381,20 @@ fn approve_remediation_job<'a>(
     body: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
     identity: &ControllerIdentity,
-    actor: &str,
+    actor: &AdminRequestContext,
 ) -> Result<(String, String), RemediationHttpError> {
+    let mut store = store.into();
+    let owner = admin_password_worker::AdminAuthRequest::new(
+        admin_crypto::AdminAuthSettings::new(1).map_err(RemediationHttpError::Authorization)?,
+    )
+    .map_err(RemediationHttpError::Authorization)?;
+    let operation = owner.operation();
     let request: ApproveRemediationJobRequest = serde_json::from_str(body)
         .map_err(|error| RemediationHttpError::BadRequest(error.to_string()))?;
     let issued_at = SystemTime::now();
-    let expires_at = issued_at + Duration::from_secs(request.expires_in_seconds);
+    let expires_at = issued_at
+        .checked_add(Duration::from_secs(request.expires_in_seconds))
+        .ok_or_else(|| RemediationHttpError::BadRequest("invalid_expiry".to_owned()))?;
     let nonce_prefix = match request.nonce_prefix {
         Some(prefix) => prefix,
         None => fleet_core::generate_prefixed_ulid("nonce").map_err(|error| {
@@ -12235,19 +14402,14 @@ fn approve_remediation_job<'a>(
         })?,
     };
     let job_id = request.job_id.clone();
-    let mut repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit = ControllerAuditWriter {
-        store: store.into(),
-    };
     let mut signer = ControllerTaskSigner {
         private_key: &identity.private_key,
         signing_fingerprint: &identity.fingerprint,
     };
-    let output = ApproveRemediationRunbookJob::execute(
-        &mut repo,
-        &mut audit,
+    let output = fleet_application::admin_remediation::ApproveAdminRemediationJob::execute(
+        &mut store,
+        &actor.principal,
+        &operation,
         &mut signer,
         ApproveRemediationRunbookJobInput {
             remediation_id: remediation_id.to_owned(),
@@ -12255,14 +14417,14 @@ fn approve_remediation_job<'a>(
             job_id: request.job_id,
             runbook_document: request.runbook_document,
             timeout: Duration::from_secs(request.timeout_seconds),
-            approver: actor.to_owned(),
+            approver: actor.actor_id.clone(),
             approval_reason: request.reason,
             issued_at,
             expires_at,
             nonce_prefix,
         },
     )
-    .map_err(map_approve_remediation_job_error)?;
+    .map_err(admin_job_write::remediation_error)?;
     let body = serde_json::to_string(&ApproveRemediationJobResponse {
         remediation: remediation_response(output.remediation),
         approval: approval_response(output.approval),
@@ -12977,35 +15139,6 @@ fn map_create_command_job_error(
     }
 }
 
-fn map_create_drift_check_job_error(
-    error: CreateDriftCheckJobError<
-        fleet_store::StoreError,
-        fleet_store::StoreError,
-        fleet_core::IdentityError,
-    >,
-) -> CreateCommandJobHttpError {
-    match error {
-        CreateDriftCheckJobError::Domain(error) => {
-            CreateCommandJobHttpError::BadRequest(error.to_string())
-        }
-        CreateDriftCheckJobError::Agent(error) => {
-            CreateCommandJobHttpError::BadRequest(error.to_string())
-        }
-        CreateDriftCheckJobError::NoTargets => CreateCommandJobHttpError::BadRequest(
-            "drift check job requires at least one target".to_owned(),
-        ),
-        CreateDriftCheckJobError::Repository(fleet_store::StoreError::ConstraintViolation(
-            message,
-        )) => CreateCommandJobHttpError::Conflict(message),
-        CreateDriftCheckJobError::Repository(error) | CreateDriftCheckJobError::Audit(error) => {
-            CreateCommandJobHttpError::Internal(ControllerError::Store(error))
-        }
-        CreateDriftCheckJobError::Sign(error) => {
-            CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
-        }
-    }
-}
-
 fn map_create_remediation_verification_job_error(
     error: CreateRemediationVerificationJobError<
         fleet_store::StoreError,
@@ -13037,40 +15170,11 @@ fn map_create_remediation_verification_job_error(
     }
 }
 
-fn map_create_runbook_job_error(
-    error: CreateRunbookJobError<
-        fleet_store::StoreError,
-        fleet_store::StoreError,
-        fleet_core::IdentityError,
-    >,
-) -> CreateCommandJobHttpError {
-    match error {
-        CreateRunbookJobError::Domain(error) => {
-            CreateCommandJobHttpError::BadRequest(error.to_string())
-        }
-        CreateRunbookJobError::Agent(error) => {
-            CreateCommandJobHttpError::BadRequest(error.to_string())
-        }
-        CreateRunbookJobError::InvalidRunbook(error) => {
-            CreateCommandJobHttpError::BadRequest(error)
-        }
-        CreateRunbookJobError::NoTargets => CreateCommandJobHttpError::BadRequest(
-            "runbook job requires at least one target".to_owned(),
-        ),
-        CreateRunbookJobError::Repository(fleet_store::StoreError::ConstraintViolation(
-            message,
-        )) => CreateCommandJobHttpError::Conflict(message),
-        CreateRunbookJobError::Repository(error) | CreateRunbookJobError::Audit(error) => {
-            CreateCommandJobHttpError::Internal(ControllerError::Store(error))
-        }
-        CreateRunbookJobError::Sign(error) => {
-            CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
-        }
-    }
-}
-
 fn remediation_http_error_response(error: RemediationHttpError) -> Result<String, ControllerError> {
     match error {
+        RemediationHttpError::Authorization(error) => Ok(admin_http::error_response(
+            admin_http::failure(error, "credential_limit"),
+        )),
         RemediationHttpError::BadRequest(message) => Ok(response(
             400,
             "application/json",
@@ -13087,65 +15191,6 @@ fn remediation_http_error_response(error: RemediationHttpError) -> Result<String
             &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
         )),
         RemediationHttpError::Internal(error) => Err(error),
-    }
-}
-
-fn map_remediation_approval_request_error(
-    error: RemediationApprovalRequestError<fleet_store::StoreError, fleet_store::StoreError>,
-) -> RemediationHttpError {
-    match error {
-        RemediationApprovalRequestError::Domain(message) => {
-            RemediationHttpError::BadRequest(message)
-        }
-        RemediationApprovalRequestError::NotFound(_) => RemediationHttpError::NotFound,
-        RemediationApprovalRequestError::Repository(
-            fleet_store::StoreError::ConstraintViolation(message),
-        ) => RemediationHttpError::Conflict(message),
-        RemediationApprovalRequestError::Repository(error)
-        | RemediationApprovalRequestError::Audit(error) => {
-            RemediationHttpError::Internal(ControllerError::Store(error))
-        }
-    }
-}
-
-fn map_approve_remediation_job_error(
-    error: ApproveRemediationRunbookJobError<
-        fleet_store::StoreError,
-        fleet_store::StoreError,
-        fleet_core::IdentityError,
-    >,
-) -> RemediationHttpError {
-    match error {
-        ApproveRemediationRunbookJobError::Domain(message)
-        | ApproveRemediationRunbookJobError::InvalidRunbook(message) => {
-            RemediationHttpError::BadRequest(message)
-        }
-        ApproveRemediationRunbookJobError::NoTargets => {
-            RemediationHttpError::BadRequest("remediation job requires a target".to_owned())
-        }
-        ApproveRemediationRunbookJobError::NotFound(_) => RemediationHttpError::NotFound,
-        ApproveRemediationRunbookJobError::Repository(
-            fleet_store::StoreError::ConstraintViolation(message),
-        ) => RemediationHttpError::Conflict(message),
-        ApproveRemediationRunbookJobError::Repository(error)
-        | ApproveRemediationRunbookJobError::Audit(error) => {
-            RemediationHttpError::Internal(ControllerError::Store(error))
-        }
-        ApproveRemediationRunbookJobError::Sign(error) => {
-            RemediationHttpError::Internal(ControllerError::Json(error.to_string()))
-        }
-    }
-}
-
-fn map_approval_use_case_error(
-    error: ApprovalUseCaseError<fleet_store::StoreError, fleet_store::StoreError>,
-) -> ControllerError {
-    match error {
-        ApprovalUseCaseError::Domain(error) => ControllerError::Json(error.to_string()),
-        ApprovalUseCaseError::NotFound => ControllerError::Store(fleet_store::StoreError::NotFound),
-        ApprovalUseCaseError::Repository(error) | ApprovalUseCaseError::Audit(error) => {
-            ControllerError::Store(error)
-        }
     }
 }
 
@@ -14100,6 +16145,18 @@ impl RemediationVerificationRecoveryRepository for ControllerJobRepository<'_> {
     }
 }
 
+impl RemediationVerificationResolutionRecoveryRepository for ControllerJobRepository<'_> {
+    type Error = fleet_store::StoreError;
+
+    fn list_pending_remediation_verification_resolutions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemediationVerificationResolutionCandidate>, Self::Error> {
+        self.store
+            .list_pending_remediation_verification_resolution_records(limit)
+    }
+}
+
 impl AppApprovalRepository for ControllerJobRepository<'_> {
     type Error = fleet_store::StoreError;
 
@@ -14489,18 +16546,41 @@ fn request_body(request: &str) -> &str {
     request.split("\r\n\r\n").nth(1).unwrap_or_default()
 }
 
+#[cfg(test)]
 fn authenticate_admin_request<'a>(
     request: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
 ) -> Result<Option<AdminRequestContext>, ControllerError> {
+    authenticate_admin_request_with_metadata(request, store, &ControllerRuntimeMetadata::default())
+}
+
+fn authenticate_admin_request_with_metadata<'a>(
+    request: &str,
+    store: impl Into<ControllerStoreRef<'a>> + Copy,
+    metadata: &ControllerRuntimeMetadata,
+) -> Result<Option<AdminRequestContext>, ControllerError> {
+    use fleet_application::admin_identity::{AdminAccessError, AdminIdentityRead};
+    let store = store.into();
+    let mode = store
+        .auth_state()
+        .map_err(|_| ControllerError::Json("administrator authentication unavailable".to_owned()))?
+        .mode;
+    if mode != fleet_domain::AdminAuthMode::LegacyBootstrap {
+        return match admin_http::authenticate(request, store, metadata) {
+            Ok(context) => Ok(context),
+            Err(AdminAccessError::Unauthorized | AdminAccessError::Forbidden) => Ok(None),
+            Err(_) => Err(ControllerError::Json(
+                "administrator authentication unavailable".to_owned(),
+            )),
+        };
+    }
     let Some(token) = bearer_token(request) else {
         return Ok(None);
     };
-    let repo = ControllerAdminTokenRepository {
-        store: store.into(),
-    };
-    let Some(record) = AuthenticateAdminToken::execute(&repo, &hash_token(token))
-        .map_err(ControllerError::from)?
+    let repo = ControllerAdminTokenRepository { store };
+    let digest = hash_token(token);
+    let Some(record) =
+        AuthenticateAdminToken::execute(&repo, &digest).map_err(ControllerError::from)?
     else {
         return Ok(None);
     };
@@ -14510,14 +16590,32 @@ fn authenticate_admin_request<'a>(
             record.actor_id
         )))
     })?;
+    let principal =
+        fleet_application::admin_identity::AdminMutationPrincipal::legacy(&digest, &record)
+            .map_err(|_| {
+                ControllerError::Json("administrator authentication unavailable".to_owned())
+            })?;
     Ok(Some(AdminRequestContext {
         actor_id: record.actor_id,
         role,
+        principal,
     }))
 }
 
 fn required_permission_for_route(method: &str, route_path: &str) -> Option<AdminPermission> {
     match (method, route_path) {
+        ("POST", "/api/auth/password" | "/api/auth/tokens") => {
+            Some(AdminPermission::SelfCredentialManage)
+        }
+        ("GET", "/api/auth/tokens") => Some(AdminPermission::SelfCredentialManage),
+        ("DELETE", path) if path.starts_with("/api/auth/tokens/") => {
+            Some(AdminPermission::SelfCredentialManage)
+        }
+        ("GET" | "POST" | "PATCH", path)
+            if path == "/api/admin/users" || path.starts_with("/api/admin/users/") =>
+        {
+            Some(AdminPermission::AccountManage)
+        }
         ("GET", "/api/agents") => Some(AdminPermission::AgentRead),
         ("GET", path) if path.starts_with("/api/agents/") => Some(AdminPermission::AgentRead),
         ("PATCH", path) if path.starts_with("/api/agents/") && path.ends_with("/labels") => {
@@ -14537,7 +16635,8 @@ fn required_permission_for_route(method: &str, route_path: &str) -> Option<Admin
         ("GET", path) if path.starts_with("/api/jobs/") => Some(AdminPermission::JobRead),
         ("POST", "/api/jobs/command")
         | ("POST", "/api/jobs/drift-check")
-        | ("POST", "/api/jobs/runbook") => Some(AdminPermission::JobCreate),
+        | ("POST", "/api/jobs/runbook")
+        | ("POST", "/api/jobs/catalog-runbook") => Some(AdminPermission::JobCreate),
         ("POST", path) if path.starts_with("/api/jobs/") && path.ends_with("/cancel") => {
             Some(AdminPermission::JobCancel)
         }
@@ -14595,14 +16694,21 @@ fn forbidden_response(permission: AdminPermission) -> String {
 }
 
 fn bearer_token(request: &str) -> Option<&str> {
-    request.lines().find_map(|line| {
+    let (head, _) = request.split_once("\r\n\r\n")?;
+    let mut values = head.lines().skip(1).filter_map(|line| {
         let (name, value) = line.split_once(':')?;
-        if name.eq_ignore_ascii_case("authorization") {
-            value.trim().strip_prefix("Bearer ")
-        } else {
-            None
-        }
-    })
+        name.eq_ignore_ascii_case("authorization")
+            .then_some(value.trim())
+    });
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.strip_prefix("Bearer ")
+}
+
+fn no_store(response: String) -> String {
+    response.replacen("\r\n\r\n", "\r\nCache-Control: no-store\r\n\r\n", 1)
 }
 
 fn response(status: u16, content_type: &str, body: &str) -> String {
@@ -14616,6 +16722,10 @@ fn response(status: u16, content_type: &str, body: &str) -> String {
         403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Content Too Large",
+        415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     format!(
@@ -14868,6 +16978,28 @@ mod tests {
     use fleet_store::SqliteStore;
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn authenticated_session_acceptance_contains_durable_controller_identity() {
+        use fleet_application::ControllerDeliveryIdentityRepository;
+
+        let store = SqliteStore::in_memory().unwrap();
+        let identity = store.controller_delivery_identity().unwrap();
+
+        let accepted =
+            controller_auth_accepted_message(&store, "agent-1".into(), "corr-1".into()).unwrap();
+
+        assert_eq!(accepted.protocol_version, fleet_protocol::PROTOCOL_VERSION);
+        assert_eq!(accepted.correlation_id.0, "corr-1");
+        assert_eq!(accepted.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(
+            accepted.payload,
+            fleet_protocol::WirePayload::AuthAccepted {
+                controller_namespace: identity.namespace,
+                store_epoch: identity.store_epoch,
+            }
+        );
+    }
 
     #[derive(Clone)]
     struct TestCatalogFetcher {
@@ -15122,6 +17254,7 @@ mod tests {
             metadata: Arc::new(ControllerRuntimeMetadata::default()),
             sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
             catalog_sync_submitter: None,
+            admin_auth: None,
         };
         let request = "POST /api/catalog/sources HTTP/1.1\r\nAuthorization: Bearer owner-token\r\n\r\n{\"source_id\":\"public-catalog\",\"url\":\"https://example.com/fleet/catalog.git\",\"reference\":\"main\"}";
 
@@ -15166,6 +17299,7 @@ mod tests {
             metadata: Arc::new(ControllerRuntimeMetadata::default()),
             sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
             catalog_sync_submitter: None,
+            admin_auth: None,
         };
         let forbidden = register_catalog_source_http(
             request.replace("owner-token", "viewer-token").as_str(),
@@ -15215,6 +17349,7 @@ mod tests {
             metadata: Arc::new(ControllerRuntimeMetadata::default()),
             sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
             catalog_sync_submitter: Some(worker.submitter()),
+            admin_auth: None,
         };
         register_catalog_source_http(
             "POST /api/catalog/sources HTTP/1.1\r\nAuthorization: Bearer owner-token\r\n\r\n{\"source_id\":\"public-catalog\",\"url\":\"https://example.com/fleet/catalog.git\",\"reference\":\"main\"}",
@@ -15265,6 +17400,7 @@ mod tests {
             metadata: Arc::new(ControllerRuntimeMetadata::default()),
             sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
             catalog_sync_submitter: None,
+            admin_auth: None,
         };
         {
             let mut guard = state.store.lock().unwrap();
@@ -15289,6 +17425,162 @@ mod tests {
             Some(&ready_commit)
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn catalog_sync_status_test_store() -> SqliteStore {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash_with_identity(
+                &hash_token("viewer-token"),
+                "viewer-1",
+                "viewer",
+            )
+            .unwrap();
+        let mut source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let mut revision = source.begin_sync(CatalogCommitId::new("a".repeat(40)).unwrap());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(1).unwrap();
+        CatalogRepository::save_catalog_source(&mut store, source.clone()).unwrap();
+        CatalogRepository::save_catalog_revision(&mut store, revision.clone()).unwrap();
+        source.activate(&revision).unwrap();
+        CatalogRepository::activate_catalog_revision(&mut store, source, &revision).unwrap();
+        store
+    }
+
+    #[test]
+    fn catalog_sync_status_reads_the_operation_not_an_existing_ready_revision() {
+        let mut store = catalog_sync_status_test_store();
+        let source_id = CatalogSourceId::new("public-catalog").unwrap();
+        let source_before = CatalogRepository::find_catalog_source(&store, &source_id).unwrap();
+        let states = [
+            fleet_domain::CatalogSyncOperationState::Completed,
+            fleet_domain::CatalogSyncOperationState::Failed(
+                fleet_domain::CatalogSyncFailure::FetchFailed,
+            ),
+            fleet_domain::CatalogSyncOperationState::Cancelled,
+            fleet_domain::CatalogSyncOperationState::InProgress,
+        ];
+        let expected = ["completed", "failed", "cancelled", "in_progress"];
+        for (index, state) in states.into_iter().enumerate() {
+            let id = CatalogSyncOperationId::new(format!("sync-{index}")).unwrap();
+            CatalogRepository::begin_or_observe_catalog_sync_operation(
+                &mut store,
+                CatalogSyncOperation::new(id.clone(), source_id.clone()),
+            )
+            .unwrap();
+            let commit =
+                (index == 0 || index == 2).then(|| CatalogCommitId::new("a".repeat(40)).unwrap());
+            let operation =
+                CatalogSyncOperation::restore(id.clone(), source_id.clone(), commit.clone(), state)
+                    .unwrap();
+            CatalogRepository::save_catalog_sync_operation(&mut store, operation.clone()).unwrap();
+            let response = route_request(&format!("GET /api/catalog/sources/public-catalog/sync-operations/{id} HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\n\r\n"), &store).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(response.contains("Cache-Control: no-store\r\n"));
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["id"], id.as_str());
+            assert_eq!(body["source_id"], "public-catalog");
+            assert_eq!(body["state"], expected[index]);
+            assert_eq!(
+                body["commit"],
+                commit.map_or(serde_json::Value::Null, |id| serde_json::Value::String(
+                    id.as_str().to_owned()
+                ))
+            );
+            assert_eq!(
+                body["failure"],
+                if index == 1 {
+                    serde_json::Value::String("fetch_failed".to_owned())
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+            assert_eq!(body.as_object().unwrap().len(), 5);
+            assert!(!response.contains("viewer-token"));
+            assert!(!response.contains("example.com"));
+            assert_eq!(
+                CatalogRepository::find_catalog_sync_operation(&store, &id).unwrap(),
+                Some(operation)
+            );
+        }
+        assert_eq!(
+            CatalogRepository::find_catalog_source(&store, &source_id).unwrap(),
+            source_before
+        );
+    }
+
+    #[test]
+    fn catalog_sync_status_protects_source_identity_and_rejects_bad_queries_without_caching() {
+        let mut store = catalog_sync_status_test_store();
+        CatalogRepository::begin_or_observe_catalog_sync_operation(
+            &mut store,
+            CatalogSyncOperation::new(
+                CatalogSyncOperationId::new("sync-a").unwrap(),
+                CatalogSourceId::new("public-catalog").unwrap(),
+            ),
+        )
+        .unwrap();
+        let path = "/api/catalog/sources/public-catalog/sync-operations/sync-a";
+        assert_eq!(
+            required_permission_for_route("GET", path),
+            Some(AdminPermission::PolicyRead)
+        );
+        let unauthorized = route_request(&format!("GET {path} HTTP/1.1\r\n\r\n"), &store).unwrap();
+        assert!(unauthorized.starts_with("HTTP/1.1 401"));
+        assert!(unauthorized.contains("Cache-Control: no-store\r\n"));
+        for (path, status) in [
+            (
+                "/api/catalog/sources/other-catalog/sync-operations/sync-a",
+                404,
+            ),
+            (
+                "/api/catalog/sources/public-catalog/sync-operations/missing",
+                404,
+            ),
+            (
+                "/api/catalog/sources/invalid%20source/sync-operations/sync-a",
+                400,
+            ),
+            (
+                "/api/catalog/sources/public-catalog/sync-operations/invalid%20operation",
+                400,
+            ),
+            (
+                "/api/catalog/sources/public-catalog/sync-operations/sync-a?unexpected=value",
+                400,
+            ),
+        ] {
+            let response = route_request(
+                &format!("GET {path} HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\n\r\n"),
+                &store,
+            )
+            .unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+            assert!(response.contains("Cache-Control: no-store\r\n"));
+        }
+        let forbidden = no_store(forbidden_response(AdminPermission::PolicyRead));
+        assert!(forbidden.starts_with("HTTP/1.1 403"));
+        assert!(forbidden.contains("Cache-Control: no-store\r\n"));
+    }
+
+    #[test]
+    fn catalog_sync_status_redacts_repository_failures() {
+        let response = catalog_sync_operation_status_reply(Err(fleet_store::StoreError::Domain(
+            "SELECT private-query: no such table".to_owned(),
+        )));
+        assert!(response.starts_with("HTTP/1.1 500"));
+        assert!(response.contains("catalog_sync_status_unavailable"));
+        assert!(response.contains("Cache-Control: no-store\r\n"));
+        assert!(!response.contains("no such table"));
+        assert!(!response.contains("SELECT"));
     }
 
     #[test]
@@ -16461,6 +18753,590 @@ mod tests {
         assert_eq!(
             receiver.try_recv().unwrap(),
             AgentSessionOutboundMessage::Wire(Box::new(message))
+        );
+    }
+
+    #[test]
+    fn stored_report_receipt_uses_the_single_session_writer_queue() {
+        let (sender, mut receiver) =
+            mpsc::channel::<AgentSessionOutboundMessage>(AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY);
+        let receipt = fleet_protocol::WireMessage::new(
+            "msg-receipt",
+            "corr-output",
+            Some("agent-1".to_owned()),
+            10,
+            fleet_protocol::WirePayload::ReportReceipt(
+                fleet_protocol::receipt::SignedReportReceiptWire {
+                    statement: fleet_protocol::receipt::ReportReceiptStatementWire {
+                        controller_namespace: "a".repeat(64),
+                        store_epoch: "b".repeat(64),
+                        agent_id: "agent-1".to_owned(),
+                        job_id: "job-1".to_owned(),
+                        task_id: "task-1".to_owned(),
+                        report_id: "report-1".to_owned(),
+                        digest_hex: "c".repeat(64),
+                        signed_at_ms: 10,
+                        disposition: fleet_protocol::receipt::ReportDispositionWire::Stored,
+                        signing_key_fingerprint: "d".repeat(64),
+                    },
+                    signature_hex: "e".repeat(128),
+                },
+            ),
+        );
+
+        queue_agent_session_message(&sender, receipt.clone()).unwrap();
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentSessionOutboundMessage::Wire(Box::new(receipt))
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_websocket_commits_and_returns_persisted_output_and_lifecycle_receipts() {
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        let root = tempfile::tempdir().unwrap();
+        let sqlite = SqliteStore::in_memory().unwrap();
+        let agent_keys = fleet_core::generate_agent_key_pair().unwrap();
+        sqlite
+            .save_agent(agent_fixture(
+                "agent-live",
+                "agent-live",
+                &agent_keys.public_key_hex,
+                &agent_keys.fingerprint,
+            ))
+            .unwrap();
+        save_test_job(&sqlite, "job-live-output");
+        save_test_assignment(&sqlite, "job-live-output", "task-live-output", "agent-live");
+        sqlite
+            .update_task_assignment_status(
+                "task-live-output",
+                AssignmentStatus::Started,
+                SystemTime::now(),
+                None,
+            )
+            .unwrap();
+        save_test_job(&sqlite, "job-live-ack");
+        save_test_assignment(&sqlite, "job-live-ack", "task-live-ack", "agent-live");
+        sqlite
+            .update_task_assignment_status(
+                "task-live-ack",
+                AssignmentStatus::Dispatched,
+                SystemTime::now(),
+                None,
+            )
+            .unwrap();
+        save_test_job(&sqlite, "job-live-reject");
+        save_test_assignment(&sqlite, "job-live-reject", "task-live-reject", "agent-live");
+        sqlite
+            .update_task_assignment_status(
+                "task-live-reject",
+                AssignmentStatus::Dispatched,
+                SystemTime::now(),
+                None,
+            )
+            .unwrap();
+        sqlite
+            .save_remediation_request_record(&controller_remediation_request_record(
+                "remediation-live",
+                "agent-live",
+                "policy-live",
+                "job_created",
+                Some("job-live-ack"),
+            ))
+            .unwrap();
+        let delivery_identity = sqlite.controller_delivery_identity().unwrap();
+        let controller_keys = fleet_core::generate_agent_key_pair().unwrap();
+        let controller_identity = ControllerIdentity {
+            public_key: controller_keys.public_key_hex,
+            fingerprint: controller_keys.fingerprint,
+            private_key: controller_keys.private_key_hex,
+        };
+        let verify_key = controller_identity.public_key.clone();
+        let store = Arc::new(Mutex::new(ControllerStore::Sqlite(sqlite)));
+        let state = ControllerAppState {
+            store: store.clone(),
+            artifact_store: Arc::new(Mutex::new(
+                LocalArtifactStore::new(root.path().join("artifacts")).unwrap(),
+            )),
+            identity: Arc::new(controller_identity),
+            metadata: Arc::new(ControllerRuntimeMetadata::default()),
+            sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+            catalog_sync_submitter: None,
+            admin_auth: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/api/agents/ws", get(axum_agent_websocket))
+            .with_state(state);
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_receiver.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let agent_id = "agent-live".to_owned();
+        let agent_private_key = agent_keys.private_key_hex;
+        let agent_fingerprint = agent_keys.fingerprint;
+        let expected_namespace = delivery_identity.namespace;
+        let expected_epoch = delivery_identity.store_epoch;
+        let namespace_for_client = expected_namespace.clone();
+        let epoch_for_client = expected_epoch.clone();
+        let (
+            first_receipt,
+            replayed_receipt,
+            first_ack_receipt,
+            replayed_ack_receipt,
+            first_started_receipt,
+            replayed_started_receipt,
+            first_rejected_receipt,
+            replayed_rejected_receipt,
+        ) = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                use tungstenite::Message;
+
+                fn send_wire(
+                    socket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+                    message: &fleet_protocol::WireMessage,
+                ) -> Result<(), String> {
+                    let encoded = fleet_protocol::encode_message(message)
+                        .map_err(|error| error.to_string())?;
+                    socket
+                        .send(Message::Text(encoded))
+                        .map_err(|error| error.to_string())
+                }
+
+                fn read_wire(
+                    socket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+                ) -> Result<fleet_protocol::WireMessage, String> {
+                    loop {
+                        match socket.read().map_err(|error| error.to_string())? {
+                            Message::Text(body) => {
+                                return fleet_protocol::decode_message(body.as_str())
+                                    .map_err(|error| error.to_string());
+                            }
+                            Message::Close(_) => return Err("websocket closed".to_owned()),
+                            Message::Ping(bytes) => socket
+                                .send(Message::Pong(bytes))
+                                .map_err(|error| error.to_string())?,
+                            _ => {}
+                        }
+                    }
+                }
+
+                fn read_receipt(
+                    socket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+                ) -> Result<fleet_protocol::receipt::SignedReportReceiptWire, String>
+                {
+                    loop {
+                        let message = read_wire(socket)?;
+                        if let fleet_protocol::WirePayload::ReportReceipt(receipt) = message.payload
+                        {
+                            return Ok(receipt);
+                        }
+                    }
+                }
+
+                let stream =
+                    std::net::TcpStream::connect(address).map_err(|error| error.to_string())?;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|error| error.to_string())?;
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|error| error.to_string())?;
+                let (mut socket, _) =
+                    tungstenite::client(format!("ws://{address}/api/agents/ws"), stream)
+                        .map_err(|error| error.to_string())?;
+                send_wire(
+                    &mut socket,
+                    &fleet_protocol::WireMessage::new(
+                        "msg-live-hello",
+                        "corr-live-session",
+                        Some(agent_id.clone()),
+                        1,
+                        fleet_protocol::WirePayload::AgentHello {
+                            agent_id: agent_id.clone(),
+                            fingerprint: agent_fingerprint,
+                        },
+                    ),
+                )?;
+                let challenge = read_wire(&mut socket)?;
+                let fleet_protocol::WirePayload::AuthChallenge { nonce } = challenge.payload else {
+                    return Err("expected auth challenge".to_owned());
+                };
+                send_wire(
+                    &mut socket,
+                    &fleet_protocol::WireMessage::new(
+                        "msg-live-auth",
+                        "corr-live-session",
+                        Some(agent_id.clone()),
+                        2,
+                        fleet_protocol::WirePayload::AuthResponse {
+                            nonce: nonce.clone(),
+                            signature: fleet_core::sign_challenge(&agent_private_key, &nonce)
+                                .map_err(|error| error.to_string())?,
+                        },
+                    ),
+                )?;
+                let accepted = read_wire(&mut socket)?;
+                if accepted.correlation_id.0 != "corr-live-session"
+                    || accepted.agent_id.as_deref() != Some(agent_id.as_str())
+                    || accepted.payload
+                        != (fleet_protocol::WirePayload::AuthAccepted {
+                            controller_namespace: namespace_for_client.clone(),
+                            store_epoch: epoch_for_client.clone(),
+                        })
+                {
+                    return Err("unexpected authentication acceptance".to_owned());
+                }
+                send_wire(
+                    &mut socket,
+                    &fleet_protocol::WireMessage::new(
+                        "msg-live-heartbeat",
+                        "corr-live-session",
+                        Some(agent_id.clone()),
+                        3,
+                        fleet_protocol::WirePayload::Heartbeat {
+                            agent_id: agent_id.clone(),
+                            status: "online".to_owned(),
+                        },
+                    ),
+                )?;
+                let report_key = ReportKey::new(
+                    &namespace_for_client,
+                    &agent_id,
+                    "job-live-output",
+                    "task-live-output",
+                    "stdout-00000000000000000000",
+                )
+                .map_err(|error| error.to_string())?;
+                let body = serde_json::json!({
+                    "stream": "stdout",
+                    "sequence": 0,
+                    "data": "loopback output",
+                });
+                let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+                    &report_key,
+                    ReportClass::Output,
+                    &serde_json::to_vec(&body).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                let message = fleet_protocol::WireMessage::new(
+                    "msg-live-output",
+                    "corr-live-output",
+                    Some(agent_id.clone()),
+                    4,
+                    fleet_protocol::WirePayload::TaskReport(report),
+                );
+                send_wire(&mut socket, &message)?;
+                let first = read_receipt(&mut socket)?;
+                send_wire(&mut socket, &message)?;
+                let replay = read_receipt(&mut socket)?;
+                let ack_key = ReportKey::new(
+                    &namespace_for_client,
+                    &agent_id,
+                    "job-live-ack",
+                    "task-live-ack",
+                    "task-ack",
+                )
+                .map_err(|error| error.to_string())?;
+                let ack_body = serde_json::json!({"event": "task_ack"});
+                let ack_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+                    &ack_key,
+                    ReportClass::Lifecycle,
+                    &serde_json::to_vec(&ack_body).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                let ack_message = fleet_protocol::WireMessage::new(
+                    "msg-live-task-ack",
+                    "corr-live-task-ack",
+                    Some(agent_id.clone()),
+                    5,
+                    fleet_protocol::WirePayload::TaskReport(ack_report),
+                );
+                send_wire(&mut socket, &ack_message)?;
+                let first_ack = read_receipt(&mut socket)?;
+                send_wire(&mut socket, &ack_message)?;
+                let replay_ack = read_receipt(&mut socket)?;
+                let started_key = ReportKey::new(
+                    &namespace_for_client,
+                    &agent_id,
+                    "job-live-ack",
+                    "task-live-ack",
+                    "task-started",
+                )
+                .map_err(|error| error.to_string())?;
+                let started_body = serde_json::json!({"event": "task_started"});
+                let started_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+                    &started_key,
+                    ReportClass::Lifecycle,
+                    &serde_json::to_vec(&started_body).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                let started_message = fleet_protocol::WireMessage::new(
+                    "msg-live-task-started",
+                    "corr-live-task-started",
+                    Some(agent_id.clone()),
+                    6,
+                    fleet_protocol::WirePayload::TaskReport(started_report),
+                );
+                send_wire(&mut socket, &started_message)?;
+                let first_started = read_receipt(&mut socket)?;
+                send_wire(&mut socket, &started_message)?;
+                let replay_started = read_receipt(&mut socket)?;
+                let rejected_key = ReportKey::new(
+                    &namespace_for_client,
+                    &agent_id,
+                    "job-live-reject",
+                    "task-live-reject",
+                    "task-rejected",
+                )
+                .map_err(|error| error.to_string())?;
+                let rejected_body = serde_json::json!({
+                    "event": "task_rejected",
+                    "reason_code": "invalid_signature",
+                    "reason": "signature check failed",
+                });
+                let rejected_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+                    &rejected_key,
+                    ReportClass::Lifecycle,
+                    &serde_json::to_vec(&rejected_body).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                let rejected_message = fleet_protocol::WireMessage::new(
+                    "msg-live-task-rejected",
+                    "corr-live-task-rejected",
+                    Some(agent_id.clone()),
+                    7,
+                    fleet_protocol::WirePayload::TaskReport(rejected_report),
+                );
+                send_wire(&mut socket, &rejected_message)?;
+                let first_rejected = read_receipt(&mut socket)?;
+                send_wire(&mut socket, &rejected_message)?;
+                let replay_rejected = read_receipt(&mut socket)?;
+                Ok((
+                    first,
+                    replay,
+                    first_ack,
+                    replay_ack,
+                    first_started,
+                    replay_started,
+                    first_rejected,
+                    replay_rejected,
+                ))
+            }),
+        )
+        .await
+        .expect("loopback report path timed out")
+        .expect("loopback report client panicked")
+        .expect("loopback report exchange failed");
+
+        assert_eq!(first_receipt, replayed_receipt);
+        assert_eq!(first_ack_receipt, replayed_ack_receipt);
+        assert_eq!(first_started_receipt, replayed_started_receipt);
+        assert_eq!(first_rejected_receipt, replayed_rejected_receipt);
+        assert_eq!(
+            first_receipt.statement.controller_namespace,
+            expected_namespace
+        );
+        assert_eq!(first_receipt.statement.store_epoch, expected_epoch);
+        assert_eq!(first_receipt.statement.agent_id, "agent-live");
+        assert_eq!(
+            first_receipt.statement.disposition,
+            fleet_protocol::receipt::ReportDispositionWire::Stored
+        );
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &verify_key,
+                &first_receipt.statement.signing_preimage().unwrap(),
+                &first_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+        assert_eq!(first_ack_receipt.statement.job_id, "job-live-ack");
+        assert_eq!(first_ack_receipt.statement.task_id, "task-live-ack");
+        assert_eq!(first_ack_receipt.statement.report_id, "task-ack");
+        assert_eq!(first_started_receipt.statement.job_id, "job-live-ack");
+        assert_eq!(first_started_receipt.statement.task_id, "task-live-ack");
+        assert_eq!(first_started_receipt.statement.report_id, "task-started");
+        assert_eq!(first_rejected_receipt.statement.job_id, "job-live-reject");
+        assert_eq!(first_rejected_receipt.statement.task_id, "task-live-reject");
+        assert_eq!(first_rejected_receipt.statement.report_id, "task-rejected");
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &verify_key,
+                &first_ack_receipt.statement.signing_preimage().unwrap(),
+                &first_ack_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &verify_key,
+                &first_started_receipt.statement.signing_preimage().unwrap(),
+                &first_started_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &verify_key,
+                &first_rejected_receipt.statement.signing_preimage().unwrap(),
+                &first_rejected_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+        {
+            let guard = store.lock().unwrap();
+            let sqlite = sqlite_test_store(&guard);
+            let output = sqlite
+                .list_job_output_chunks("job-live-output", "agent-live")
+                .unwrap();
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].body, "loopback output");
+            assert_eq!(
+                sqlite
+                    .find_task_assignment_status("task-live-ack")
+                    .unwrap()
+                    .as_deref(),
+                Some("started")
+            );
+            assert_eq!(
+                sqlite
+                    .find_job_status_value("job-live-ack")
+                    .unwrap()
+                    .as_deref(),
+                Some("running")
+            );
+            assert_eq!(
+                sqlite
+                    .list_audit_events_by_category(AuditCategory::Job, 50)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.action == "task_accepted")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                sqlite
+                    .find_task_assignment_status("task-live-reject")
+                    .unwrap()
+                    .as_deref(),
+                Some("rejected")
+            );
+            assert_eq!(
+                sqlite
+                    .find_job_status_value("job-live-reject")
+                    .unwrap()
+                    .as_deref(),
+                Some("failed")
+            );
+            let rejected = sqlite
+                .list_task_assignment_summaries_for_job("job-live-reject")
+                .unwrap();
+            assert_eq!(
+                rejected[0].last_error,
+                "invalid_signature: signature check failed"
+            );
+            assert_eq!(
+                sqlite
+                    .list_audit_events_by_category(AuditCategory::Job, 50)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.action == "task_rejected")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                sqlite
+                    .find_remediation_request_record("remediation-live")
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "running"
+            );
+            assert_eq!(
+                sqlite
+                    .list_audit_events_by_category(AuditCategory::Policy, 50)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.action == "remediation_job_running")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                sqlite
+                    .list_audit_events_by_category(AuditCategory::Job, 50)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.action == "task_started")
+                    .count(),
+                1
+            );
+        }
+
+        let _ = shutdown_sender.send(());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn task_started_report_requires_its_stable_report_identity() {
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        let sqlite = SqliteStore::in_memory().unwrap();
+        save_test_agent(&sqlite, "agent-1");
+        save_test_job(&sqlite, "job-1");
+        save_test_assignment(&sqlite, "job-1", "task-1", "agent-1");
+        sqlite
+            .update_task_assignment_status(
+                "task-1",
+                AssignmentStatus::Accepted,
+                SystemTime::UNIX_EPOCH,
+                None,
+            )
+            .unwrap();
+        let namespace = sqlite.controller_delivery_identity().unwrap().namespace;
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "task-ack").unwrap();
+        let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::Lifecycle,
+            br#"{"event":"task_started"}"#,
+        )
+        .unwrap();
+        let keys = fleet_core::generate_agent_key_pair().unwrap();
+        let identity = ControllerIdentity {
+            public_key: keys.public_key_hex,
+            fingerprint: keys.fingerprint,
+            private_key: keys.private_key_hex,
+        };
+        let mut store = ControllerStore::Sqlite(sqlite);
+
+        assert!(
+            commit_authenticated_task_lifecycle_report(
+                &mut store,
+                "agent-1",
+                "corr-invalid-lifecycle-key",
+                &report,
+                &identity,
+                1,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .store_ref()
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("accepted")
         );
     }
 
@@ -18427,6 +21303,15 @@ mod tests {
     }
 
     #[test]
+    fn controller_store_exposes_the_catalog_atomic_creation_boundary() {
+        fn requires<
+            R: fleet_application::CatalogRunbookJobCreationRepository<Error = fleet_store::StoreError>,
+        >() {
+        }
+        requires::<ControllerStore>();
+    }
+
+    #[test]
     fn admin_static_assets_are_served_by_controller() {
         let store = SqliteStore::in_memory().unwrap();
 
@@ -18438,6 +21323,22 @@ mod tests {
         let js_with_query =
             route_request("GET /admin/app.js?v=1 HTTP/1.1\r\n\r\n", &store).unwrap();
         let client = route_request("GET /admin/api-client.js HTTP/1.1\r\n\r\n", &store).unwrap();
+        let observer =
+            route_request("GET /admin/job-observer.js?v=1 HTTP/1.1\r\n\r\n", &store).unwrap();
+        let output_reader = route_request(
+            "GET /admin/job-output-reader.js?v=1 HTTP/1.1\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        let catalog_explorer =
+            route_request("GET /admin/catalog-explorer.js HTTP/1.1\r\n\r\n", &store).unwrap();
+        assert!(catalog_explorer.starts_with("HTTP/1.1 200"));
+        assert!(catalog_explorer.contains("Content-Type: application/javascript; charset=utf-8"));
+        assert!(catalog_explorer.contains("export function createCatalogExplorer"));
+        let catalog_actions =
+            route_request("GET /admin/catalog-actions.js HTTP/1.1\r\n\r\n", &store).unwrap();
+        assert!(catalog_actions.starts_with("HTTP/1.1 200"));
+        assert!(catalog_actions.contains("export function createCatalogActions"));
         let schema = route_request("GET /admin/api.schema.json HTTP/1.1\r\n\r\n", &store).unwrap();
         let missing = route_request("GET /admin/missing.js HTTP/1.1\r\n\r\n", &store).unwrap();
         let favicon = route_request("GET /favicon.ico HTTP/1.1\r\n\r\n", &store).unwrap();
@@ -18458,9 +21359,23 @@ mod tests {
         assert!(js_with_query.contains("createApiClient"));
         assert!(client.starts_with("HTTP/1.1 200"));
         assert!(client.contains("/api/agents"));
+        assert!(observer.starts_with("HTTP/1.1 200"));
+        assert!(observer.contains("Content-Type: application/javascript; charset=utf-8"));
+        assert!(observer.contains("export function createJobObserver"));
+        assert!(output_reader.starts_with("HTTP/1.1 200"));
+        assert!(output_reader.contains("Content-Type: application/javascript; charset=utf-8"));
+        assert!(output_reader.contains("export function createJobOutputReader"));
         assert!(schema.starts_with("HTTP/1.1 200"));
         assert!(schema.contains("\"schema_version\": \"mvp-1\""));
         assert!(favicon.starts_with("HTTP/1.1 204"));
+        let catalog_job =
+            route_request("GET /admin/catalog-job.js HTTP/1.1\r\n\r\n", &store).unwrap();
+        assert!(catalog_job.starts_with("HTTP/1.1 200"));
+        assert!(catalog_job.contains("export function createCatalogJobSubmission"));
+        let accounts =
+            route_request("GET /admin/admin-accounts.js HTTP/1.1\r\n\r\n", &store).unwrap();
+        assert!(accounts.starts_with("HTTP/1.1 200"));
+        assert!(accounts.contains("export function createAdminAccounts"));
         assert!(missing.starts_with("HTTP/1.1 404"));
     }
 
@@ -18577,6 +21492,11 @@ mod tests {
         RestApiRouteContract {
             method: "POST",
             path: "/api/catalog/sources/{source_id}/sync",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/catalog/sources/{source_id}/sync-operations/{operation_id}",
             surface: ApiSurface::Admin,
         },
         RestApiRouteContract {
@@ -18701,12 +21621,22 @@ mod tests {
         },
         RestApiRouteContract {
             method: "POST",
+            path: "/api/jobs/catalog-runbook",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
             path: "/api/jobs/{job_id}/cancel",
             surface: ApiSurface::Admin,
         },
         RestApiRouteContract {
             method: "GET",
             path: "/api/jobs/{job_id}/output",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/jobs/{job_id}/output-page",
             surface: ApiSurface::Admin,
         },
         RestApiRouteContract {
@@ -19152,10 +22082,26 @@ mod tests {
         let operator = AdminRequestContext {
             actor_id: "operator-1".to_owned(),
             role: AdminRole::Operator,
+            principal: fleet_application::admin_identity::AdminMutationPrincipal::legacy(
+                &hash_token("permission-fixture"),
+                &fleet_application::AdminTokenRecord {
+                    actor_id: "operator-1".to_owned(),
+                    role: "operator".to_owned(),
+                },
+            )
+            .unwrap(),
         };
         let viewer = AdminRequestContext {
             actor_id: "viewer-1".to_owned(),
             role: AdminRole::Viewer,
+            principal: fleet_application::admin_identity::AdminMutationPrincipal::legacy(
+                &hash_token("permission-fixture"),
+                &fleet_application::AdminTokenRecord {
+                    actor_id: "viewer-1".to_owned(),
+                    role: "viewer".to_owned(),
+                },
+            )
+            .unwrap(),
         };
 
         assert!(operator.allows(AdminPermission::JobCreate));
@@ -19167,6 +22113,241 @@ mod tests {
         assert!(viewer.allows(AdminPermission::JobRead));
         assert!(!viewer.allows(AdminPermission::JobCreate));
         assert!(!viewer.allows(AdminPermission::JobApprove));
+    }
+
+    #[test]
+    fn admin_identity_characterization_preserves_existing_business_permissions() {
+        let permissions = [
+            AdminPermission::AgentRead,
+            AdminPermission::AgentWrite,
+            AdminPermission::AgentRevoke,
+            AdminPermission::ApprovalRead,
+            AdminPermission::JobRead,
+            AdminPermission::JobCreate,
+            AdminPermission::JobApprove,
+            AdminPermission::JobCancel,
+            AdminPermission::EnrollmentTokenRead,
+            AdminPermission::EnrollmentTokenCreate,
+            AdminPermission::EnrollmentTokenRevoke,
+            AdminPermission::AuditRead,
+            AdminPermission::PolicyRead,
+            AdminPermission::PolicyWrite,
+            AdminPermission::SigningRotationWrite,
+        ];
+        let all = [
+            "agent_read",
+            "agent_write",
+            "agent_revoke",
+            "approval_read",
+            "job_read",
+            "job_create",
+            "job_approve",
+            "job_cancel",
+            "enrollment_token_read",
+            "enrollment_token_create",
+            "enrollment_token_revoke",
+            "audit_read",
+            "policy_read",
+            "policy_write",
+            "signing_rotation_write",
+        ];
+        let execution = [
+            "agent_read",
+            "approval_read",
+            "job_read",
+            "job_create",
+            "job_approve",
+            "job_cancel",
+            "audit_read",
+            "policy_read",
+        ];
+        let read_only = [
+            "agent_read",
+            "approval_read",
+            "job_read",
+            "audit_read",
+            "policy_read",
+        ];
+        for (role, allowed) in [
+            (AdminRole::Owner, all.as_slice()),
+            (AdminRole::Admin, all.as_slice()),
+            (AdminRole::Operator, execution.as_slice()),
+            (AdminRole::Viewer, read_only.as_slice()),
+        ] {
+            for permission in permissions {
+                assert_eq!(
+                    role.allows(permission),
+                    allowed.contains(&permission.as_str()),
+                    "{role:?}: {}",
+                    permission.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admin_identity_characterization_direct_routes_use_stored_role_and_actor() {
+        for (role, can_enroll) in [
+            ("owner", true),
+            ("admin", true),
+            ("operator", false),
+            ("viewer", false),
+        ] {
+            let store = SqliteStore::in_memory().unwrap();
+            let actor = format!("fixture-{role}");
+            store
+                .insert_admin_token_hash_with_identity(
+                    &hash_token("fixture-credential"),
+                    &actor,
+                    role,
+                )
+                .unwrap();
+            let read = route_request(
+                "GET /api/agents HTTP/1.1\r\nAuthorization: Bearer fixture-credential\r\n\r\n",
+                &store,
+            )
+            .unwrap();
+            assert!(read.starts_with("HTTP/1.1 200"), "{role} read");
+            let write = route_request(
+                "POST /api/enrollment-tokens HTTP/1.1\r\nAuthorization: Bearer fixture-credential\r\nContent-Length: 2\r\n\r\n{}",
+                &store,
+            )
+            .unwrap();
+            let audits = store
+                .list_audit_events_by_category(AuditCategory::Enrollment, 10)
+                .unwrap();
+            if can_enroll {
+                assert!(write.starts_with("HTTP/1.1 201"), "{role} write");
+                assert_eq!(store.list_enrollment_tokens().unwrap().len(), 1);
+                assert_eq!(audits.len(), 1);
+                assert_eq!(audits[0].actor.as_str(), actor);
+            } else {
+                assert!(write.starts_with("HTTP/1.1 403"), "{role} write");
+                assert!(write.contains("\"required_permission\":\"enrollment_token_create\""));
+                assert!(store.list_enrollment_tokens().unwrap().is_empty());
+                assert!(audits.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn admin_identity_characterization_missing_and_invalid_bearer_are_rejected() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("fixture-credential"))
+            .unwrap();
+        for path in ["/api/agents", "/api/jobs", "/api/approvals"] {
+            for header in ["", "Authorization: Bearer unknown-fixture\r\n"] {
+                let response =
+                    route_request(&format!("GET {path} HTTP/1.1\r\n{header}\r\n"), &store).unwrap();
+                assert!(response.starts_with("HTTP/1.1 401"), "{path}");
+                assert!(response.contains("\"error\":\"unauthorized\""));
+            }
+        }
+    }
+
+    #[test]
+    fn admin_identity_characterization_command_audit_ignores_claimed_body_actor() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash_with_identity(
+                &hash_token("fixture-credential"),
+                "actual-operator",
+                "operator",
+            )
+            .unwrap();
+        save_test_agent(&store, "fixture-agent");
+        let body = serde_json::to_string(&CreateCommandJobRequest {
+            job_id: "identity-fixture-job".to_owned(),
+            target_agent_ids: vec!["fixture-agent".to_owned()],
+            selector: None,
+            match_labels: None,
+            strategy: None,
+            program: "uptime".to_owned(),
+            args: Vec::new(),
+            timeout_seconds: 30,
+            confirmed_high_risk: true,
+            confirmed_by: "claimed-owner".to_owned(),
+            expires_in_seconds: 60,
+            nonce_prefix: Some("identity-fixture".to_owned()),
+        })
+        .unwrap();
+        let request = format!(
+            "POST /api/jobs/command HTTP/1.1\r\nAuthorization: Bearer fixture-credential\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = route_request(&request, &store).unwrap();
+        assert!(response.starts_with("HTTP/1.1 201"));
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Job, 10)
+            .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].actor.as_str(), "actual-operator");
+        assert_eq!(
+            audits[0].value,
+            AuditValue::Plain(
+                "confirmed_high_risk=true,confirmed_by=actual-operator,target_count=1".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit isolated bearer baseline measurement; uses only in-memory fixture credentials"]
+    fn admin_identity_baseline_measurement() {
+        const SAMPLES: usize = 1000;
+        fn measure(mut operation: impl FnMut()) -> serde_json::Value {
+            for _ in 0..100 {
+                operation();
+            }
+            let mut durations = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let start = std::time::Instant::now();
+                operation();
+                durations.push(start.elapsed().as_nanos());
+            }
+            durations.sort_unstable();
+            serde_json::json!({
+                "samples": SAMPLES,
+                "warmup": 100,
+                "unit": "nanoseconds",
+                "p50": durations[SAMPLES / 2],
+                "p95": durations[SAMPLES * 95 / 100],
+                "max": durations[SAMPLES - 1]
+            })
+        }
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("measurement-fixture"))
+            .unwrap();
+        let request =
+            "GET /api/agents HTTP/1.1\r\nAuthorization: Bearer measurement-fixture\r\n\r\n";
+        let authenticate = measure(|| {
+            let context = authenticate_admin_request(std::hint::black_box(request), &store)
+                .unwrap()
+                .unwrap();
+            std::hint::black_box(context);
+        });
+        let protected_read = measure(|| {
+            let response = route_request(std::hint::black_box(request), &store).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"));
+            std::hint::black_box(response);
+        });
+        println!(
+            "{}",
+            serde_json::json!({
+                "kind": "admin_bearer_baseline",
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "debug_assertions": cfg!(debug_assertions),
+                "database": "in-memory SQLite, empty agent inventory",
+                "authenticate": authenticate,
+                "protected_read": protected_read,
+                "limitations": [
+                    "no network/TLS or Agent workload",
+                    "not a Fleet SLA or production capacity claim"
+                ]
+            })
+        );
     }
 
     #[test]
@@ -20148,7 +23329,14 @@ mod tests {
         store
             .insert_admin_token_hash(&hash_token("admin-token"))
             .unwrap();
-        save_test_job(&store, "job-expire-approval");
+        store
+            .save_job_record(&Job::new(
+                JobId::new("job-expire-approval").unwrap(),
+                fleet_domain::TaskRisk::High,
+                fleet_domain::ApprovalRequirement::ManualApproval,
+                Duration::from_secs(30),
+            ))
+            .unwrap();
         store
             .insert_approval_request(AppApprovalRequestRecord {
                 id: "approval-expired".to_owned(),
@@ -20186,6 +23374,52 @@ mod tests {
             audits
                 .iter()
                 .any(|event| event.action == "approval_expired")
+        );
+    }
+
+    #[test]
+    fn manual_expiry_preserves_an_already_queued_legacy_job() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        // Older data can contain a pending approval beside an already queued Job.
+        // Expiring that record must not stop work that has already been accepted.
+        save_test_job(&store, "job-queued-expiry");
+        store
+            .insert_approval_request(AppApprovalRequestRecord {
+                id: "approval-queued-expiry".to_owned(),
+                job_id: "job-queued-expiry".to_owned(),
+                requester: "legacy-operator".to_owned(),
+                approver: None,
+                reason: "legacy pending record".to_owned(),
+                status: "pending".to_owned(),
+                expires_at: UNIX_EPOCH + Duration::from_secs(1),
+                created_at: UNIX_EPOCH,
+                decided_at: None,
+            })
+            .unwrap();
+        let response = route_request(
+            "POST /api/approvals/expire HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"expired_count\":1"));
+        assert_eq!(
+            store
+                .find_approval_request("approval-queued-expiry")
+                .unwrap()
+                .unwrap()
+                .status,
+            "expired"
+        );
+        assert_eq!(
+            store
+                .find_job_status_value("job-queued-expiry")
+                .unwrap()
+                .as_deref(),
+            Some("queued")
         );
     }
 
@@ -20670,6 +23904,79 @@ steps:
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn selector_preview_uses_connected_sessions_without_enabling_disabled_targets() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        for id in ["preview-live", "preview-offline"] {
+            let key = fleet_core::generate_agent_key_pair().unwrap();
+            let mut agent = agent_fixture(id, id, &key.public_key_hex, &key.fingerprint);
+            agent.set_labels(vec![AgentLabel::new("role", "web").unwrap()]);
+            agent.mark_offline();
+            store.save_agent(agent).unwrap();
+        }
+        save_disabled_test_agent_with_labels(&store, "preview-disabled", vec![("role", "web")]);
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        let (sender, _receiver) = mpsc::channel(4);
+        let (disabled_sender, _disabled_receiver) = mpsc::channel(4);
+        for (id, sender) in [
+            ("preview-live", sender),
+            ("preview-disabled", disabled_sender),
+        ] {
+            sessions.lock().unwrap().register(AgentSessionHandle::new(
+                id,
+                id,
+                SystemTime::now(),
+                Vec::new(),
+                sender,
+                Some(4),
+            ));
+        }
+        let body = r#"{"selector":"role=web"}"#;
+        let request = format!(
+            "POST /api/selectors/preview HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = route_request_with_identity_and_sessions(
+            &request,
+            &store,
+            None,
+            &ControllerIdentity::dev_insecure(),
+            &ControllerRuntimeMetadata::default(),
+            Some(&sessions),
+        )
+        .unwrap();
+        let preview: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(preview["matched_count"], 3);
+        assert_eq!(preview["selected_count"], 2);
+        assert_eq!(preview["disabled_count"], 1);
+        assert_eq!(preview["offline_count"], 1);
+        let rows = preview["agents"].as_array().unwrap();
+        let live = rows
+            .iter()
+            .find(|row| row["agent_id"] == "preview-live")
+            .unwrap();
+        assert_eq!(live["status"], "online");
+        assert_eq!(live["selected_for_dispatch"], true);
+        let disabled = rows
+            .iter()
+            .find(|row| row["agent_id"] == "preview-disabled")
+            .unwrap();
+        assert_eq!(disabled["status"], "disabled");
+        assert_eq!(disabled["selected_for_dispatch"], false);
+        assert_eq!(
+            store
+                .find_agent_by_id("preview-live")
+                .unwrap()
+                .unwrap()
+                .status(),
+            AgentStatus::Offline
         );
     }
 
@@ -21441,6 +24748,330 @@ spec:
     }
 
     #[test]
+    #[ignore = "manual seven-sample legacy SQLite output ingestion baseline"]
+    fn legacy_output_delivery_baseline() {
+        let root = artifact_test_root("output-delivery-baseline");
+        std::fs::create_dir_all(&root).unwrap();
+        let body = "x".repeat(4096);
+        for sample in 0..7 {
+            let store = SqliteStore::open(root.join(format!("sample-{sample}.db"))).unwrap();
+            save_test_agent(&store, "agent-1");
+            save_test_job(&store, "job-baseline");
+            save_test_assignment(&store, "job-baseline", "task-baseline", "agent-1");
+            for replay in [false, true] {
+                let started = std::time::Instant::now();
+                for sequence in 0..256 {
+                    handle_agent_task_data_message(
+                        &store,
+                        "agent-1",
+                        fleet_protocol::WireMessage::new(
+                            format!("msg-output-{sequence}"),
+                            "corr-baseline",
+                            Some("agent-1".to_owned()),
+                            1,
+                            fleet_protocol::WirePayload::OutputChunk {
+                                job_id: "job-baseline".to_owned(),
+                                task_id: "task-baseline".to_owned(),
+                                stream: fleet_protocol::OutputStream::Stdout,
+                                sequence,
+                                data: body.clone(),
+                            },
+                        ),
+                    )
+                    .unwrap();
+                }
+                let elapsed_us = started.elapsed().as_micros();
+                let output = store
+                    .list_job_output_chunks("job-baseline", "agent-1")
+                    .unwrap();
+                assert_eq!(output.len(), 256);
+                assert_eq!(
+                    output.iter().map(|chunk| chunk.body.len()).sum::<usize>(),
+                    1024 * 1024
+                );
+                for (sequence, chunk) in output.iter().enumerate() {
+                    assert_eq!(chunk.sequence, sequence as u64);
+                    assert_eq!(chunk.body, body);
+                }
+                println!(
+                    "legacy_store_baseline sample={sample} replay={replay} rows=256 payload_bytes=1048576 elapsed_us={elapsed_us}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn legacy_result_retry_after_artifact_failure_preserves_partial_commit() {
+        let root = artifact_test_root("result-partial-commit");
+        std::fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("controller.db");
+        let store = SqliteStore::open(&database_path).unwrap();
+        store.migrate().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-partial");
+        save_test_assignment(&store, "job-partial", "task-partial", "agent-1");
+        let bytes = b"non-secret fixture".to_vec();
+        let message = fleet_protocol::WireMessage::new(
+            "msg-partial-result",
+            "corr-partial-result",
+            Some("agent-1".to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskResult {
+                job_id: "job-partial".to_owned(),
+                task_id: "task-partial".to_owned(),
+                exit_code: 0,
+                status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                reason: String::new(),
+                artifacts: vec![fleet_protocol::TaskResultArtifactWire {
+                    artifact_id: "artifact-partial".to_owned(),
+                    step_id: "template:fixture".to_owned(),
+                    destination: "/fixture/app.conf".to_owned(),
+                    checksum_sha256: controller_test_artifact_checksum(&bytes)
+                        .as_sha256()
+                        .to_owned(),
+                    size_bytes: bytes.len() as u64,
+                    retention_class: "rendered_template".to_owned(),
+                    content_bytes: Some(bytes),
+                }],
+            },
+        );
+
+        // Fail after the Assignment commit, before the artifact and Job aggregate writes.
+        let failed = handle_agent_task_data_message_with_artifact_store(
+            &store,
+            "agent-1",
+            message.clone(),
+            None,
+        );
+        assert!(failed.unwrap_err().to_string().contains("not configured"));
+        drop(store);
+
+        let store = SqliteStore::open(&database_path).unwrap();
+        assert_eq!(
+            store.find_task_assignment_status("task-partial").unwrap(),
+            Some("succeeded".to_owned())
+        );
+        assert_eq!(
+            store.find_job_status_value("job-partial").unwrap(),
+            Some("queued".to_owned())
+        );
+        let artifact_store = Mutex::new(LocalArtifactStore::new(root.join("artifacts")).unwrap());
+        handle_agent_task_data_message_with_artifact_store(
+            &store,
+            "agent-1",
+            message,
+            Some(&artifact_store),
+        )
+        .unwrap();
+
+        let artifacts =
+            <SqliteStore as fleet_application::ArtifactMetadataRepository>::list_rendered_artifacts_for_job(
+                &store,
+                &JobId::new("job-partial").unwrap(),
+            )
+            .unwrap();
+        assert!(artifacts.is_empty());
+        assert_eq!(
+            store.find_job_status_value("job-partial").unwrap(),
+            Some("queued".to_owned())
+        );
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Job, 10)
+            .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "task_result_ignored");
+        drop(artifact_store);
+        drop(store);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn task_result_from_other_authenticated_agent_cannot_complete_assignment() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-owner");
+        save_test_agent(&store, "agent-other");
+        save_test_job(&store, "job-owner");
+        save_test_assignment(&store, "job-owner", "task-owner", "agent-owner");
+        let message = fleet_protocol::WireMessage::new(
+            "msg-wrong-owner",
+            "corr-wrong-owner",
+            Some("agent-other".to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskResult {
+                job_id: "job-owner".to_owned(),
+                task_id: "task-owner".to_owned(),
+                exit_code: 0,
+                status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                reason: String::new(),
+                artifacts: Vec::new(),
+            },
+        );
+        assert!(
+            handle_agent_task_data_message_with_artifact_store(
+                &store,
+                "agent-other",
+                message,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store.find_task_assignment_status("task-owner").unwrap(),
+            Some("queued".to_owned())
+        );
+        assert_eq!(
+            store.find_job_status_value("job-owner").unwrap(),
+            Some("queued".to_owned())
+        );
+        let security = store
+            .list_audit_events_by_category(AuditCategory::Security, 10)
+            .unwrap();
+        assert!(
+            security
+                .iter()
+                .any(|event| event.action == "task_assignment_owner_mismatch")
+        );
+    }
+
+    #[test]
+    fn task_started_with_wrong_job_cannot_change_assignment() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-owner");
+        save_test_job(&store, "job-owner");
+        save_test_job(&store, "job-other");
+        save_test_assignment(&store, "job-owner", "task-owner", "agent-owner");
+        let message = fleet_protocol::WireMessage::new(
+            "msg-wrong-job",
+            "corr-wrong-job",
+            Some("agent-owner".to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskStarted {
+                job_id: "job-other".to_owned(),
+                task_id: "task-owner".to_owned(),
+            },
+        );
+        assert!(
+            handle_agent_task_data_message_with_artifact_store(
+                &store,
+                "agent-owner",
+                message,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store.find_task_assignment_status("task-owner").unwrap(),
+            Some("queued".to_owned())
+        );
+    }
+
+    #[test]
+    fn task_ack_and_rejection_from_other_agent_cannot_change_assignments() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-owner");
+        save_test_agent(&store, "agent-other");
+        save_test_job(&store, "job-owner");
+        save_test_assignment(&store, "job-owner", "task-ack-owner", "agent-owner");
+        save_test_assignment(&store, "job-owner", "task-reject-owner", "agent-owner");
+        let ack = fleet_protocol::WireMessage::new(
+            "msg-wrong-ack",
+            "corr-wrong-ack",
+            Some("agent-other".to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskAck {
+                job_id: "job-owner".to_owned(),
+                task_id: "task-ack-owner".to_owned(),
+            },
+        );
+        let rejection = fleet_protocol::WireMessage::new(
+            "msg-wrong-rejection",
+            "corr-wrong-rejection",
+            Some("agent-other".to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskRejected {
+                job_id: "job-owner".to_owned(),
+                task_id: "task-reject-owner".to_owned(),
+                reason_code: fleet_protocol::TaskRejectionReasonCode::InvalidSignature,
+                reason: "invalid signature".to_owned(),
+            },
+        );
+        let wrong_job_ack = fleet_protocol::WireMessage::new(
+            "msg-wrong-job-ack",
+            "corr-wrong-job-ack",
+            Some("agent-owner".to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskAck {
+                job_id: "job-other".to_owned(),
+                task_id: "task-ack-owner".to_owned(),
+            },
+        );
+        let wrong_job_rejection = fleet_protocol::WireMessage::new(
+            "msg-wrong-job-rejection",
+            "corr-wrong-job-rejection",
+            Some("agent-owner".to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskRejected {
+                job_id: "job-other".to_owned(),
+                task_id: "task-reject-owner".to_owned(),
+                reason_code: fleet_protocol::TaskRejectionReasonCode::InvalidSignature,
+                reason: "invalid signature".to_owned(),
+            },
+        );
+        assert!(
+            handle_agent_task_data_message_with_artifact_store(&store, "agent-other", ack, None)
+                .is_err()
+        );
+        assert!(
+            handle_agent_task_data_message_with_artifact_store(
+                &store,
+                "agent-other",
+                rejection,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            handle_agent_task_data_message_with_artifact_store(
+                &store,
+                "agent-owner",
+                wrong_job_ack,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            handle_agent_task_data_message_with_artifact_store(
+                &store,
+                "agent-owner",
+                wrong_job_rejection,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store.find_task_assignment_status("task-ack-owner").unwrap(),
+            Some("queued".to_owned())
+        );
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-reject-owner")
+                .unwrap(),
+            Some("queued".to_owned())
+        );
+        let security = store
+            .list_audit_events_by_category(AuditCategory::Security, 10)
+            .unwrap();
+        assert_eq!(
+            security
+                .iter()
+                .filter(|event| event.action == "task_assignment_owner_mismatch")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
     fn task_result_with_artifacts_stores_rendered_artifact_metadata() {
         let store = SqliteStore::in_memory().unwrap();
         save_test_agent(&store, "agent-1");
@@ -22134,6 +25765,78 @@ spec:
     }
 
     #[test]
+    fn cancel_job_audit_failure_never_sends_to_the_agent_queue() {
+        struct OwnedRoot(PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = OwnedRoot(artifact_test_root("cancel-commit-fault"));
+        std::fs::create_dir(&root.0).unwrap();
+        let path = root.0.join("controller.db");
+        let store = SqliteStore::open(&path).unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-cancel-fault");
+        save_test_assignment(&store, "job-cancel-fault", "task-cancel-fault", "agent-1");
+        store
+            .update_task_assignment_status(
+                "task-cancel-fault",
+                AssignmentStatus::Started,
+                SystemTime::UNIX_EPOCH,
+                None,
+            )
+            .unwrap();
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        let (handle, mut receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(8),
+        );
+        sessions.lock().unwrap().register(handle);
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection.execute_batch("CREATE TRIGGER fixture_cancel_fault BEFORE INSERT ON audit_events WHEN NEW.action='job_canceled' BEGIN SELECT RAISE(ABORT,'private cancel diagnostic'); END;").unwrap();
+        let request = "POST /api/jobs/job-cancel-fault/cancel HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: 0\r\n\r\n";
+        let failed = route_request_with_sessions(request, &store, &sessions).unwrap();
+        assert!(failed.starts_with("HTTP/1.1 503"));
+        assert!(!failed.contains("private cancel diagnostic"));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-cancel-fault")
+                .unwrap()
+                .as_deref(),
+            Some("started")
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "rollback must never enqueue a cancellation"
+        );
+        connection
+            .execute_batch("DROP TRIGGER fixture_cancel_fault;")
+            .unwrap();
+        let committed = route_request_with_sessions(request, &store, &sessions).unwrap();
+        assert!(committed.starts_with("HTTP/1.1 200"));
+        assert!(
+            matches!(receiver.try_recv().unwrap(),AgentSessionOutboundMessage::Wire(message) if matches!(message.payload,fleet_protocol::WirePayload::TaskCancel { ref task_id, .. } if task_id=="task-cancel-fault"))
+        );
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-cancel-fault")
+                .unwrap()
+                .as_deref(),
+            Some("canceled")
+        );
+        let repeated = route_request_with_sessions(request, &store, &sessions).unwrap();
+        assert!(repeated.starts_with("HTTP/1.1 200"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn cancel_job_sends_cancel_to_dispatched_session() {
         let store = SqliteStore::in_memory().unwrap();
         store
@@ -22559,6 +26262,7 @@ spec:
             metadata: Arc::new(ControllerRuntimeMetadata::default()),
             sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
             catalog_sync_submitter: None,
+            admin_auth: None,
         };
 
         handle_agent_task_data_message_from_state(
@@ -22710,6 +26414,7 @@ spec:
                 metadata: Arc::new(ControllerRuntimeMetadata::default()),
                 sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
                 catalog_sync_submitter: None,
+                admin_auth: None,
             };
             let execution_job_id = format!("job-remediation-{suffix}");
             let execution_task_id = format!("task-remediation-{suffix}");
@@ -22871,6 +26576,7 @@ spec:
             metadata: Arc::new(ControllerRuntimeMetadata::default()),
             sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
             catalog_sync_submitter: None,
+            admin_auth: None,
         };
 
         let first = recover_pending_remediation_verifications(&state, 1).unwrap();
@@ -22932,6 +26638,3017 @@ spec:
         }));
         drop(guard);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn seed_assignment_recovery_fixture(store: &SqliteStore) {
+        save_test_agent(store, "agent-recovery");
+        let mut job = Job::new(
+            JobId::new("job-recovery").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        job.queue(true).unwrap();
+        store.save_job_record(&job).unwrap();
+        save_test_assignment(store, "job-recovery", "task-recovery", "agent-recovery");
+        store
+            .update_task_assignment_status(
+                "task-recovery",
+                AssignmentStatus::Dispatched,
+                UNIX_EPOCH + Duration::from_secs(100),
+                None,
+            )
+            .unwrap();
+        store
+            .update_task_assignment_status(
+                "task-recovery",
+                AssignmentStatus::Started,
+                UNIX_EPOCH + Duration::from_secs(101),
+                None,
+            )
+            .unwrap();
+    }
+
+    fn assignment_recovery_test_store() -> SqliteStore {
+        let store = SqliteStore::in_memory().unwrap();
+        seed_assignment_recovery_fixture(&store);
+        store
+    }
+
+    #[tokio::test]
+    async fn startup_assignment_recovery_completes_before_listener_bind() {
+        let root = artifact_test_root("assignment-startup-recovery-before-bind");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.sqlite3");
+        let store = SqliteStore::open(&database).unwrap();
+        seed_assignment_recovery_fixture(&store);
+        let occupied_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = occupied_listener.local_addr().unwrap();
+        let trust = ControllerTrustSettings::from_parts(
+            None,
+            None,
+            root.join("controller-signing-public.key"),
+            root.join("controller-signing-private.key"),
+            AgentClientCertificateTrust::Disabled,
+        )
+        .unwrap();
+        let config = ControllerServerConfig {
+            host: address.ip().to_string(),
+            port: address.port(),
+            external_url: None,
+            tls_cert_path: None,
+            tls_key_path: None,
+            agent_client_ca_cert_path: None,
+            data_dir: root.clone(),
+            database: None,
+            secret_provider: None,
+        };
+
+        let result = run_axum_controller_server(
+            config,
+            trust,
+            ControllerStore::sqlite(store),
+            LocalArtifactStore::new(root.join("artifacts")).unwrap(),
+            ControllerIdentity::dev_insecure(),
+            None,
+            || false,
+        )
+        .await;
+        assert!(result.is_err(), "the occupied address must reject bind");
+        drop(occupied_listener);
+
+        let reopened = SqliteStore::open(&database).unwrap();
+        assert_eq!(
+            reopened
+                .find_task_assignment_status("task-recovery")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            reopened
+                .find_job_status_value("job-recovery")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        let audits = reopened.list_audit_events(10).unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "assignment_execution_outcome_unknown");
+        assert_eq!(
+            audits[0].value,
+            AuditValue::Plain("execution_outcome_unknown".to_owned())
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn assignment_recovery_worker_runs_periodically_and_joins_on_shutdown() {
+        let store = Arc::new(Mutex::new(ControllerStore::sqlite(
+            assignment_recovery_test_store(),
+        )));
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        let worker_clock_calls = Arc::clone(&clock_calls);
+        let worker = start_assignment_recovery_worker_with_clock(
+            Arc::clone(&store),
+            Duration::from_millis(5),
+            move || {
+                worker_clock_calls.fetch_add(1, Ordering::SeqCst);
+                UNIX_EPOCH + Duration::from_secs(431)
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while clock_calls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("periodic worker should run more than once");
+        tokio::time::timeout(Duration::from_secs(1), worker.shutdown())
+            .await
+            .expect("shutdown should interrupt the next interval wait")
+            .expect("worker task should be joined without panic");
+
+        let guard = store.lock().unwrap();
+        let sqlite = sqlite_test_store(&guard);
+        assert_eq!(
+            sqlite
+                .find_task_assignment_status("task-recovery")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            sqlite
+                .list_audit_events(10)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "assignment_execution_outcome_unknown")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_final_result_worker_recovers_receipt_after_effect_commit() {
+        use fleet_application::delivery::{ControllerInboxReport, InboxStageOutcome};
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        let root = artifact_test_root("pending-final-worker");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let sqlite = SqliteStore::open(&database).unwrap();
+        save_test_agent(&sqlite, "agent-final-worker");
+        let mut job = Job::new(
+            JobId::new("job-final-worker").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        job.queue(true).unwrap();
+        let command =
+            fleet_domain::CommandTask::new("true", Vec::new(), Duration::from_secs(30)).unwrap();
+        sqlite.save_command_job_record(&job, &command).unwrap();
+        save_test_assignment(
+            &sqlite,
+            "job-final-worker",
+            "task-final-worker",
+            "agent-final-worker",
+        );
+        for status in [
+            AssignmentStatus::Dispatched,
+            AssignmentStatus::Accepted,
+            AssignmentStatus::Started,
+        ] {
+            sqlite
+                .update_task_assignment_status(
+                    "task-final-worker",
+                    status,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+                    None,
+                )
+                .unwrap();
+        }
+        let delivery = sqlite.controller_delivery_identity().unwrap();
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-final-worker",
+            "job-final-worker",
+            "task-final-worker",
+            "final-worker-report",
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&fleet_protocol::delivery_v2::V2FinalResultReportBody {
+            exit_code: 0,
+            status: fleet_protocol::TaskResultStatus::Succeeded,
+            reason: String::new(),
+            artifacts: Vec::new(),
+            output: fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 0,
+                stderr_chunks: 0,
+                truncated: false,
+            },
+        })
+        .unwrap();
+        let wire_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &body,
+        )
+        .unwrap();
+        let inbox_report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+        let mut sqlite = sqlite;
+        assert_eq!(
+            fleet_application::delivery::StageControllerInboxReport::execute(
+                &mut sqlite,
+                "agent-final-worker",
+                &delivery.namespace,
+                fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES,
+                &inbox_report,
+            )
+            .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        let effect = fleet_application::delivery::ControllerInboxFinalEffect::new(
+            key.clone(),
+            body.clone(),
+            AssignmentStatus::Succeeded,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(11),
+            None,
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            0, 0, false,
+        ));
+        assert!(matches!(
+            fleet_application::delivery::CommitControllerInboxFinal::execute(&mut sqlite, &effect,)
+                .unwrap(),
+            fleet_application::delivery::InboxEffectOutcome::Committed(_)
+        ));
+
+        let signer_pair = fleet_core::generate_agent_key_pair().unwrap();
+        let signer = Arc::new(ControllerIdentity {
+            public_key: signer_pair.public_key_hex,
+            fingerprint: signer_pair.fingerprint,
+            private_key: signer_pair.private_key_hex,
+        });
+        let store = Arc::new(Mutex::new(ControllerStore::Sqlite(sqlite)));
+        let artifact_store = Arc::new(Mutex::new(
+            LocalArtifactStore::new(root.join("artifacts")).unwrap(),
+        ));
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        let (sender, mut receiver) = mpsc::channel(4);
+        sessions.lock().unwrap().register(AgentSessionHandle::new(
+            "agent-final-worker",
+            "connection-final-worker",
+            SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            sender,
+            Some(4),
+        ));
+        let worker = start_pending_final_result_recovery_worker_with_interval(
+            Arc::clone(&store),
+            Arc::clone(&artifact_store),
+            Arc::clone(&signer),
+            Arc::clone(&sessions),
+            Duration::from_millis(5),
+        );
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("recovery worker should enqueue the persisted receipt")
+            .expect("session receiver should remain open");
+        let AgentSessionOutboundMessage::Wire(receipt_message) = outbound else {
+            panic!("recovery should send a receipt, not close the session");
+        };
+        let fleet_protocol::WirePayload::ReportReceipt(receipt) = &receipt_message.payload else {
+            panic!("expected final-result storage receipt");
+        };
+        assert_eq!(receipt.statement.report_id, "final-worker-report");
+        worker.shutdown().await.unwrap();
+
+        let mut store_guard = store.lock().unwrap();
+        let sqlite = sqlite_test_store(&store_guard);
+        assert_eq!(
+            sqlite
+                .find_task_assignment_status("task-final-worker")
+                .unwrap()
+                .as_deref(),
+            Some("succeeded")
+        );
+        assert_eq!(
+            sqlite
+                .list_audit_events_by_category(AuditCategory::Job, 10)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "job_completed")
+                .count(),
+            1
+        );
+        assert!(
+            fleet_application::delivery::LoadPendingFinalReports::execute(sqlite, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let replay = commit_authenticated_final_result_report(
+            &mut store_guard,
+            "agent-final-worker",
+            "final-worker-replay",
+            &wire_report,
+            &signer,
+            epoch_millis() as u64,
+        )
+        .unwrap();
+        assert_eq!(replay.payload, receipt_message.payload);
+        drop(store_guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn committed_output_receipt_replays_verified_bytes_after_controller_reopen() {
+        use fleet_application::ControllerDeliveryIdentityRepository;
+        use fleet_application::delivery::{
+            CommitControllerInboxOutput, ControllerInboxOutputEffect, ControllerInboxReport,
+            InboxEffectOutcome, StageControllerInboxReport,
+        };
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        let root = artifact_test_root("controller-signed-receipt-reopen");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let mut store = SqliteStore::open(&database).unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-receipt");
+        save_test_assignment(&store, "job-receipt", "task-receipt", "agent-1");
+        let delivery = store.controller_delivery_identity().unwrap();
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-1",
+            "job-receipt",
+            "task-receipt",
+            "output-receipt",
+        )
+        .unwrap();
+        let report = ControllerInboxReport::new(
+            key.clone(),
+            ReportClass::Output,
+            b"encoded-output".to_vec(),
+        );
+        StageControllerInboxReport::execute(
+            &mut store,
+            "agent-1",
+            &delivery.namespace,
+            1024,
+            &report,
+        )
+        .unwrap();
+        let effect = ControllerInboxOutputEffect::new(
+            key.clone(),
+            b"encoded-output".to_vec(),
+            JobOutputStream::Stdout,
+            0,
+            "hello".into(),
+        );
+        let outcome = CommitControllerInboxOutput::execute(&mut store, &effect).unwrap();
+        assert!(matches!(outcome, InboxEffectOutcome::Committed(_)));
+        let pair = fleet_core::generate_agent_key_pair().unwrap();
+        let signer = ControllerIdentity {
+            public_key: pair.public_key_hex,
+            fingerprint: pair.fingerprint,
+            private_key: pair.private_key_hex,
+        };
+        let first = crate::report_receipt::issue_and_persist_stored_receipt(
+            &mut store, &delivery, &key, "agent-1", outcome, &signer, 10,
+        )
+        .unwrap();
+        drop(store);
+
+        let mut reopened = SqliteStore::open(&database).unwrap();
+        let duplicate = CommitControllerInboxOutput::execute(&mut reopened, &effect).unwrap();
+        assert!(matches!(duplicate, InboxEffectOutcome::AlreadyCommitted(_)));
+        let replay = crate::report_receipt::issue_and_persist_stored_receipt(
+            &mut reopened,
+            &delivery,
+            &key,
+            "agent-1",
+            duplicate,
+            &signer,
+            11,
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(
+            reopened
+                .list_job_output_chunks("job-receipt", "agent-1")
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_drift_evidence_receipt_commits_effects_once_without_completing_job() {
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        let root = artifact_test_root("drift-evidence-stored-receipt");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let sqlite = SqliteStore::open(&database).unwrap();
+        save_test_agent_with_labels(&sqlite, "agent-drift", vec![("role", "web")]);
+        let policy_source = r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: nginx-running
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+  remediation:
+    runbookRef: runbooks/nginx-remediate.yml
+    approvalRequired: true
+"#;
+        sqlite
+            .save_policy_source("nginx-running", "nginx-running", 1, policy_source)
+            .unwrap();
+        let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+        sqlite
+            .upsert_policy_schedule(
+                "nginx-running",
+                "agent-drift",
+                Duration::from_secs(300),
+                checked_at - Duration::from_secs(1),
+            )
+            .unwrap();
+        run_due_scheduled_drift_once(&sqlite, &ControllerIdentity::dev_insecure(), checked_at)
+            .unwrap();
+        let assignment = sqlite
+            .list_pending_dispatch_assignments(None, None, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let delivery = sqlite.controller_delivery_identity().unwrap();
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-drift",
+            assignment.envelope.job_id.as_str(),
+            assignment.envelope.task_id.as_str(),
+            "drift-evidence",
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&fleet_protocol::delivery_v2::V2DriftEvidenceReportBody {
+            status: fleet_protocol::delivery_v2::V2DriftStatusWire::Drifted,
+            expected: "running".to_owned(),
+            actual: "stopped".to_owned(),
+        })
+        .unwrap();
+        let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::DriftEvidence,
+            &body,
+        )
+        .unwrap();
+        let signer_pair = fleet_core::generate_agent_key_pair().unwrap();
+        let signer = ControllerIdentity {
+            public_key: signer_pair.public_key_hex,
+            fingerprint: signer_pair.fingerprint,
+            private_key: signer_pair.private_key_hex,
+        };
+        let mut store = ControllerStore::Sqlite(sqlite);
+        let first = commit_authenticated_drift_evidence_report(
+            &mut store,
+            "agent-drift",
+            "corr-drift-evidence",
+            &report,
+            &signer,
+            700,
+            checked_at,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(first_receipt) = &first.payload else {
+            panic!("expected signed drift evidence receipt");
+        };
+        let stored_receipt = first_receipt.clone();
+        assert_eq!(
+            first_receipt.statement.disposition,
+            fleet_protocol::receipt::ReportDispositionWire::Stored
+        );
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &signer.public_key,
+                &first_receipt.statement.signing_preimage().unwrap(),
+                &first_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+
+        let sqlite = sqlite_test_store(&store);
+        let evidence = sqlite.latest_drift_report("agent-drift").unwrap().unwrap();
+        assert_eq!(evidence.report.status, DriftStatus::Drifted);
+        assert_eq!(
+            evidence.provenance.purpose,
+            Some(fleet_domain::DriftCheckPurpose::Evaluation)
+        );
+        assert_eq!(
+            sqlite
+                .find_task_assignment_status(assignment.envelope.task_id.as_str())
+                .unwrap()
+                .as_deref(),
+            Some("queued")
+        );
+        assert_ne!(
+            sqlite
+                .find_job_status_value(assignment.envelope.job_id.as_str())
+                .unwrap()
+                .as_deref(),
+            Some("succeeded")
+        );
+        let proposal_id = format!(
+            "remediation-nginx-running-{}",
+            assignment.envelope.task_id.as_str()
+        );
+        assert_eq!(
+            sqlite
+                .find_remediation_request_record(&proposal_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "proposed"
+        );
+        let drift_audit_count = sqlite
+            .list_audit_events_by_category(AuditCategory::Drift, 100)
+            .unwrap()
+            .iter()
+            .filter(|event| event.action == "drift_report_received")
+            .count();
+        let proposal_audit_count = sqlite
+            .list_audit_events_by_category(AuditCategory::Policy, 100)
+            .unwrap()
+            .iter()
+            .filter(|event| event.action == "remediation_requested")
+            .count();
+        assert_eq!(drift_audit_count, 1);
+        assert_eq!(proposal_audit_count, 1);
+
+        let conflicting_body =
+            serde_json::to_vec(&fleet_protocol::delivery_v2::V2DriftEvidenceReportBody {
+                status: fleet_protocol::delivery_v2::V2DriftStatusWire::Drifted,
+                expected: "running".to_owned(),
+                actual: "changed observation".to_owned(),
+            })
+            .unwrap();
+        let conflicting_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::DriftEvidence,
+            &conflicting_body,
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_authenticated_drift_evidence_report(
+                &mut store,
+                "agent-drift",
+                "corr-drift-evidence-conflict",
+                &conflicting_report,
+                &signer,
+                750,
+                checked_at,
+            ),
+            Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::Json(_)
+            ))
+        ));
+        assert!(matches!(
+            commit_authenticated_drift_evidence_report(
+                &mut store,
+                "agent-other",
+                "corr-drift-evidence-owner-mismatch",
+                &report,
+                &signer,
+                775,
+                checked_at,
+            ),
+            Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::IdentityMismatch
+                )
+            ))
+        ));
+        drop(store);
+
+        let mut reopened = ControllerStore::Sqlite(SqliteStore::open(&database).unwrap());
+        let replay = commit_authenticated_drift_evidence_report(
+            &mut reopened,
+            "agent-drift",
+            "corr-drift-evidence-replay",
+            &report,
+            &signer,
+            800,
+            checked_at + Duration::from_secs(1),
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(replayed_receipt) = replay.payload else {
+            panic!("expected replayed drift evidence receipt");
+        };
+        assert_eq!(replayed_receipt, stored_receipt);
+        let sqlite = sqlite_test_store(&reopened);
+        assert_eq!(
+            sqlite
+                .list_audit_events_by_category(AuditCategory::Drift, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "drift_report_received")
+                .count(),
+            1
+        );
+        assert_eq!(
+            sqlite
+                .list_audit_events_by_category(AuditCategory::Policy, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "remediation_requested")
+                .count(),
+            1
+        );
+        let final_key = ReportKey::new(
+            &delivery.namespace,
+            "agent-drift",
+            assignment.envelope.job_id.as_str(),
+            assignment.envelope.task_id.as_str(),
+            "final-result",
+        )
+        .unwrap();
+        let final_body =
+            serde_json::to_vec(&fleet_protocol::delivery_v2::V2FinalResultReportBody {
+                exit_code: 0,
+                status: fleet_protocol::TaskResultStatus::Succeeded,
+                reason: String::new(),
+                artifacts: Vec::new(),
+                output: fleet_protocol::delivery_v2::V2OutputSummary {
+                    stdout_chunks: 0,
+                    stderr_chunks: 0,
+                    truncated: false,
+                },
+            })
+            .unwrap();
+        let final_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &final_key,
+            ReportClass::FinalResult,
+            &final_body,
+        )
+        .unwrap();
+        let final_message = commit_authenticated_final_result_report(
+            &mut reopened,
+            "agent-drift",
+            "corr-drift-final-result",
+            &final_report,
+            &signer,
+            900,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(final_receipt) = &final_message.payload
+        else {
+            panic!("expected terminal drift result receipt");
+        };
+        let stored_final_receipt = final_receipt.clone();
+        assert_eq!(
+            sqlite_test_store(&reopened)
+                .find_task_assignment_status(assignment.envelope.task_id.as_str())
+                .unwrap()
+                .as_deref(),
+            Some("succeeded")
+        );
+        assert_eq!(
+            sqlite_test_store(&reopened)
+                .find_job_status_value(assignment.envelope.job_id.as_str())
+                .unwrap()
+                .as_deref(),
+            Some("success")
+        );
+        let final_replay = commit_authenticated_final_result_report(
+            &mut reopened,
+            "agent-drift",
+            "corr-drift-final-replay",
+            &final_report,
+            &signer,
+            950,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(replayed_final_receipt) =
+            final_replay.payload
+        else {
+            panic!("expected replayed terminal drift result receipt");
+        };
+        assert_eq!(replayed_final_receipt, stored_final_receipt);
+        assert_eq!(
+            sqlite_test_store(&reopened)
+                .list_audit_events_by_category(AuditCategory::Job, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "job_completed")
+                .count(),
+            1
+        );
+        drop(reopened);
+
+        let mut reopened = ControllerStore::Sqlite(SqliteStore::open(&database).unwrap());
+        let replay_after_reopen = commit_authenticated_final_result_report(
+            &mut reopened,
+            "agent-drift",
+            "corr-drift-final-reopen",
+            &final_report,
+            &signer,
+            1_000,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(receipt_after_reopen) =
+            replay_after_reopen.payload
+        else {
+            panic!("expected replayed terminal drift result receipt after reopen");
+        };
+        assert_eq!(receipt_after_reopen, stored_final_receipt);
+        assert_eq!(
+            sqlite_test_store(&reopened)
+                .list_audit_events_by_category(AuditCategory::Job, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "job_completed")
+                .count(),
+            1
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_output_report_reissues_after_signing_key_rotation_without_repeating_effect() {
+        use fleet_application::ControllerDeliveryIdentityRepository;
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        #[derive(serde::Serialize)]
+        struct OutputBody {
+            stream: fleet_protocol::OutputStream,
+            sequence: u64,
+            data: String,
+        }
+
+        let sqlite = SqliteStore::in_memory().unwrap();
+        save_test_agent(&sqlite, "agent-1");
+        save_test_agent(&sqlite, "agent-2");
+        save_test_job(&sqlite, "job-output");
+        save_test_assignment(&sqlite, "job-output", "task-output", "agent-1");
+        let delivery = sqlite.controller_delivery_identity().unwrap();
+        let signer_pair = fleet_core::generate_agent_key_pair().unwrap();
+        let signer = ControllerIdentity {
+            public_key: signer_pair.public_key_hex,
+            fingerprint: signer_pair.fingerprint,
+            private_key: signer_pair.private_key_hex,
+        };
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-1",
+            "job-output",
+            "task-output",
+            "stdout-00000000000000000000",
+        )
+        .unwrap();
+        let encoded_output = serde_json::to_vec(&OutputBody {
+            stream: fleet_protocol::OutputStream::Stdout,
+            sequence: 0,
+            data: "hello from command".to_owned(),
+        })
+        .unwrap();
+        let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::Output,
+            &encoded_output,
+        )
+        .unwrap();
+        let mut store = ControllerStore::Sqlite(sqlite);
+
+        let first = commit_authenticated_output_report(
+            &mut store,
+            "agent-1",
+            "corr-output",
+            &report,
+            &signer,
+            100,
+        )
+        .unwrap();
+
+        let fleet_protocol::WirePayload::ReportReceipt(first_receipt) = &first.payload else {
+            panic!("expected stored report receipt");
+        };
+        assert_eq!(
+            first_receipt.statement.controller_namespace,
+            delivery.namespace
+        );
+        assert_eq!(first_receipt.statement.store_epoch, delivery.store_epoch);
+        assert_eq!(first_receipt.statement.agent_id, "agent-1");
+        assert_eq!(first_receipt.statement.job_id, "job-output");
+        assert_eq!(first_receipt.statement.task_id, "task-output");
+        assert_eq!(
+            first_receipt.statement.disposition,
+            fleet_protocol::receipt::ReportDispositionWire::Stored
+        );
+        let first_receipt = first_receipt.clone();
+        let preimage = first_receipt.statement.signing_preimage().unwrap();
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &signer.public_key,
+                &preimage,
+                &first_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+
+        let (outbound_sender, mut outbound_receiver) =
+            mpsc::channel(AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY);
+        queue_agent_session_message(&outbound_sender, first.clone()).unwrap();
+        assert_eq!(
+            outbound_receiver.try_recv().unwrap(),
+            AgentSessionOutboundMessage::Wire(Box::new(first.clone()))
+        );
+
+        assert!(matches!(
+            commit_authenticated_output_report(
+                &mut store,
+                "agent-2",
+                "corr-output",
+                &report,
+                &signer,
+                150,
+            ),
+            Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::IdentityMismatch
+                )
+            ))
+        ));
+        let mismatch_audits = store
+            .store_ref()
+            .list_audit_events_by_category(AuditCategory::Security, 10)
+            .unwrap();
+        assert!(mismatch_audits.iter().any(|event| {
+            event.action == "websocket_task_report_identity_mismatch"
+                && event.target.as_str() == "agent-2"
+        }));
+
+        let current_signer_pair = fleet_core::generate_agent_key_pair().unwrap();
+        let current_signer = ControllerIdentity {
+            public_key: current_signer_pair.public_key_hex,
+            fingerprint: current_signer_pair.fingerprint,
+            private_key: current_signer_pair.private_key_hex,
+        };
+        let replay = commit_authenticated_output_report(
+            &mut store,
+            "agent-1",
+            "corr-output",
+            &report,
+            &current_signer,
+            200,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(replayed_receipt) = replay.payload else {
+            panic!("expected replayed stored report receipt");
+        };
+        assert_eq!(replayed_receipt.statement.store_epoch, delivery.store_epoch);
+        assert_eq!(
+            replayed_receipt.statement.signing_key_fingerprint,
+            current_signer.fingerprint
+        );
+        assert_ne!(replayed_receipt, first_receipt);
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &current_signer.public_key,
+                &replayed_receipt.statement.signing_preimage().unwrap(),
+                &replayed_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+        let current_replay = commit_authenticated_output_report(
+            &mut store,
+            "agent-1",
+            "corr-output",
+            &report,
+            &current_signer,
+            250,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(current_replayed_receipt) =
+            current_replay.payload
+        else {
+            panic!("expected current signer receipt replay");
+        };
+        assert_eq!(current_replayed_receipt, replayed_receipt);
+        let conflicting_body = serde_json::to_vec(&OutputBody {
+            stream: fleet_protocol::OutputStream::Stdout,
+            sequence: 0,
+            data: "different output".to_owned(),
+        })
+        .unwrap();
+        let conflicting_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::Output,
+            &conflicting_body,
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_authenticated_output_report(
+                &mut store,
+                "agent-1",
+                "corr-output",
+                &conflicting_report,
+                &current_signer,
+                300,
+            ),
+            Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::Json(_)
+            ))
+        ));
+        let sqlite = sqlite_test_store(&store);
+        assert_eq!(
+            sqlite
+                .list_job_output_chunks("job-output", "agent-1")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn authenticated_final_result_commits_and_replays_stored_receipt() {
+        use fleet_application::{
+            ControllerDeliveryIdentityRepository, delivery::ControllerInboxFinalRecoveryRepository,
+        };
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        #[derive(serde::Serialize)]
+        struct FinalBody {
+            exit_code: i32,
+            status: fleet_protocol::TaskResultStatus,
+            reason: String,
+            artifacts: Vec<fleet_protocol::TaskResultArtifactWire>,
+            output: fleet_protocol::delivery_v2::V2OutputSummary,
+        }
+
+        #[derive(serde::Serialize)]
+        struct OutputBody {
+            stream: fleet_protocol::OutputStream,
+            sequence: u64,
+            data: String,
+        }
+
+        let root = artifact_test_root("final-result-report-receipt-replay");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let sqlite = SqliteStore::open(&database).unwrap();
+        save_test_agent(&sqlite, "agent-final");
+        save_test_agent(&sqlite, "agent-other");
+        let mut job = Job::new(
+            JobId::new("job-final").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        job.queue(true).unwrap();
+        let command =
+            fleet_domain::CommandTask::new("true", Vec::new(), Duration::from_secs(30)).unwrap();
+        sqlite.save_command_job_record(&job, &command).unwrap();
+        save_test_assignment(&sqlite, "job-final", "task-final", "agent-final");
+        for (status, seconds) in [
+            (AssignmentStatus::Dispatched, 1),
+            (AssignmentStatus::Accepted, 2),
+            (AssignmentStatus::Started, 3),
+        ] {
+            sqlite
+                .update_task_assignment_status(
+                    "task-final",
+                    status,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+                    None,
+                )
+                .unwrap();
+        }
+        let delivery = sqlite.controller_delivery_identity().unwrap();
+        let signer_pair = fleet_core::generate_agent_key_pair().unwrap();
+        let signer = ControllerIdentity {
+            public_key: signer_pair.public_key_hex,
+            fingerprint: signer_pair.fingerprint,
+            private_key: signer_pair.private_key_hex,
+        };
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-final",
+            "job-final",
+            "task-final",
+            "final-00000000000000000001",
+        )
+        .unwrap();
+        let encoded_body = serde_json::to_vec(&FinalBody {
+            exit_code: 0,
+            status: fleet_protocol::TaskResultStatus::Succeeded,
+            reason: String::new(),
+            artifacts: Vec::new(),
+            output: fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 2,
+                stderr_chunks: 0,
+                truncated: false,
+            },
+        })
+        .unwrap();
+        let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &encoded_body,
+        )
+        .unwrap();
+        let mut store = ControllerStore::Sqlite(sqlite);
+
+        let first_output_key = ReportKey::new(
+            &delivery.namespace,
+            "agent-final",
+            "job-final",
+            "task-final",
+            "output-stdout-00000000000000000000",
+        )
+        .unwrap();
+        let first_output_body = serde_json::to_vec(&OutputBody {
+            stream: fleet_protocol::OutputStream::Stdout,
+            sequence: 0,
+            data: "first chunk".to_owned(),
+        })
+        .unwrap();
+        let first_output = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &first_output_key,
+            ReportClass::Output,
+            &first_output_body,
+        )
+        .unwrap();
+        commit_authenticated_output_report(
+            &mut store,
+            "agent-final",
+            "corr-final-output",
+            &first_output,
+            &signer,
+            90,
+        )
+        .unwrap();
+        let truncated_success_key = ReportKey::new(
+            &delivery.namespace,
+            "agent-final",
+            "job-final",
+            "task-final",
+            "final-truncated-success",
+        )
+        .unwrap();
+        let truncated_success_body = serde_json::to_vec(&FinalBody {
+            exit_code: 0,
+            status: fleet_protocol::TaskResultStatus::Succeeded,
+            reason: String::new(),
+            artifacts: Vec::new(),
+            output: fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 1,
+                stderr_chunks: 0,
+                truncated: true,
+            },
+        })
+        .unwrap();
+        let truncated_success_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &truncated_success_key,
+            ReportClass::FinalResult,
+            &truncated_success_body,
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_authenticated_final_result_report(
+                &mut store,
+                "agent-final",
+                "corr-final",
+                &truncated_success_report,
+                &signer,
+                92,
+            ),
+            Err(ControllerError::Json(_))
+        ));
+        assert!(matches!(
+            commit_authenticated_final_result_report(
+                &mut store,
+                "agent-final",
+                "corr-final",
+                &report,
+                &signer,
+                100,
+            ),
+            Err(ControllerError::Store(_))
+        ));
+        let pending = fleet_application::delivery::LoadPendingFinalReports::execute(
+            sqlite_test_store(&store),
+            10,
+        )
+        .unwrap();
+        assert_eq!(pending.len(), 1);
+        let artifact_store = Mutex::new(LocalArtifactStore::new(root.join("artifacts")).unwrap());
+        let gap_recovery =
+            run_pending_final_result_recovery_pass(&mut store, &artifact_store, &signer, 101)
+                .unwrap();
+        assert_eq!(gap_recovery.scanned_count, 1);
+        assert_eq!(gap_recovery.committed_count, 0);
+        assert_eq!(gap_recovery.failed_count, 1);
+        assert_eq!(
+            fleet_application::delivery::LoadPendingFinalReports::execute(
+                sqlite_test_store(&store),
+                10,
+            )
+            .unwrap()
+            .len(),
+            1,
+            "output gap must leave the final report pending for an exact retry"
+        );
+        assert_eq!(
+            sqlite_test_store(&store)
+                .find_task_assignment_status("task-final")
+                .unwrap()
+                .as_deref(),
+            Some("started")
+        );
+        let second_output_key = ReportKey::new(
+            &delivery.namespace,
+            "agent-final",
+            "job-final",
+            "task-final",
+            "output-stdout-00000000000000000001",
+        )
+        .unwrap();
+        let second_output_body = serde_json::to_vec(&OutputBody {
+            stream: fleet_protocol::OutputStream::Stdout,
+            sequence: 1,
+            data: "second chunk".to_owned(),
+        })
+        .unwrap();
+        let second_output = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &second_output_key,
+            ReportClass::Output,
+            &second_output_body,
+        )
+        .unwrap();
+        commit_authenticated_output_report(
+            &mut store,
+            "agent-final",
+            "corr-final-output",
+            &second_output,
+            &signer,
+            95,
+        )
+        .unwrap();
+
+        let first = commit_authenticated_final_result_report(
+            &mut store,
+            "agent-final",
+            "corr-final",
+            &report,
+            &signer,
+            100,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(first_receipt) = &first.payload else {
+            panic!("expected stored final-result receipt");
+        };
+        let stored_receipt = (*first_receipt).clone();
+        assert_eq!(
+            sqlite_test_store(&store)
+                .find_task_assignment_status("task-final")
+                .unwrap()
+                .as_deref(),
+            Some("succeeded")
+        );
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &signer.public_key,
+                &first_receipt.statement.signing_preimage().unwrap(),
+                &first_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+
+        assert!(matches!(
+            commit_authenticated_final_result_report(
+                &mut store,
+                "agent-other",
+                "corr-final",
+                &report,
+                &signer,
+                150,
+            ),
+            Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::InvalidV2Payload(
+                    fleet_protocol::delivery_v2::V2ProtocolError::IdentityMismatch
+                )
+            ))
+        ));
+
+        let replay = commit_authenticated_final_result_report(
+            &mut store,
+            "agent-final",
+            "corr-final",
+            &report,
+            &signer,
+            200,
+        )
+        .unwrap();
+        assert_eq!(replay.payload, first.payload);
+
+        let conflicting_body = serde_json::to_vec(&FinalBody {
+            exit_code: 0,
+            status: fleet_protocol::TaskResultStatus::Succeeded,
+            reason: "different final body".to_owned(),
+            artifacts: Vec::new(),
+            output: fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 0,
+                stderr_chunks: 0,
+                truncated: false,
+            },
+        })
+        .unwrap();
+        let conflicting_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &conflicting_body,
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_authenticated_final_result_report(
+                &mut store,
+                "agent-final",
+                "corr-final",
+                &conflicting_report,
+                &signer,
+                300,
+            ),
+            Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::Json(_)
+            ))
+        ));
+
+        let artifact_report_body = serde_json::to_vec(&FinalBody {
+            exit_code: 0,
+            status: fleet_protocol::TaskResultStatus::Succeeded,
+            reason: String::new(),
+            artifacts: vec![fleet_protocol::TaskResultArtifactWire {
+                artifact_id: "artifact-unhandled".to_owned(),
+                step_id: "step-1".to_owned(),
+                destination: "/tmp/result".to_owned(),
+                checksum_sha256: "0".repeat(64),
+                size_bytes: 0,
+                retention_class: "job_output".to_owned(),
+                content_bytes: None,
+            }],
+            output: fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 0,
+                stderr_chunks: 0,
+                truncated: false,
+            },
+        })
+        .unwrap();
+        let artifact_key = ReportKey::new(
+            &delivery.namespace,
+            "agent-final",
+            "job-final",
+            "task-final",
+            "final-with-artifact",
+        )
+        .unwrap();
+        let artifact_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &artifact_key,
+            ReportClass::FinalResult,
+            &artifact_report_body,
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_authenticated_final_result_report(
+                &mut store,
+                "agent-final",
+                "corr-final-artifact",
+                &artifact_report,
+                &signer,
+                400,
+            ),
+            Err(ControllerError::Json(_))
+        ));
+        let pending_artifact_report = sqlite_test_store(&store)
+            .load_pending_final_reports(10)
+            .unwrap();
+        assert!(pending_artifact_report.is_empty());
+        let job_audits = sqlite_test_store(&store)
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap();
+        assert_eq!(
+            job_audits
+                .iter()
+                .filter(|event| event.action == "job_completed")
+                .count(),
+            1
+        );
+        let security_audits = sqlite_test_store(&store)
+            .list_audit_events_by_category(AuditCategory::Security, 20)
+            .unwrap();
+        assert!(security_audits.iter().any(|event| {
+            event.action == "websocket_task_report_identity_mismatch"
+                && event.target.as_str() == "agent-other"
+        }));
+
+        drop(store);
+        let reopened = SqliteStore::open(&database).unwrap();
+        let mut reopened = ControllerStore::Sqlite(reopened);
+        let replay_after_reopen = commit_authenticated_final_result_report(
+            &mut reopened,
+            "agent-final",
+            "corr-final-reopen",
+            &report,
+            &signer,
+            500,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(replayed_receipt) =
+            replay_after_reopen.payload
+        else {
+            panic!("expected final-result receipt after reopen");
+        };
+        assert_eq!(replayed_receipt, stored_receipt);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_artifact_final_result_commits_prepared_body_and_replays_receipt() {
+        use fleet_application::delivery::ControllerInboxFinalRecoveryRepository;
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        let root = artifact_test_root("artifact-final-result-report-receipt");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let sqlite = SqliteStore::open(&database).unwrap();
+        save_test_agent(&sqlite, "agent-artifact");
+        let mut job = Job::new(
+            JobId::new("job-artifact").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        job.queue(true).unwrap();
+        let runbook = fleet_domain::RunbookExecutionTask::new(
+            "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nmetadata:\n  name: artifact-result\nspec:\n  steps: []",
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        sqlite.save_runbook_job_record(&job, &runbook).unwrap();
+        save_test_assignment(&sqlite, "job-artifact", "task-artifact", "agent-artifact");
+        for (status, seconds) in [
+            (AssignmentStatus::Dispatched, 1),
+            (AssignmentStatus::Accepted, 2),
+            (AssignmentStatus::Started, 3),
+        ] {
+            sqlite
+                .update_task_assignment_status(
+                    "task-artifact",
+                    status,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+                    None,
+                )
+                .unwrap();
+        }
+        let delivery = sqlite.controller_delivery_identity().unwrap();
+        let signer_pair = fleet_core::generate_agent_key_pair().unwrap();
+        let signer = ControllerIdentity {
+            public_key: signer_pair.public_key_hex,
+            fingerprint: signer_pair.fingerprint,
+            private_key: signer_pair.private_key_hex,
+        };
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-artifact",
+            "job-artifact",
+            "task-artifact",
+            "final-result",
+        )
+        .unwrap();
+        let artifact_body = b"rendered fixture body".to_vec();
+        let checksum = controller_test_artifact_checksum(&artifact_body)
+            .as_sha256()
+            .to_owned();
+        let body = serde_json::to_vec(&fleet_protocol::delivery_v2::V2FinalResultReportBody {
+            exit_code: 0,
+            status: fleet_protocol::TaskResultStatus::Succeeded,
+            reason: String::new(),
+            artifacts: vec![fleet_protocol::TaskResultArtifactWire {
+                artifact_id: "artifact-result".to_owned(),
+                step_id: "template:fixture".to_owned(),
+                destination: "/etc/fixture.conf".to_owned(),
+                checksum_sha256: checksum,
+                size_bytes: artifact_body.len() as u64,
+                retention_class: "rendered_template".to_owned(),
+                content_bytes: Some(artifact_body),
+            }],
+            output: fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 0,
+                stderr_chunks: 0,
+                truncated: false,
+            },
+        })
+        .unwrap();
+        let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &body,
+        )
+        .unwrap();
+        let mut store = ControllerStore::Sqlite(sqlite);
+        let artifact_store = Mutex::new(LocalArtifactStore::new(root.join("artifacts")).unwrap());
+
+        let mut invalid_body: fleet_protocol::delivery_v2::V2FinalResultReportBody =
+            serde_json::from_slice(&body).unwrap();
+        invalid_body.artifacts[0].checksum_sha256 = "f".repeat(64);
+        let invalid_body = serde_json::to_vec(&invalid_body).unwrap();
+        let invalid_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &invalid_body,
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_authenticated_final_result_report_with_artifact_store(
+                &mut store,
+                "agent-artifact",
+                "corr-artifact-invalid-checksum",
+                &invalid_report,
+                &signer,
+                99,
+                Some(&artifact_store),
+            ),
+            Err(ControllerError::Json(_))
+        ));
+        assert!(
+            sqlite_test_store(&store)
+                .load_pending_final_reports(10)
+                .unwrap()
+                .is_empty(),
+            "invalid artifact body must fail before inbox staging"
+        );
+        assert_eq!(
+            artifact_store
+                .lock()
+                .unwrap()
+                .get(
+                    &ArtifactId::new("artifact-result").unwrap(),
+                    ArtifactRetentionClass::RenderedTemplate,
+                )
+                .unwrap(),
+            None,
+            "invalid artifact body must not be written"
+        );
+
+        let mut invalid_metadata: fleet_protocol::delivery_v2::V2FinalResultReportBody =
+            serde_json::from_slice(&body).unwrap();
+        invalid_metadata.artifacts[0].content_bytes = None;
+        invalid_metadata.artifacts[0].destination.clear();
+        let invalid_metadata = serde_json::to_vec(&invalid_metadata).unwrap();
+        let invalid_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &invalid_metadata,
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_authenticated_final_result_report_with_artifact_store(
+                &mut store,
+                "agent-artifact",
+                "corr-artifact-invalid-destination",
+                &invalid_report,
+                &signer,
+                99,
+                Some(&artifact_store),
+            ),
+            Err(ControllerError::Json(_))
+        ));
+        assert!(
+            sqlite_test_store(&store)
+                .load_pending_final_reports(10)
+                .unwrap()
+                .is_empty(),
+            "metadata-only artifact with empty destination must fail before inbox staging"
+        );
+
+        let mut invalid_metadata: fleet_protocol::delivery_v2::V2FinalResultReportBody =
+            serde_json::from_slice(&body).unwrap();
+        invalid_metadata.artifacts[0].content_bytes = None;
+        invalid_metadata.artifacts[0].retention_class = "temporary".to_owned();
+        let invalid_metadata = serde_json::to_vec(&invalid_metadata).unwrap();
+        let invalid_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &invalid_metadata,
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_authenticated_final_result_report_with_artifact_store(
+                &mut store,
+                "agent-artifact",
+                "corr-artifact-invalid-retention",
+                &invalid_report,
+                &signer,
+                99,
+                Some(&artifact_store),
+            ),
+            Err(ControllerError::Json(_))
+        ));
+        assert!(
+            sqlite_test_store(&store)
+                .load_pending_final_reports(10)
+                .unwrap()
+                .is_empty(),
+            "metadata-only artifact with unsupported retention must fail before inbox staging"
+        );
+
+        let pending = fleet_application::delivery::ControllerInboxReport::new(
+            key.clone(),
+            ReportClass::FinalResult,
+            body.clone(),
+        );
+        assert_eq!(
+            fleet_application::delivery::StageControllerInboxReport::execute(
+                &mut store,
+                "agent-artifact",
+                &delivery.namespace,
+                fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES,
+                &pending,
+            )
+            .unwrap(),
+            fleet_application::delivery::InboxStageOutcome::StagedPendingEffects
+        );
+        drop(store);
+
+        let reopened = SqliteStore::open(&database).unwrap();
+        let mut store = ControllerStore::Sqlite(reopened);
+        let recovered =
+            run_pending_final_result_recovery_pass(&mut store, &artifact_store, &signer, 100)
+                .unwrap();
+        assert_eq!(recovered.scanned_count, 1);
+        assert_eq!(recovered.committed_count, 1);
+        assert_eq!(recovered.failed_count, 0);
+        let first = recovered.receipts.into_iter().next().unwrap().1;
+        let fleet_protocol::WirePayload::ReportReceipt(receipt) = &first.payload else {
+            panic!("expected stored artifact final-result receipt");
+        };
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &signer.public_key,
+                &receipt.statement.signing_preimage().unwrap(),
+                &receipt.signature_hex,
+            )
+            .unwrap()
+        );
+        let sqlite = sqlite_test_store(&store);
+        assert_eq!(
+            sqlite
+                .find_task_assignment_status("task-artifact")
+                .unwrap()
+                .as_deref(),
+            Some("succeeded")
+        );
+        assert_eq!(
+            sqlite
+                .list_rendered_artifact_metadata_for_job("job-artifact")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            artifact_store
+                .lock()
+                .unwrap()
+                .get(
+                    &ArtifactId::new("artifact-result").unwrap(),
+                    ArtifactRetentionClass::RenderedTemplate,
+                )
+                .unwrap(),
+            Some(b"rendered fixture body".to_vec())
+        );
+        let replay = commit_authenticated_final_result_report_with_artifact_store(
+            &mut store,
+            "agent-artifact",
+            "corr-artifact-final-replay",
+            &report,
+            &signer,
+            200,
+            Some(&artifact_store),
+        )
+        .unwrap();
+        assert_eq!(replay.payload, first.payload);
+        assert_eq!(
+            sqlite_test_store(&store)
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "job_completed")
+                .count(),
+            1
+        );
+        let mut conflicting_body: fleet_protocol::delivery_v2::V2FinalResultReportBody =
+            serde_json::from_slice(&body).unwrap();
+        conflicting_body.reason = "changed after commit".to_owned();
+        let conflicting_body = serde_json::to_vec(&conflicting_body).unwrap();
+        let conflicting_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &conflicting_body,
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_authenticated_final_result_report_with_artifact_store(
+                &mut store,
+                "agent-artifact",
+                "corr-artifact-conflict",
+                &conflicting_report,
+                &signer,
+                250,
+                Some(&artifact_store),
+            ),
+            Err(ControllerError::Protocol(_))
+        ));
+        assert_eq!(
+            sqlite_test_store(&store)
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "job_completed")
+                .count(),
+            1,
+            "conflicting body must not repeat final effects"
+        );
+        drop(store);
+        let reopened = SqliteStore::open(&database).unwrap();
+        let mut reopened = ControllerStore::Sqlite(reopened);
+        let replay_after_reopen = commit_authenticated_final_result_report_with_artifact_store(
+            &mut reopened,
+            "agent-artifact",
+            "corr-artifact-final-reopen",
+            &report,
+            &signer,
+            300,
+            Some(&artifact_store),
+        )
+        .unwrap();
+        assert_eq!(replay_after_reopen.payload, first.payload);
+        assert_eq!(
+            sqlite_test_store(&reopened)
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "job_completed")
+                .count(),
+            1
+        );
+
+        let late_key = ReportKey::new(
+            &delivery.namespace,
+            "agent-artifact",
+            "job-artifact",
+            "task-artifact",
+            "late-artifact-result",
+        )
+        .unwrap();
+        let mut late_body: fleet_protocol::delivery_v2::V2FinalResultReportBody =
+            serde_json::from_slice(&body).unwrap();
+        late_body.artifacts[0].artifact_id = "artifact-late".to_owned();
+        let late_body = serde_json::to_vec(&late_body).unwrap();
+        let late_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &late_key,
+            ReportClass::FinalResult,
+            &late_body,
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_authenticated_final_result_report_with_artifact_store(
+                &mut reopened,
+                "agent-artifact",
+                "corr-artifact-terminal",
+                &late_report,
+                &signer,
+                400,
+                Some(&artifact_store),
+            ),
+            Err(ControllerError::Store(_))
+        ));
+        let reopened_sqlite = sqlite_test_store(&reopened);
+        assert_eq!(
+            reopened_sqlite
+                .find_task_assignment_status("task-artifact")
+                .unwrap()
+                .as_deref(),
+            Some("succeeded"),
+            "late artifact report must not change terminal Assignment state"
+        );
+        assert_eq!(
+            reopened_sqlite
+                .list_rendered_artifact_metadata_for_job("job-artifact")
+                .unwrap()
+                .len(),
+            1,
+            "failed terminal report must not commit artifact metadata"
+        );
+        assert_eq!(
+            reopened_sqlite
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "job_completed")
+                .count(),
+            1,
+            "failed terminal report must not repeat completion audit"
+        );
+        assert_eq!(
+            artifact_store
+                .lock()
+                .unwrap()
+                .get(
+                    &ArtifactId::new("artifact-late").unwrap(),
+                    ArtifactRetentionClass::RenderedTemplate,
+                )
+                .unwrap(),
+            Some(b"rendered fixture body".to_vec()),
+            "terminal rejection can leave a documented file-only orphan"
+        );
+        let terminal_recovery =
+            run_pending_final_result_recovery_pass(&mut reopened, &artifact_store, &signer, 500)
+                .unwrap();
+        assert_eq!(terminal_recovery.scanned_count, 1);
+        assert_eq!(terminal_recovery.committed_count, 0);
+        assert_eq!(terminal_recovery.failed_count, 1);
+        assert_eq!(
+            fleet_application::delivery::LoadPendingFinalReports::execute(
+                sqlite_test_store(&reopened),
+                10,
+            )
+            .unwrap()
+            .len(),
+            1,
+            "terminal report stays pending when its final effect is rejected"
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_late_g2_lifecycle_reports_get_receipts_without_changing_terminal_state() {
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        let root = artifact_test_root("late-g2-lifecycle-receipts");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let sqlite = SqliteStore::open(&database).unwrap();
+        save_test_agent(&sqlite, "agent-late-lifecycle");
+        save_test_job(&sqlite, "job-late-lifecycle");
+        save_test_assignment(
+            &sqlite,
+            "job-late-lifecycle",
+            "task-late-lifecycle",
+            "agent-late-lifecycle",
+        );
+        sqlite
+            .update_task_assignment_status(
+                "task-late-lifecycle",
+                AssignmentStatus::Dispatched,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                None,
+            )
+            .unwrap();
+        let mut store = ControllerStore::Sqlite(sqlite);
+        let recovery = run_assignment_recovery_once(
+            &mut store,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(431),
+        )
+        .unwrap();
+        assert_eq!(recovery.recovered_count, 1);
+        let delivery = store.store_ref().controller_delivery_identity().unwrap();
+        let signer_pair = fleet_core::generate_agent_key_pair().unwrap();
+        let signer = ControllerIdentity {
+            public_key: signer_pair.public_key_hex,
+            fingerprint: signer_pair.fingerprint,
+            private_key: signer_pair.private_key_hex,
+        };
+        let reports: [(&str, &[u8]); 3] = [
+            ("task-ack", br#"{"event":"task_ack"}"#),
+            ("task-started", br#"{"event":"task_started"}"#),
+            (
+                "task-rejected",
+                br#"{"event":"task_rejected","reason_code":"invalid_signature","reason":"late rejection reason"}"#,
+            ),
+        ];
+        let mut committed = Vec::new();
+        for (report_id, body) in reports {
+            let key = ReportKey::new(
+                &delivery.namespace,
+                "agent-late-lifecycle",
+                "job-late-lifecycle",
+                "task-late-lifecycle",
+                report_id,
+            )
+            .unwrap();
+            let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+                &key,
+                ReportClass::Lifecycle,
+                body,
+            )
+            .unwrap();
+            let first = commit_authenticated_task_lifecycle_report(
+                &mut store,
+                "agent-late-lifecycle",
+                "corr-late-lifecycle",
+                &report,
+                &signer,
+                500,
+            )
+            .unwrap();
+            let fleet_protocol::WirePayload::ReportReceipt(receipt) = &first.payload else {
+                panic!("expected signed lifecycle disposition receipt");
+            };
+            assert_eq!(
+                receipt.statement.disposition,
+                fleet_protocol::receipt::ReportDispositionWire::Stored
+            );
+            assert!(
+                fleet_core::verify_challenge_signature(
+                    &signer.public_key,
+                    &receipt.statement.signing_preimage().unwrap(),
+                    &receipt.signature_hex,
+                )
+                .unwrap()
+            );
+            let replay = commit_authenticated_task_lifecycle_report(
+                &mut store,
+                "agent-late-lifecycle",
+                "corr-late-lifecycle-replay",
+                &report,
+                &signer,
+                600,
+            )
+            .unwrap();
+            assert_eq!(replay.payload, first.payload);
+            committed.push((report, first.payload));
+        }
+
+        let sqlite = sqlite_test_store(&store);
+        assert_eq!(
+            sqlite
+                .find_task_assignment_status("task-late-lifecycle")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            sqlite
+                .list_task_assignment_summaries_for_job("job-late-lifecycle")
+                .unwrap()[0]
+                .last_error,
+            "execution_outcome_unknown"
+        );
+        assert_eq!(
+            sqlite
+                .find_job_status_value("job-late-lifecycle")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        let audits = sqlite
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap();
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|event| event.action == "assignment_late_lifecycle_report_received")
+                .count(),
+            3
+        );
+        assert!(audits.iter().all(|event| {
+            !matches!(&event.value, fleet_domain::AuditValue::Plain(value) if value.contains("late rejection reason"))
+        }));
+        drop(store);
+
+        let mut reopened = ControllerStore::Sqlite(SqliteStore::open(&database).unwrap());
+        for (report, stored_payload) in committed {
+            let replay = commit_authenticated_task_lifecycle_report(
+                &mut reopened,
+                "agent-late-lifecycle",
+                "corr-late-lifecycle-reopen",
+                &report,
+                &signer,
+                800,
+            )
+            .unwrap();
+            assert_eq!(replay.payload, stored_payload);
+        }
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_late_g2_runbook_final_result_gets_receipt_without_changing_terminal_state() {
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        #[derive(serde::Serialize)]
+        struct FinalBody {
+            exit_code: i32,
+            status: fleet_protocol::TaskResultStatus,
+            reason: String,
+            artifacts: Vec<fleet_protocol::TaskResultArtifactWire>,
+            output: fleet_protocol::delivery_v2::V2OutputSummary,
+        }
+
+        let root = artifact_test_root("late-g2-runbook-final-result-receipt");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let sqlite = SqliteStore::open(&database).unwrap();
+        save_test_agent(&sqlite, "agent-late-runbook");
+        let mut job = Job::new(
+            JobId::new("job-late-runbook").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        job.queue(true).unwrap();
+        let runbook = fleet_domain::RunbookExecutionTask::new(
+            "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nmetadata:\n  name: late-result\nspec:\n  steps: []",
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        sqlite.save_runbook_job_record(&job, &runbook).unwrap();
+        save_test_assignment(
+            &sqlite,
+            "job-late-runbook",
+            "task-late-runbook",
+            "agent-late-runbook",
+        );
+        for (status, seconds) in [
+            (AssignmentStatus::Dispatched, 1),
+            (AssignmentStatus::Accepted, 2),
+            (AssignmentStatus::Started, 3),
+        ] {
+            sqlite
+                .update_task_assignment_status(
+                    "task-late-runbook",
+                    status,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+                    None,
+                )
+                .unwrap();
+        }
+        let mut store = ControllerStore::Sqlite(sqlite);
+        let recovery = run_assignment_recovery_once(
+            &mut store,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(431),
+        )
+        .unwrap();
+        assert_eq!(recovery.recovered_count, 1);
+        let delivery = store.store_ref().controller_delivery_identity().unwrap();
+        let signer_pair = fleet_core::generate_agent_key_pair().unwrap();
+        let signer = ControllerIdentity {
+            public_key: signer_pair.public_key_hex,
+            fingerprint: signer_pair.fingerprint,
+            private_key: signer_pair.private_key_hex,
+        };
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-late-runbook",
+            "job-late-runbook",
+            "task-late-runbook",
+            "final-late-after-g2",
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&FinalBody {
+            exit_code: 0,
+            status: fleet_protocol::TaskResultStatus::Succeeded,
+            reason: String::new(),
+            artifacts: Vec::new(),
+            output: fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 0,
+                stderr_chunks: 0,
+                truncated: false,
+            },
+        })
+        .unwrap();
+        let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &body,
+        )
+        .unwrap();
+
+        let first = commit_authenticated_final_result_report(
+            &mut store,
+            "agent-late-runbook",
+            "corr-late-runbook",
+            &report,
+            &signer,
+            500,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(first_receipt) = &first.payload else {
+            panic!("expected stored late Runbook result receipt");
+        };
+        assert_eq!(
+            first_receipt.statement.disposition,
+            fleet_protocol::receipt::ReportDispositionWire::Stored
+        );
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &signer.public_key,
+                &first_receipt.statement.signing_preimage().unwrap(),
+                &first_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store
+                .store_ref()
+                .find_task_assignment_status("task-late-runbook")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            store
+                .store_ref()
+                .find_job_status_value("job-late-runbook")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        let audits = store
+            .store_ref()
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap();
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|event| event.action == "assignment_late_final_result_received")
+                .count(),
+            1
+        );
+        let replay = commit_authenticated_final_result_report(
+            &mut store,
+            "agent-late-runbook",
+            "corr-late-runbook-replay",
+            &report,
+            &signer,
+            600,
+        )
+        .unwrap();
+        assert_eq!(replay.payload, first.payload);
+        drop(store);
+
+        let mut reopened = ControllerStore::Sqlite(SqliteStore::open(&database).unwrap());
+        let replay_after_reopen = commit_authenticated_final_result_report(
+            &mut reopened,
+            "agent-late-runbook",
+            "corr-late-runbook-reopen",
+            &report,
+            &signer,
+            800,
+        )
+        .unwrap();
+        assert_eq!(replay_after_reopen.payload, first.payload);
+        let audits = sqlite_test_store(&reopened)
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap();
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|event| event.action == "assignment_late_final_result_received")
+                .count(),
+            1
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_late_g2_final_result_gets_receipt_without_changing_terminal_state() {
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        #[derive(serde::Serialize)]
+        struct FinalBody {
+            exit_code: i32,
+            status: fleet_protocol::TaskResultStatus,
+            reason: String,
+            artifacts: Vec<fleet_protocol::TaskResultArtifactWire>,
+            output: fleet_protocol::delivery_v2::V2OutputSummary,
+        }
+
+        let root = artifact_test_root("late-g2-final-result-receipt");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let sqlite = SqliteStore::open(&database).unwrap();
+        save_test_agent(&sqlite, "agent-late-final");
+        let mut job = Job::new(
+            JobId::new("job-late-final").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        job.queue(true).unwrap();
+        let command =
+            fleet_domain::CommandTask::new("true", Vec::new(), Duration::from_secs(30)).unwrap();
+        sqlite.save_command_job_record(&job, &command).unwrap();
+        save_test_assignment(
+            &sqlite,
+            "job-late-final",
+            "task-late-final",
+            "agent-late-final",
+        );
+        for (status, seconds) in [
+            (AssignmentStatus::Dispatched, 1),
+            (AssignmentStatus::Accepted, 2),
+            (AssignmentStatus::Started, 3),
+        ] {
+            sqlite
+                .update_task_assignment_status(
+                    "task-late-final",
+                    status,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+                    None,
+                )
+                .unwrap();
+        }
+        let mut store = ControllerStore::Sqlite(sqlite);
+        let recovery = run_assignment_recovery_once(
+            &mut store,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(431),
+        )
+        .unwrap();
+        assert_eq!(recovery.recovered_count, 1);
+        let delivery = store.store_ref().controller_delivery_identity().unwrap();
+        let signer_pair = fleet_core::generate_agent_key_pair().unwrap();
+        let signer = ControllerIdentity {
+            public_key: signer_pair.public_key_hex,
+            fingerprint: signer_pair.fingerprint,
+            private_key: signer_pair.private_key_hex,
+        };
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-late-final",
+            "job-late-final",
+            "task-late-final",
+            "final-late-after-g2",
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&FinalBody {
+            exit_code: 0,
+            status: fleet_protocol::TaskResultStatus::Succeeded,
+            reason: String::new(),
+            artifacts: Vec::new(),
+            output: fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 0,
+                stderr_chunks: 0,
+                truncated: false,
+            },
+        })
+        .unwrap();
+        let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &body,
+        )
+        .unwrap();
+
+        let first = commit_authenticated_final_result_report(
+            &mut store,
+            "agent-late-final",
+            "corr-late-final",
+            &report,
+            &signer,
+            500,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(first_receipt) = &first.payload else {
+            panic!("expected stored late-result receipt");
+        };
+        assert_eq!(
+            first_receipt.statement.disposition,
+            fleet_protocol::receipt::ReportDispositionWire::Stored
+        );
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &signer.public_key,
+                &first_receipt.statement.signing_preimage().unwrap(),
+                &first_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store
+                .store_ref()
+                .find_task_assignment_status("task-late-final")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            store
+                .store_ref()
+                .find_job_status_value("job-late-final")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        let job_audits = store
+            .store_ref()
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap();
+        assert_eq!(
+            job_audits
+                .iter()
+                .filter(|event| event.action == "assignment_execution_outcome_unknown")
+                .count(),
+            1
+        );
+        assert_eq!(
+            job_audits
+                .iter()
+                .filter(|event| event.action == "assignment_late_final_result_received")
+                .count(),
+            1
+        );
+
+        let replay = commit_authenticated_final_result_report(
+            &mut store,
+            "agent-late-final",
+            "corr-late-final-replay",
+            &report,
+            &signer,
+            600,
+        )
+        .unwrap();
+        assert_eq!(replay.payload, first.payload);
+        drop(store);
+        let mut reopened = ControllerStore::Sqlite(SqliteStore::open(&database).unwrap());
+        let replay_after_reopen = commit_authenticated_final_result_report(
+            &mut reopened,
+            "agent-late-final",
+            "corr-late-final-reopen",
+            &report,
+            &signer,
+            800,
+        )
+        .unwrap();
+        assert_eq!(replay_after_reopen.payload, first.payload);
+        let job_audits = sqlite_test_store(&reopened)
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap();
+        assert_eq!(
+            job_audits
+                .iter()
+                .filter(|event| event.action == "assignment_late_final_result_received")
+                .count(),
+            1
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_canceled_final_recovers_receipt_after_reopen_without_changing_cancel_result() {
+        use fleet_application::delivery::{ControllerInboxReport, StageControllerInboxReport};
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        for (reported_status, truncated) in [
+            (fleet_protocol::TaskResultStatus::Canceled, true),
+            (fleet_protocol::TaskResultStatus::Succeeded, false),
+            (fleet_protocol::TaskResultStatus::Failed, false),
+            (fleet_protocol::TaskResultStatus::TimedOut, false),
+        ] {
+            let root = artifact_test_root("canceled-final-receipt-replay");
+            std::fs::create_dir_all(&root).unwrap();
+            let database = root.join("controller.db");
+            let mut sqlite = SqliteStore::open(&database).unwrap();
+            save_test_agent(&sqlite, "agent-canceled");
+            save_test_agent(&sqlite, "agent-other");
+            let mut job = Job::new(
+                JobId::new("job-canceled").unwrap(),
+                fleet_domain::TaskRisk::Low,
+                fleet_domain::ApprovalRequirement::NotRequired,
+                Duration::from_secs(120),
+            );
+            job.queue(false).unwrap();
+            sqlite
+                .save_command_job_record(
+                    &job,
+                    &fleet_domain::CommandTask::new(
+                        "python3",
+                        Vec::new(),
+                        Duration::from_secs(120),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            save_test_assignment(&sqlite, "job-canceled", "task-canceled", "agent-canceled");
+            for (status, seconds) in [
+                (AssignmentStatus::Dispatched, 1),
+                (AssignmentStatus::Accepted, 2),
+                (AssignmentStatus::Started, 3),
+            ] {
+                sqlite
+                    .update_task_assignment_status(
+                        "task-canceled",
+                        status,
+                        UNIX_EPOCH + Duration::from_secs(seconds),
+                        None,
+                    )
+                    .unwrap();
+            }
+            for sequence in 0..2 {
+                sqlite
+                    .append_job_output_chunk_record(&JobOutputChunk {
+                        job_id: "job-canceled".into(),
+                        agent_id: "agent-canceled".into(),
+                        stream: JobOutputStream::Stdout,
+                        sequence,
+                        body: "test start\n".into(),
+                    })
+                    .unwrap();
+            }
+            sqlite
+                .insert_admin_token_hash(&hash_token("cancel-fixture-token"))
+                .unwrap();
+            let cancel_actor = authenticate_admin_request(
+                "POST /api/jobs/job-canceled/cancel HTTP/1.1\r\nAuthorization: Bearer cancel-fixture-token\r\n\r\n",&sqlite,
+            ).unwrap().unwrap();
+            assert!(matches!(
+                cancel_job(
+                    "job-canceled",
+                    r#"{"reason":"operator cancellation"}"#,
+                    &sqlite,
+                    None,
+                    &cancel_actor,
+                ),
+                Ok(Some(_))
+            ));
+            let original = sqlite
+                .list_task_assignment_summaries_for_job("job-canceled")
+                .unwrap();
+            assert_eq!(original[0].status, "canceled");
+            assert_eq!(original[0].last_error, "operator cancellation");
+            let original_output = sqlite
+                .list_job_output_chunks_for_job("job-canceled")
+                .unwrap();
+            let delivery = sqlite.controller_delivery_identity().unwrap();
+            let key = ReportKey::new(
+                &delivery.namespace,
+                "agent-canceled",
+                "job-canceled",
+                "task-canceled",
+                "final-result",
+            )
+            .unwrap();
+            let exit_code = if reported_status == fleet_protocol::TaskResultStatus::Succeeded {
+                0
+            } else {
+                -1
+            };
+            let body = serde_json::to_vec(&serde_json::json!({
+            "exit_code": exit_code, "status": reported_status, "reason": "agent completion raced cancellation",
+            "artifacts": [], "output": {"stdout_chunks": 2, "stderr_chunks": 0, "truncated": truncated},
+        })).unwrap();
+            let wire = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+                &key,
+                ReportClass::FinalResult,
+                &body,
+            )
+            .unwrap();
+            StageControllerInboxReport::execute(
+                &mut sqlite,
+                "agent-canceled",
+                &delivery.namespace,
+                fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES,
+                &ControllerInboxReport::new(key, ReportClass::FinalResult, body),
+            )
+            .unwrap();
+            drop(sqlite);
+            let mut store = ControllerStore::Sqlite(SqliteStore::open(&database).unwrap());
+            let signer =
+                controller_identity_from_key_pair(&fleet_core::generate_agent_key_pair().unwrap());
+            assert!(
+                commit_authenticated_final_result_report(
+                    &mut store,
+                    "agent-other",
+                    "wrong-agent",
+                    &wire,
+                    &signer,
+                    100,
+                )
+                .is_err()
+            );
+            let artifact_store =
+                Mutex::new(LocalArtifactStore::new(root.join("artifacts")).unwrap());
+            let recovery =
+                run_pending_final_result_recovery_pass(&mut store, &artifact_store, &signer, 101)
+                    .unwrap();
+            assert_eq!(
+                (
+                    recovery.scanned_count,
+                    recovery.committed_count,
+                    recovery.failed_count
+                ),
+                (1, 1, 0)
+            );
+            assert_eq!(recovery.receipts.len(), 1);
+            let first = &recovery.receipts[0].1;
+            let fleet_protocol::WirePayload::ReportReceipt(receipt) = &first.payload else {
+                panic!("stored receipt expected")
+            };
+            assert_eq!(
+                receipt.statement.disposition,
+                fleet_protocol::receipt::ReportDispositionWire::Stored
+            );
+            assert!(
+                fleet_core::verify_challenge_signature(
+                    &signer.public_key,
+                    &receipt.statement.signing_preimage().unwrap(),
+                    &receipt.signature_hex,
+                )
+                .unwrap()
+            );
+            let replay = commit_authenticated_final_result_report(
+                &mut store,
+                "agent-canceled",
+                "exact-replay",
+                &wire,
+                &signer,
+                102,
+            )
+            .unwrap();
+            assert_eq!(replay.payload, first.payload);
+            drop(store);
+            let mut reopened = ControllerStore::Sqlite(SqliteStore::open(&database).unwrap());
+            let replay_after_reopen = commit_authenticated_final_result_report(
+                &mut reopened,
+                "agent-canceled",
+                "reopen-replay",
+                &wire,
+                &signer,
+                103,
+            )
+            .unwrap();
+            assert_eq!(replay_after_reopen.payload, first.payload);
+            let sqlite = sqlite_test_store(&reopened);
+            assert_eq!(
+                sqlite
+                    .list_task_assignment_summaries_for_job("job-canceled")
+                    .unwrap(),
+                original
+            );
+            assert_eq!(
+                sqlite
+                    .find_job_status_value("job-canceled")
+                    .unwrap()
+                    .as_deref(),
+                Some("canceled")
+            );
+            assert_eq!(
+                sqlite
+                    .list_job_output_chunks_for_job("job-canceled")
+                    .unwrap(),
+                original_output
+            );
+            let events = sqlite
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.action == "assignment_canceled_final_result_received")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events.iter().filter(|e| e.action == "job_canceled").count(),
+                1
+            );
+            drop(reopened);
+            drop(artifact_store);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn authenticated_late_g2_drift_final_preserves_terminal_state_and_replays_receipt() {
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        let root = artifact_test_root("late-g2-drift-final-result-receipt");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let sqlite = SqliteStore::open(&database).unwrap();
+        save_test_agent_with_labels(&sqlite, "agent-late-drift", vec![("role", "web")]);
+        let policy_source = r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: drift-late-final
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+"#;
+        sqlite
+            .save_policy_source("drift-late-final", "drift-late-final", 1, policy_source)
+            .unwrap();
+        let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+        sqlite
+            .upsert_policy_schedule(
+                "drift-late-final",
+                "agent-late-drift",
+                Duration::from_secs(300),
+                checked_at - Duration::from_secs(1),
+            )
+            .unwrap();
+        run_due_scheduled_drift_once(&sqlite, &ControllerIdentity::dev_insecure(), checked_at)
+            .unwrap();
+        let assignment = sqlite
+            .list_pending_dispatch_assignments(None, None, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        for (status, seconds) in [
+            (AssignmentStatus::Dispatched, 601),
+            (AssignmentStatus::Accepted, 602),
+            (AssignmentStatus::Started, 603),
+        ] {
+            sqlite
+                .update_task_assignment_status(
+                    assignment.envelope.task_id.as_str(),
+                    status,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let mut store = ControllerStore::Sqlite(sqlite);
+        let recovery =
+            run_assignment_recovery_once(&mut store, checked_at + Duration::from_secs(400))
+                .unwrap();
+        assert_eq!(recovery.recovered_count, 1);
+        let delivery = store.store_ref().controller_delivery_identity().unwrap();
+        let signer_pair = fleet_core::generate_agent_key_pair().unwrap();
+        let signer = ControllerIdentity {
+            public_key: signer_pair.public_key_hex,
+            fingerprint: signer_pair.fingerprint,
+            private_key: signer_pair.private_key_hex,
+        };
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-late-drift",
+            assignment.envelope.job_id.as_str(),
+            assignment.envelope.task_id.as_str(),
+            "final-result",
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&fleet_protocol::delivery_v2::V2FinalResultReportBody {
+            exit_code: 0,
+            status: fleet_protocol::TaskResultStatus::Succeeded,
+            reason: String::new(),
+            artifacts: Vec::new(),
+            output: fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 0,
+                stderr_chunks: 0,
+                truncated: false,
+            },
+        })
+        .unwrap();
+        let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &body,
+        )
+        .unwrap();
+        let first = commit_authenticated_final_result_report(
+            &mut store,
+            "agent-late-drift",
+            "corr-late-drift-final",
+            &report,
+            &signer,
+            1_100,
+        )
+        .unwrap();
+        let fleet_protocol::WirePayload::ReportReceipt(first_receipt) = &first.payload else {
+            panic!("expected stored late DriftCheck result receipt");
+        };
+        assert_eq!(
+            first_receipt.statement.disposition,
+            fleet_protocol::receipt::ReportDispositionWire::Stored
+        );
+        assert!(
+            fleet_core::verify_challenge_signature(
+                &signer.public_key,
+                &first_receipt.statement.signing_preimage().unwrap(),
+                &first_receipt.signature_hex,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store
+                .store_ref()
+                .find_task_assignment_status(assignment.envelope.task_id.as_str())
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            store
+                .store_ref()
+                .find_job_status_value(assignment.envelope.job_id.as_str())
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+
+        let changed_body =
+            serde_json::to_vec(&fleet_protocol::delivery_v2::V2FinalResultReportBody {
+                exit_code: 1,
+                status: fleet_protocol::TaskResultStatus::Failed,
+                reason: "changed report".to_owned(),
+                artifacts: Vec::new(),
+                output: fleet_protocol::delivery_v2::V2OutputSummary {
+                    stdout_chunks: 0,
+                    stderr_chunks: 0,
+                    truncated: false,
+                },
+            })
+            .unwrap();
+        let changed_report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+            &key,
+            ReportClass::FinalResult,
+            &changed_body,
+        )
+        .unwrap();
+        assert!(
+            commit_authenticated_final_result_report(
+                &mut store,
+                "agent-late-drift",
+                "corr-late-drift-conflict",
+                &changed_report,
+                &signer,
+                1_200,
+            )
+            .is_err()
+        );
+        let replay = commit_authenticated_final_result_report(
+            &mut store,
+            "agent-late-drift",
+            "corr-late-drift-replay",
+            &report,
+            &signer,
+            1_300,
+        )
+        .unwrap();
+        assert_eq!(replay.payload, first.payload);
+        let audits = store
+            .store_ref()
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap();
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|event| event.action == "assignment_late_final_result_received")
+                .count(),
+            1
+        );
+        drop(store);
+
+        let mut reopened = ControllerStore::Sqlite(SqliteStore::open(&database).unwrap());
+        let replay_after_reopen = commit_authenticated_final_result_report(
+            &mut reopened,
+            "agent-late-drift",
+            "corr-late-drift-reopen",
+            &report,
+            &signer,
+            1_400,
+        )
+        .unwrap();
+        assert_eq!(replay_after_reopen.payload, first.payload);
+        let audits = sqlite_test_store(&reopened)
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap();
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|event| event.action == "assignment_late_final_result_received")
+                .count(),
+            1
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn committed_inbox_remediation_final_is_recovered_into_one_verification_job() {
+        use fleet_application::delivery::{
+            CommitControllerInboxFinal, ControllerInboxFinalEffect, ControllerInboxReport,
+            ControllerPreparedRemediation, InboxEffectOutcome, StageControllerInboxReport,
+        };
+        use fleet_application::{
+            ControllerDeliveryIdentityRepository, PrepareRemediationExecutionTransition,
+            RemediationExecutionTransition, RemediationJobResultStatus,
+        };
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        let root = artifact_test_root("inbox-remediation-startup-recovery");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let mut store = SqliteStore::open(&database).unwrap();
+        save_test_agent(&store, "agent-1");
+        let mut job = Job::new(
+            JobId::new("job-inbox-remediation").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        job.queue(true).unwrap();
+        store
+            .save_runbook_job_record(
+                &job,
+                &fleet_domain::RunbookExecutionTask::new("fixture", Duration::from_secs(30))
+                    .unwrap(),
+            )
+            .unwrap();
+        save_test_assignment(
+            &store,
+            "job-inbox-remediation",
+            "task-inbox-remediation",
+            "agent-1",
+        );
+        store
+            .save_policy_source(
+                "policy-inbox",
+                "policy-inbox",
+                1,
+                "apiVersion: fleet.sponzey.dev/v1alpha1",
+            )
+            .unwrap();
+        let mut current = controller_remediation_request_record(
+            "rem-inbox",
+            "agent-1",
+            "policy-inbox",
+            "running",
+            Some("job-inbox-remediation"),
+        );
+        current.policy_version = Some(1);
+        store.save_remediation_request_record(&current).unwrap();
+        let (updated, audit) = PrepareRemediationExecutionTransition::execute(
+            current,
+            "job-inbox-remediation",
+            RemediationExecutionTransition::Result(RemediationJobResultStatus::Succeeded),
+            "agent-1",
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap()
+        .unwrap();
+        let namespace = store.controller_delivery_identity().unwrap().namespace;
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-inbox-remediation",
+            "task-inbox-remediation",
+            "report-inbox-remediation",
+        )
+        .unwrap();
+        let encoded = b"encoded-remediation-result".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            encoded,
+            AssignmentStatus::Succeeded,
+            SystemTime::UNIX_EPOCH,
+            None,
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            0, 0, false,
+        ))
+        .with_prepared_remediation(ControllerPreparedRemediation::new(
+            "running", updated, audit,
+        ));
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        drop(store);
+
+        let state = ControllerAppState {
+            store: Arc::new(Mutex::new(ControllerStore::Sqlite(
+                SqliteStore::open(&database).unwrap(),
+            ))),
+            artifact_store: Arc::new(Mutex::new(
+                LocalArtifactStore::new(root.join("artifacts")).unwrap(),
+            )),
+            identity: Arc::new(ControllerIdentity::dev_insecure()),
+            metadata: Arc::new(ControllerRuntimeMetadata::default()),
+            sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+            catalog_sync_submitter: None,
+            admin_auth: None,
+        };
+        assert_eq!(
+            recover_pending_remediation_verifications(&state, 10)
+                .unwrap()
+                .created,
+            1
+        );
+        assert_eq!(
+            recover_pending_remediation_verifications(&state, 10)
+                .unwrap()
+                .created,
+            0
+        );
+        let guard = lock_store(&state).unwrap();
+        let store = sqlite_test_store(&guard);
+        let verification_job_id = store
+            .find_remediation_verification_job_id("rem-inbox")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .find_task_assignment_status(&format!("{verification_job_id}-task-0"))
+                .unwrap()
+                .as_deref(),
+            Some("queued")
+        );
+        drop(guard);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_verification_result_and_evidence_resolve_remediation_after_restart() {
+        let root = artifact_test_root("remediation-resolution-startup-recovery");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let store = SqliteStore::open(&database).unwrap();
+        save_test_agent(&store, "agent-recovery");
+        save_test_job(&store, "job-remediation-recovery");
+        save_test_job(&store, "job-verification-recovery");
+        save_test_assignment(
+            &store,
+            "job-remediation-recovery",
+            "task-remediation-recovery",
+            "agent-recovery",
+        );
+        save_test_assignment(
+            &store,
+            "job-verification-recovery",
+            "task-verification-recovery",
+            "agent-recovery",
+        );
+        store
+            .update_task_assignment_status(
+                "task-remediation-recovery",
+                AssignmentStatus::Succeeded,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(50),
+                None,
+            )
+            .unwrap();
+        let origin = DriftReport {
+            policy_name: "policy-recovery".to_owned(),
+            status: DriftStatus::Drifted,
+            severity: DriftSeverity::Warning,
+            acknowledgement: DriftAcknowledgement::Open,
+            expected: "running".to_owned(),
+            actual: "stopped".to_owned(),
+        };
+        store
+            .insert_drift_report(
+                "agent-recovery",
+                &origin,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            )
+            .unwrap();
+        let origin_id = store
+            .latest_drift_report("agent-recovery")
+            .unwrap()
+            .unwrap()
+            .id;
+        let mut remediation = controller_remediation_request_record(
+            "remediation-recovery",
+            "agent-recovery",
+            "policy-recovery",
+            "succeeded_pending_verify",
+            Some("job-remediation-recovery"),
+        );
+        remediation.origin_drift_report_id = Some(origin_id);
+        remediation.policy_version = Some(1);
+        store.save_remediation_request_record(&remediation).unwrap();
+        store
+            .save_remediation_verification_job(
+                "remediation-recovery",
+                "job-verification-recovery",
+                SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            )
+            .unwrap();
+        let evidence = DriftReport {
+            policy_name: "policy-recovery".to_owned(),
+            status: DriftStatus::Compliant,
+            severity: DriftSeverity::None,
+            acknowledgement: DriftAcknowledgement::Open,
+            expected: "running".to_owned(),
+            actual: "running".to_owned(),
+        };
+        store
+            .insert_drift_report_with_provenance(
+                "agent-recovery",
+                &evidence,
+                &fleet_domain::DriftReportProvenance::verified(
+                    JobId::new("job-verification-recovery").unwrap(),
+                    fleet_domain::TaskId::new("task-verification-recovery").unwrap(),
+                    "policy-recovery",
+                    1,
+                    fleet_domain::DriftCheckPurpose::RemediationVerification,
+                ),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(80),
+            )
+            .unwrap();
+        store
+            .update_task_assignment_status(
+                "task-verification-recovery",
+                AssignmentStatus::Succeeded,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(70),
+                None,
+            )
+            .unwrap();
+        drop(store);
+
+        let state = ControllerAppState {
+            store: Arc::new(Mutex::new(ControllerStore::Sqlite(
+                SqliteStore::open(&database).unwrap(),
+            ))),
+            artifact_store: Arc::new(Mutex::new(
+                LocalArtifactStore::new(root.join("artifacts")).unwrap(),
+            )),
+            identity: Arc::new(ControllerIdentity::dev_insecure()),
+            metadata: Arc::new(ControllerRuntimeMetadata::default()),
+            sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+            catalog_sync_submitter: None,
+            admin_auth: None,
+        };
+
+        assert_eq!(
+            recover_pending_remediation_verification_resolutions(&state, 10).unwrap(),
+            RemediationVerificationResolutionRecoverySummary {
+                discovered: 1,
+                resolved: 1,
+                unchanged: 0,
+            }
+        );
+        assert_eq!(
+            recover_pending_remediation_verification_resolutions(&state, 10).unwrap(),
+            RemediationVerificationResolutionRecoverySummary::default()
+        );
+        let guard = lock_store(&state).unwrap();
+        let store = sqlite_test_store(&guard);
+        assert_eq!(
+            store
+                .find_remediation_request_record("remediation-recovery")
+                .unwrap()
+                .unwrap()
+                .status,
+            "resolved"
+        );
+        assert_eq!(
+            store
+                .list_audit_events(100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "remediation_resolved_by_verification")
+                .count(),
+            1
+        );
+        drop(guard);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -23002,6 +29719,100 @@ spec:
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "task_verification_failed");
         assert!(!audits[0].contains_secret_plaintext());
+    }
+
+    #[test]
+    fn persistent_heartbeat_updates_received_time_without_security_noise() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        store
+            .mark_agent_online("agent-1", SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let before = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+        let message = fleet_protocol::WireMessage::new(
+            "msg-heartbeat",
+            "corr-heartbeat",
+            Some("agent-1".to_owned()),
+            u64::MAX,
+            fleet_protocol::WirePayload::Heartbeat {
+                agent_id: "agent-1".to_owned(),
+                status: "online".to_owned(),
+            },
+        );
+        assert!(!handle_agent_task_data_message(&store, "agent-1", message).unwrap());
+        let seen = store
+            .find_agent_by_id("agent-1")
+            .unwrap()
+            .unwrap()
+            .last_seen_at()
+            .unwrap();
+        assert!(seen >= before && seen <= SystemTime::now());
+        assert!(
+            store
+                .list_audit_events_by_category(AuditCategory::Security, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn persistent_heartbeat_cannot_refresh_another_agent() {
+        let store = SqliteStore::in_memory().unwrap();
+        for id in ["agent-1", "agent-2"] {
+            save_test_agent(&store, id);
+            store.mark_agent_online(id, SystemTime::UNIX_EPOCH).unwrap();
+        }
+        let message = fleet_protocol::WireMessage::new(
+            "msg-heartbeat",
+            "corr-heartbeat",
+            Some("agent-1".to_owned()),
+            u64::MAX,
+            fleet_protocol::WirePayload::Heartbeat {
+                agent_id: "agent-2".to_owned(),
+                status: "online".to_owned(),
+            },
+        );
+        assert!(!handle_agent_task_data_message(&store, "agent-1", message).unwrap());
+        for id in ["agent-1", "agent-2"] {
+            assert_eq!(
+                store.find_agent_by_id(id).unwrap().unwrap().last_seen_at(),
+                Some(SystemTime::UNIX_EPOCH)
+            );
+        }
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Security, 10)
+            .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "websocket_heartbeat_agent_mismatch");
+    }
+
+    #[test]
+    fn persistent_heartbeat_preserves_degraded_health() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        store
+            .mark_agent_degraded("agent-1", SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let message = fleet_protocol::WireMessage::new(
+            "msg-heartbeat",
+            "corr-heartbeat",
+            Some("agent-1".to_owned()),
+            1,
+            fleet_protocol::WirePayload::Heartbeat {
+                agent_id: "agent-1".to_owned(),
+                status: "online".to_owned(),
+            },
+        );
+        assert!(!handle_agent_task_data_message(&store, "agent-1", message).unwrap());
+        let agent = store.find_agent_by_id("agent-1").unwrap().unwrap();
+        assert_eq!(agent.status(), AgentStatus::Degraded);
+        assert!(agent.last_seen_at().unwrap() > SystemTime::UNIX_EPOCH);
     }
 
     #[test]
@@ -26210,6 +33021,14 @@ spec:
     }
 
     fn write_default_controller_signing_key_pair(data_dir: &Path) -> ControllerSigningKeyTestPair {
+        let mut directory = std::fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(data_dir).unwrap();
         let pair = write_controller_signing_key_pair(&data_dir.join("controller"), "controller");
         std::fs::rename(
             &pair.files.public_key_path,
@@ -26297,7 +33116,8 @@ spec:
 
     fn poll_http_get(port: u16, path: &str) -> String {
         let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             match std::net::TcpStream::connect(("127.0.0.1", port)) {
                 Ok(mut stream) => {
                     stream.write_all(request.as_bytes()).unwrap();

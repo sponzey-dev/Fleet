@@ -10,5 +10,8 @@ fleet-domain = { path = "../fleet-domain" }
 serde.workspace = true
 sha2.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { workspace = true, features = ["event"] }
+
 [dev-dependencies]
 serde_json.workspace = true

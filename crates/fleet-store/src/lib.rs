@@ -1,3 +1,22 @@
+mod admin_approval;
+mod admin_cancel;
+mod admin_command_creation;
+mod admin_identity;
+mod admin_remediation;
+mod admin_structured_job;
+pub mod agent_journal;
+mod assignment_recovery;
+mod catalog_job_creation;
+mod controller_delivery_identity;
+mod controller_inbox;
+mod controller_receipts;
+mod output_read;
+#[cfg(test)]
+mod output_read_rehearsal;
+pub mod sqlite_snapshot;
+#[cfg(test)]
+mod sqlite_snapshot_tests;
+
 use fleet_application::{
     AdminTokenRecord as AppAdminTokenRecord, AdminTokenRepository, AgentCapabilityRepository,
     AgentCertificateLifecycleRecord, AgentCertificateLifecycleRepository,
@@ -31,7 +50,9 @@ use fleet_application::{
     RemediationVerificationJobPersistenceInput as AppRemediationVerificationJobPersistenceInput,
     RemediationVerificationJobRepository,
     RemediationVerificationJobSave as AppRemediationVerificationJobSave,
-    RemediationVerificationRecoveryRepository, RemediationVerificationResolutionRepository,
+    RemediationVerificationRecoveryRepository, RemediationVerificationResolutionCandidate,
+    RemediationVerificationResolutionRecoveryRepository,
+    RemediationVerificationResolutionRepository,
     RetentionCleanupSummary as AppRetentionCleanupSummary, RetentionCutoffs, RetentionRepository,
     RunbookJobRepository, ScheduledDriftRecord as AppScheduledDriftRecord,
     SigningKeyRotationRecord, SigningKeyRotationRepository, SnapshotPageCursor,
@@ -58,14 +79,16 @@ use fleet_domain::{
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 22;
+pub const CURRENT_SCHEMA_VERSION: i64 = 28;
 
 #[derive(Debug)]
 pub enum StoreError {
     DuplicateAgent,
+    AssignmentOwnershipMismatch,
     ConstraintViolation(String),
     NotFound,
     Sqlite(rusqlite::Error),
@@ -78,6 +101,10 @@ impl PartialEq for StoreError {
         matches!(
             (self, other),
             (Self::DuplicateAgent, Self::DuplicateAgent)
+                | (
+                    Self::AssignmentOwnershipMismatch,
+                    Self::AssignmentOwnershipMismatch
+                )
                 | (Self::NotFound, Self::NotFound)
                 | (Self::ConstraintViolation(_), Self::ConstraintViolation(_))
                 | (Self::Sqlite(_), Self::Sqlite(_))
@@ -521,6 +548,29 @@ impl PostgresStore {
             .transition(StoreMigrationEvent::CheckSchema)?
             .transition(StoreMigrationEvent::Plan)?;
         let mut client = self.checkout_client()?;
+        let migration_table_exists: bool = client
+            .query_one("SELECT to_regclass('schema_migrations') IS NOT NULL", &[])
+            .map_err(|_| StoreError::Postgres("postgres schema version check failed".into()))?
+            .get(0);
+        let current_version = if migration_table_exists {
+            let version = client
+                .query_opt(
+                    "SELECT version FROM schema_migrations WHERE name = $1",
+                    &[&"fleet_store"],
+                )
+                .map_err(|_| StoreError::Postgres("postgres schema version check failed".into()))?;
+            if version
+                .as_ref()
+                .is_some_and(|row| row.get::<_, i64>(0) > CURRENT_SCHEMA_VERSION)
+            {
+                return Err(StoreError::Postgres(
+                    "controller database schema is newer than this binary".into(),
+                ));
+            }
+            version.map(|row| row.get::<_, i64>(0))
+        } else {
+            None
+        };
         client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -535,6 +585,44 @@ impl PostgresStore {
                     public_fingerprint TEXT NOT NULL,
                     private_key_path TEXT NOT NULL,
                     created_at BIGINT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS controller_delivery_identity (
+                    id BIGINT PRIMARY KEY CHECK (id = 1),
+                    namespace TEXT NOT NULL,
+                    store_epoch TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS controller_report_inbox (
+                    controller_namespace TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    report_id TEXT NOT NULL,
+                    class TEXT NOT NULL CHECK (class IN ('lifecycle', 'drift_evidence', 'output', 'final_result')),
+                    digest_hex TEXT NOT NULL,
+                    body BYTEA,
+                    accounted_bytes BIGINT NOT NULL CHECK (accounted_bytes > 0),
+                    status TEXT NOT NULL CHECK (status IN ('pending_effects', 'committed')),
+                    PRIMARY KEY (controller_namespace, agent_id, job_id, task_id, report_id)
+                );
+                CREATE INDEX IF NOT EXISTS controller_report_inbox_pending_agent_idx
+                    ON controller_report_inbox (agent_id, status);
+
+                CREATE TABLE IF NOT EXISTS controller_report_receipts (
+                    controller_namespace TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    report_id TEXT NOT NULL,
+                    digest_hex TEXT NOT NULL,
+                    store_epoch TEXT NOT NULL,
+                    signer_fingerprint TEXT NOT NULL,
+                    receipt_bytes BYTEA NOT NULL,
+                    PRIMARY KEY (controller_namespace, agent_id, job_id, task_id, report_id),
+                    FOREIGN KEY (controller_namespace, agent_id, job_id, task_id, report_id)
+                        REFERENCES controller_report_inbox (controller_namespace, agent_id, job_id, task_id, report_id)
+                        ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS controller_signing_key_rotation (
@@ -947,20 +1035,21 @@ impl PostgresStore {
                     ON audit_events (occurred_at DESC, id DESC)",
             )
             .map_err(|_| StoreError::Postgres("postgres schema migration failed".to_owned()))?;
-        client
-            .execute(
-                "INSERT INTO schema_migrations (name, version, applied_at)
-                 VALUES ($1, $2, EXTRACT(EPOCH FROM now())::BIGINT)
-                 ON CONFLICT (name) DO UPDATE
-                 SET version = EXCLUDED.version,
-                     applied_at = CASE
-                         WHEN schema_migrations.version = EXCLUDED.version
-                         THEN schema_migrations.applied_at
-                         ELSE EXCLUDED.applied_at
-                     END",
-                &[&"fleet_store", &CURRENT_SCHEMA_VERSION],
-            )
-            .map_err(|_| StoreError::Postgres("postgres schema migration failed".to_owned()))?;
+        // The inbox-class expansion belongs to v26; later identity migrations
+        // do not require rebuilding this constraint.
+        if current_version.is_some_and(|version| version < 26) {
+            client
+                .batch_execute(
+                    "ALTER TABLE controller_report_inbox
+                         DROP CONSTRAINT IF EXISTS controller_report_inbox_class_check;
+                     ALTER TABLE controller_report_inbox
+                         ADD CONSTRAINT controller_report_inbox_class_check
+                         CHECK (class IN ('lifecycle', 'drift_evidence', 'output', 'final_result'));",
+                )
+                .map_err(|_| StoreError::Postgres("postgres schema migration failed".to_owned()))?;
+        }
+        controller_delivery_identity::ensure_postgres(&mut client)?;
+        admin_identity::migrate_postgres(&mut client, current_version)?;
         state = state.transition(StoreMigrationEvent::Apply)?;
         let _verified = state.transition(StoreMigrationEvent::Verify)?;
         Ok(())
@@ -1211,7 +1300,27 @@ impl SqliteStore {
     }
 
     pub fn migrate(&self) -> Result<(), StoreError> {
+        let migration_table_exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
+            [], |row| row.get(0)
+        )?;
+        if migration_table_exists {
+            let version: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT version FROM schema_migrations WHERE name = 'fleet_store'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if version.is_some_and(|value| value > CURRENT_SCHEMA_VERSION) {
+                return Err(StoreError::Domain(
+                    "controller database schema is newer than this binary".into(),
+                ));
+            }
+        }
         self.connection.execute_batch(SCHEMA_SQL)?;
+        self.ensure_controller_inbox_supports_drift_evidence()?;
         self.ensure_column(
             "jobs",
             "drift_policy_document",
@@ -1391,11 +1500,13 @@ impl SqliteStore {
              WHERE job_id IS NOT NULL AND task_id IS NOT NULL;",
         )?;
         self.ensure_approval_requests_allow_reserved_job_id()?;
-        self.record_schema_version()?;
+        controller_delivery_identity::ensure_sqlite(self)?;
+        output_read::migrate_projection(self)?;
+        admin_identity::migrate_sqlite(self)?;
         Ok(())
     }
 
-    fn record_schema_version(&self) -> Result<(), StoreError> {
+    fn record_schema_version(&self, version: i64) -> Result<(), StoreError> {
         self.connection.execute(
             "INSERT INTO schema_migrations (name, version, applied_at)
              VALUES ('fleet_store', ?1, unixepoch())
@@ -1406,7 +1517,7 @@ impl SqliteStore {
                     THEN schema_migrations.applied_at
                     ELSE excluded.applied_at
                 END",
-            params![CURRENT_SCHEMA_VERSION],
+            params![version],
         )?;
         Ok(())
     }
@@ -1586,6 +1697,81 @@ impl SqliteStore {
         }
     }
 
+    fn ensure_controller_inbox_supports_drift_evidence(&self) -> Result<(), StoreError> {
+        let schema: String = self.connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='controller_report_inbox'",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema.contains("'drift_evidence'") {
+            return Ok(());
+        }
+
+        self.connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let rebuild = (|| -> Result<(), StoreError> {
+            let transaction = self.connection.unchecked_transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE controller_report_inbox_v26 (
+                    controller_namespace TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    report_id TEXT NOT NULL,
+                    class TEXT NOT NULL CHECK (class IN ('lifecycle', 'drift_evidence', 'output', 'final_result')),
+                    digest_hex TEXT NOT NULL,
+                    body BLOB,
+                    accounted_bytes INTEGER NOT NULL CHECK (accounted_bytes > 0),
+                    status TEXT NOT NULL CHECK (status IN ('pending_effects', 'committed')),
+                    PRIMARY KEY (controller_namespace, agent_id, job_id, task_id, report_id)
+                );
+                CREATE TABLE controller_report_receipts_v26 (
+                    controller_namespace TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    report_id TEXT NOT NULL,
+                    digest_hex TEXT NOT NULL,
+                    store_epoch TEXT NOT NULL,
+                    signer_fingerprint TEXT NOT NULL,
+                    receipt_bytes BLOB NOT NULL,
+                    PRIMARY KEY (controller_namespace, agent_id, job_id, task_id, report_id),
+                    FOREIGN KEY (controller_namespace, agent_id, job_id, task_id, report_id)
+                        REFERENCES controller_report_inbox_v26 (controller_namespace, agent_id, job_id, task_id, report_id)
+                        ON DELETE CASCADE
+                );
+                INSERT INTO controller_report_inbox_v26 (
+                    controller_namespace, agent_id, job_id, task_id, report_id, class,
+                    digest_hex, body, accounted_bytes, status
+                ) SELECT controller_namespace, agent_id, job_id, task_id, report_id, class,
+                    digest_hex, body, accounted_bytes, status FROM controller_report_inbox;
+                INSERT INTO controller_report_receipts_v26 (
+                    controller_namespace, agent_id, job_id, task_id, report_id, digest_hex,
+                    store_epoch, signer_fingerprint, receipt_bytes
+                ) SELECT controller_namespace, agent_id, job_id, task_id, report_id, digest_hex,
+                    store_epoch, signer_fingerprint, receipt_bytes FROM controller_report_receipts;
+                DROP TABLE controller_report_receipts;
+                DROP TABLE controller_report_inbox;
+                ALTER TABLE controller_report_inbox_v26 RENAME TO controller_report_inbox;
+                ALTER TABLE controller_report_receipts_v26 RENAME TO controller_report_receipts;
+                CREATE INDEX controller_report_inbox_pending_agent_idx
+                    ON controller_report_inbox (agent_id, status);",
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        let restore_foreign_keys = self.connection.execute_batch("PRAGMA foreign_keys = ON;");
+        rebuild?;
+        restore_foreign_keys?;
+        let mut check = self.connection.prepare("PRAGMA foreign_key_check")?;
+        if check.query([])?.next()?.is_some() {
+            return Err(StoreError::Domain(
+                "controller report migration left a foreign-key violation".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn approval_requests_has_job_fk(&self) -> Result<bool, StoreError> {
         let mut statement = self
             .connection
@@ -1625,12 +1811,16 @@ impl SqliteStore {
         actor_id: &str,
         role: &str,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        let inserted = self.connection.execute(
             "INSERT INTO admin_tokens (id, token_hash, actor_id, role, created_at)
-             VALUES (1, ?1, ?2, ?3, unixepoch())
+             SELECT 1, ?1, ?2, ?3, unixepoch()
+             WHERE EXISTS (SELECT 1 FROM admin_auth_state WHERE id=1 AND mode='legacy_bootstrap')
              ON CONFLICT(id) DO NOTHING",
             params![token_hash, actor_id, role],
         )?;
+        if inserted == 0 {
+            admin_identity::require_legacy_token_mode(self)?;
+        }
         Ok(())
     }
 
@@ -1644,7 +1834,10 @@ impl SqliteStore {
     pub fn verify_admin_token_hash(&self, token_hash: &str) -> Result<bool, StoreError> {
         Ok(self
             .connection
-            .prepare("SELECT 1 FROM admin_tokens WHERE id = 1 AND token_hash = ?1")?
+            .prepare(
+                "SELECT 1 FROM admin_tokens WHERE id = 1 AND token_hash = ?1
+                AND EXISTS (SELECT 1 FROM admin_auth_state WHERE id=1 AND mode='legacy_bootstrap')",
+            )?
             .exists(params![token_hash])?)
     }
 
@@ -1656,7 +1849,8 @@ impl SqliteStore {
             .query_row(
                 "SELECT actor_id, role
                  FROM admin_tokens
-                 WHERE id = 1 AND token_hash = ?1",
+                 WHERE id = 1 AND token_hash = ?1
+                   AND EXISTS (SELECT 1 FROM admin_auth_state WHERE id=1 AND mode='legacy_bootstrap')",
                 params![token_hash],
                 |row| {
                     Ok(AppAdminTokenRecord {
@@ -3019,25 +3213,36 @@ impl SqliteStore {
                     task.runbook_document(),
                 ],
             )?;
-            self.connection.execute(
-                "INSERT INTO job_catalog_runbook_provenance
-                    (job_id, source_id, commit_id, path, checksum)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    job.id().as_str(),
-                    provenance.source_id().as_str(),
-                    provenance.commit().as_str(),
-                    provenance.path(),
-                    provenance.checksum(),
-                ],
-            )?;
-            for assignment in assignments {
-                sqlite_insert_task_assignment_in_connection(&self.connection, assignment)?;
-            }
-            Ok(())
+            self.insert_catalog_job_provenance_and_assignments(job.id().as_str(), provenance, assignments)
         })
     }
 
+    fn insert_catalog_job_provenance_and_assignments(
+        &self,
+        job_id: &str,
+        provenance: &fleet_domain::CatalogRunbookProvenance,
+        assignments: &[TaskEnvelope],
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO job_catalog_runbook_provenance
+            (job_id, source_id, commit_id, path, checksum)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                job_id,
+                provenance.source_id().as_str(),
+                provenance.commit().as_str(),
+                provenance.path(),
+                provenance.checksum(),
+            ],
+        )?;
+        for assignment in assignments {
+            sqlite_insert_task_assignment_in_connection(&self.connection, assignment)?;
+        }
+        Ok(())
+    }
+
+    /// Owns one immediate write unit and attempts rollback on operation or commit
+    /// failure. A failed BEGIN never rolls back a caller's existing transaction.
     fn run_sqlite_transaction<T, F>(&self, operation: F) -> Result<T, StoreError>
     where
         F: FnOnce() -> Result<T, StoreError>,
@@ -3045,7 +3250,10 @@ impl SqliteStore {
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         match operation() {
             Ok(value) => {
-                self.connection.execute_batch("COMMIT")?;
+                if let Err(error) = self.connection.execute_batch("COMMIT") {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
                 Ok(value)
             }
             Err(error) => {
@@ -3211,29 +3419,105 @@ impl SqliteStore {
         self.update_task_assignment_status(task_id, status, occurred_at, last_error)
     }
 
+    /// WebSocket ACK/rejection state may change only for the authenticated
+    /// Agent and claimed Job that own this Assignment.
+    pub fn update_active_task_assignment_status_for_owner(
+        &self,
+        task_id: &str,
+        job_id: &str,
+        agent_id: &str,
+        status: AssignmentStatus,
+        occurred_at: SystemTime,
+        last_error: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        if !matches!(
+            status,
+            AssignmentStatus::Accepted | AssignmentStatus::Rejected
+        ) {
+            return Err(StoreError::Domain(
+                "unsupported owner-bound assignment transition".into(),
+            ));
+        }
+        self.run_sqlite_transaction(|| {
+            let owner: Option<(String, String, String)> = self
+                .connection
+                .query_row(
+                    "SELECT status, job_id, agent_id FROM task_assignments WHERE id = ?1",
+                    params![task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((current_status, stored_job, stored_agent)) = owner else {
+                return Ok(false);
+            };
+            if stored_job != job_id || stored_agent != agent_id {
+                return Err(StoreError::AssignmentOwnershipMismatch);
+            }
+            if assignment_status_value_is_terminal(&current_status) {
+                return Ok(false);
+            }
+            let occurred_at = system_time_to_unix_secs(occurred_at);
+            let changed = if status == AssignmentStatus::Accepted {
+                self.connection.execute(
+                    "UPDATE task_assignments SET status = 'accepted', accepted_at = ?4
+                     WHERE id = ?1 AND job_id = ?2 AND agent_id = ?3",
+                    params![task_id, job_id, agent_id, occurred_at],
+                )?
+            } else {
+                self.connection.execute(
+                    "UPDATE task_assignments SET status = 'rejected', completed_at = ?4,
+                         last_error = COALESCE(?5, last_error)
+                     WHERE id = ?1 AND job_id = ?2 AND agent_id = ?3",
+                    params![task_id, job_id, agent_id, occurred_at, last_error],
+                )?
+            };
+            Ok(changed == 1)
+        })
+    }
+
     pub fn persist_remediation_execution_transition_record(
         &self,
         input: &AppRemediationExecutionPersistenceInput,
     ) -> Result<bool, StoreError> {
         self.run_sqlite_transaction(|| {
-            let Some(current_status) = self.find_task_assignment_status(&input.task_id)? else {
+            let owner: Option<(String, String, String)> = self
+                .connection
+                .query_row(
+                    "SELECT status, job_id, agent_id FROM task_assignments WHERE id = ?1",
+                    params![input.task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((current_status, job_id, agent_id)) = owner else {
                 return Ok(false);
             };
+            if job_id != input.job_id || agent_id != input.agent_id {
+                return Err(StoreError::AssignmentOwnershipMismatch);
+            }
             if assignment_status_value_is_terminal(&current_status) {
                 return Ok(false);
             }
             let occurred_at = system_time_to_unix_secs(input.occurred_at);
             let changed = match input.assignment_status.as_str() {
                 "started" => self.connection.execute(
-                    "UPDATE task_assignments SET status = ?2, started_at = ?3 WHERE id = ?1",
-                    params![input.task_id, input.assignment_status, occurred_at],
+                    "UPDATE task_assignments SET status = ?4, started_at = ?5
+                     WHERE id = ?1 AND job_id = ?2 AND agent_id = ?3",
+                    params![
+                        input.task_id,
+                        input.job_id,
+                        input.agent_id,
+                        input.assignment_status,
+                        occurred_at
+                    ],
                 )?,
                 "succeeded" | "failed" | "canceled" | "expired" => self.connection.execute(
                     "UPDATE task_assignments
-                     SET status = ?2, completed_at = ?3, last_error = COALESCE(?4, last_error)
-                     WHERE id = ?1",
+                     SET status = ?4, completed_at = ?5, last_error = COALESCE(?6, last_error)
+                     WHERE id = ?1 AND job_id = ?2 AND agent_id = ?3",
                     params![
                         input.task_id,
+                        input.job_id,
+                        input.agent_id,
                         input.assignment_status,
                         occurred_at,
                         input.assignment_last_error
@@ -4248,18 +4532,24 @@ impl SqliteStore {
         &self,
         input: &AppPersistVerifiedDriftProposalInput,
     ) -> Result<AppPersistVerifiedDriftProposalOutput, StoreError> {
-        self.run_sqlite_transaction(|| {
-            let job_id = input
-                .provenance
-                .job_id
-                .as_ref()
-                .ok_or_else(|| StoreError::Domain("verified drift requires job id".to_owned()))?;
-            let task_id = input
-                .provenance
-                .task_id
-                .as_ref()
-                .ok_or_else(|| StoreError::Domain("verified drift requires task id".to_owned()))?;
-            let existing = self
+        self.run_sqlite_transaction(|| self.save_verified_drift_proposal_in_transaction(input))
+    }
+
+    fn save_verified_drift_proposal_in_transaction(
+        &self,
+        input: &AppPersistVerifiedDriftProposalInput,
+    ) -> Result<AppPersistVerifiedDriftProposalOutput, StoreError> {
+        let job_id = input
+            .provenance
+            .job_id
+            .as_ref()
+            .ok_or_else(|| StoreError::Domain("verified drift requires job id".to_owned()))?;
+        let task_id = input
+            .provenance
+            .task_id
+            .as_ref()
+            .ok_or_else(|| StoreError::Domain("verified drift requires task id".to_owned()))?;
+        let existing = self
                 .connection
                 .query_row(
                     "SELECT id, agent_id, policy_name, status, expected, actual, checked_at,
@@ -4278,68 +4568,85 @@ impl SqliteStore {
                     },
                 )
                 .optional()?;
-            if let Some(report) = existing {
-                let remediation = self
-                    .connection
-                    .query_row(
-                        "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
+        if let Some(report) = existing {
+            if report.agent_id != input.agent_id
+                || report.report != input.report
+                || report.provenance != input.provenance
+                || report.checked_at != input.checked_at
+            {
+                return Err(StoreError::Domain(
+                    "verified drift correlation conflicts with stored evidence".to_owned(),
+                ));
+            }
+            let remediation = self
+                .connection
+                .query_row(
+                    "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
                                 approval_required, risk_summary, job_id, origin_drift_report_id,
                                 policy_version, created_at, updated_at
                          FROM remediation_requests WHERE origin_drift_report_id = ?1
                          ORDER BY created_at, id LIMIT 1",
-                        params![report.id.as_i64()],
-                        row_to_remediation_request_record,
-                    )
-                    .optional()?
-                    .ok_or_else(|| {
-                        StoreError::Domain("verified drift has no remediation proposal".to_owned())
-                    })?;
-                return Ok(AppPersistVerifiedDriftProposalOutput {
-                    report,
-                    proposal: AppRemediationProposalSave {
-                        remediation,
-                        created: false,
-                    },
-                });
+                    params![report.id.as_i64()],
+                    row_to_remediation_request_record,
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::Domain("verified drift has no remediation proposal".to_owned())
+                })?;
+            if remediation.agent_id != input.agent_id
+                || remediation.policy_id != input.remediation.policy_id
+                || remediation.policy_version != input.remediation.policy_version
+            {
+                return Err(StoreError::Domain(
+                    "verified drift proposal conflicts with stored evidence".to_owned(),
+                ));
             }
-            self.connection
-                .execute(
-                    "INSERT INTO drift_reports (
+            return Ok(AppPersistVerifiedDriftProposalOutput {
+                report,
+                proposal: AppRemediationProposalSave {
+                    remediation,
+                    created: false,
+                },
+            });
+        }
+        self.connection
+            .execute(
+                "INSERT INTO drift_reports (
                         agent_id, policy_name, status, severity, expected, actual, checked_at,
                         job_id, task_id, policy_id, policy_version, purpose
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![
-                        input.agent_id,
-                        input.report.policy_name,
-                        drift_status_to_str(&input.report.status),
-                        drift_severity_to_str(input.report.severity),
-                        input.report.expected,
-                        input.report.actual,
-                        system_time_to_unix_secs(input.checked_at),
-                        job_id.as_str(),
-                        task_id.as_str(),
-                        input.provenance.policy_id,
-                        input.provenance.policy_version.map(i64::from),
-                        input.provenance.purpose.map(DriftCheckPurpose::as_str),
-                    ],
-                )
-                .map_err(map_drift_report_constraint)?;
-            let report_id = DriftReportId::new(self.connection.last_insert_rowid())
-                .map_err(|error| StoreError::Domain(format!("{error:?}")))?;
-            let report = AppDriftReportRecord {
-                id: report_id,
-                agent_id: input.agent_id.clone(),
-                report: input.report.clone(),
-                provenance: input.provenance.clone(),
-                checked_at: input.checked_at,
-            };
-            self.insert_audit(&input.drift_audit)?;
-            let mut remediation = input.remediation.clone();
-            remediation.origin_drift_report_id = Some(report_id);
-            let existing = self
-                .connection
-                .query_row(
-                    "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
+                params![
+                    input.agent_id,
+                    input.report.policy_name,
+                    drift_status_to_str(&input.report.status),
+                    drift_severity_to_str(input.report.severity),
+                    input.report.expected,
+                    input.report.actual,
+                    system_time_to_unix_secs(input.checked_at),
+                    job_id.as_str(),
+                    task_id.as_str(),
+                    input.provenance.policy_id,
+                    input.provenance.policy_version.map(i64::from),
+                    input.provenance.purpose.map(DriftCheckPurpose::as_str),
+                ],
+            )
+            .map_err(map_drift_report_constraint)?;
+        let report_id = DriftReportId::new(self.connection.last_insert_rowid())
+            .map_err(|error| StoreError::Domain(format!("{error:?}")))?;
+        let report = AppDriftReportRecord {
+            id: report_id,
+            agent_id: input.agent_id.clone(),
+            report: input.report.clone(),
+            provenance: input.provenance.clone(),
+            checked_at: input.checked_at,
+        };
+        self.insert_audit(&input.drift_audit)?;
+        let mut remediation = input.remediation.clone();
+        remediation.origin_drift_report_id = Some(report_id);
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
                             approval_required, risk_summary, job_id, origin_drift_report_id,
                             policy_version, created_at, updated_at
                      FROM remediation_requests
@@ -4347,25 +4654,24 @@ impl SqliteStore {
                        AND origin_drift_report_id IS NOT NULL
                        AND status NOT IN ('resolved', 'failed', 'rejected', 'expired', 'canceled')
                      ORDER BY created_at, id LIMIT 1",
-                    params![remediation.agent_id, remediation.policy_id],
-                    row_to_remediation_request_record,
-                )
-                .optional()?;
-            let proposal = if let Some(existing) = existing {
-                AppRemediationProposalSave {
-                    remediation: existing,
-                    created: false,
-                }
-            } else {
-                self.save_remediation_request_record(&remediation)?;
-                self.insert_audit(&input.proposal_audit)?;
-                AppRemediationProposalSave {
-                    remediation,
-                    created: true,
-                }
-            };
-            Ok(AppPersistVerifiedDriftProposalOutput { report, proposal })
-        })
+                params![remediation.agent_id, remediation.policy_id],
+                row_to_remediation_request_record,
+            )
+            .optional()?;
+        let proposal = if let Some(existing) = existing {
+            AppRemediationProposalSave {
+                remediation: existing,
+                created: false,
+            }
+        } else {
+            self.save_remediation_request_record(&remediation)?;
+            self.insert_audit(&input.proposal_audit)?;
+            AppRemediationProposalSave {
+                remediation,
+                created: true,
+            }
+        };
+        Ok(AppPersistVerifiedDriftProposalOutput { report, proposal })
     }
 
     pub fn find_remediation_request_record(
@@ -4488,6 +4794,58 @@ impl SqliteStore {
         )?;
         statement
             .query_map(params![limit], row_to_remediation_request_record)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Returns only bounded candidates with a successful final and fresh, policy-bound evidence.
+    pub fn list_pending_remediation_verification_resolution_records(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemediationVerificationResolutionCandidate>, StoreError> {
+        let limit = limit.clamp(1, 100);
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT verification_assignment.job_id, verification_assignment.id
+             FROM remediation_requests AS remediation
+             JOIN remediation_verification_jobs AS verification_job
+               ON verification_job.remediation_id = remediation.id
+             JOIN task_assignments AS verification_assignment
+               ON verification_assignment.job_id = verification_job.job_id
+              AND verification_assignment.agent_id = remediation.agent_id
+             JOIN task_assignments AS execution_assignment
+               ON execution_assignment.job_id = remediation.job_id
+              AND execution_assignment.agent_id = remediation.agent_id
+             JOIN drift_reports AS evidence
+               ON evidence.job_id = verification_assignment.job_id
+              AND evidence.task_id = verification_assignment.id
+             JOIN drift_reports AS origin
+               ON origin.id = remediation.origin_drift_report_id
+              AND origin.agent_id = remediation.agent_id
+             WHERE remediation.status = 'succeeded_pending_verify'
+               AND remediation.job_id IS NOT NULL
+               AND remediation.policy_version IS NOT NULL
+               AND verification_assignment.status = 'succeeded'
+               AND verification_assignment.completed_at IS NOT NULL
+               AND execution_assignment.status = 'succeeded'
+               AND execution_assignment.completed_at IS NOT NULL
+               AND evidence.agent_id = remediation.agent_id
+               AND evidence.policy_id = remediation.policy_id
+               AND evidence.policy_name = remediation.policy_name
+               AND evidence.policy_version = remediation.policy_version
+               AND evidence.purpose = 'remediation_verification'
+               AND evidence.status = 'compliant'
+               AND evidence.checked_at > execution_assignment.completed_at
+               AND origin.resolved_at IS NULL
+             ORDER BY verification_assignment.job_id, verification_assignment.id
+             LIMIT ?1",
+        )?;
+        statement
+            .query_map(params![limit], |row| {
+                Ok(RemediationVerificationResolutionCandidate {
+                    verification_job_id: row.get(0)?,
+                    verification_task_id: row.get(1)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -4982,6 +5340,13 @@ impl CatalogRepository for SqliteStore {
 
 impl CatalogQueryRepository for SqliteStore {
     type Error = StoreError;
+
+    fn find_catalog_sync_operation_status(
+        &self,
+        operation_id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+        CatalogRepository::find_catalog_sync_operation(self, operation_id)
+    }
 
     fn list_catalog_sources_after(
         &self,
@@ -5858,6 +6223,13 @@ impl CatalogRepository for PostgresStore {
 impl CatalogQueryRepository for PostgresStore {
     type Error = StoreError;
 
+    fn find_catalog_sync_operation_status(
+        &self,
+        operation_id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+        CatalogRepository::find_catalog_sync_operation(self, operation_id)
+    }
+
     fn list_catalog_sources_after(
         &self,
         after: Option<&CatalogSourceId>,
@@ -6262,22 +6634,28 @@ impl AdminTokenRepository for PostgresStore {
     }
 
     fn insert_admin_token_hash(&mut self, token_hash: &str) -> Result<(), Self::Error> {
-        self.checkout_client()?
+        let mut client = self.checkout_client()?;
+        let inserted = client
             .execute(
                 "INSERT INTO admin_tokens (id, token_hash, actor_id, role, created_at)
-                 VALUES (1, $1, 'bootstrap-admin', 'owner', EXTRACT(EPOCH FROM now())::BIGINT)
+                 SELECT 1, $1, 'bootstrap-admin', 'owner', EXTRACT(EPOCH FROM now())::BIGINT
+                 WHERE EXISTS (SELECT 1 FROM admin_auth_state WHERE id=1 AND mode='legacy_bootstrap')
                  ON CONFLICT (id) DO NOTHING",
                 &[&token_hash],
             )
-            .map(|_| ())
-            .map_err(|_| postgres_error("postgres admin token insert failed"))
+            .map_err(|_| postgres_error("postgres admin token insert failed"))?;
+        if inserted == 0 {
+            admin_identity::require_legacy_postgres(&mut client)?;
+        }
+        Ok(())
     }
 
     fn verify_admin_token_hash(&self, token_hash: &str) -> Result<bool, Self::Error> {
         let mut client = self.checkout_client()?;
         client
             .query_opt(
-                "SELECT 1 FROM admin_tokens WHERE id = 1 AND token_hash = $1",
+                "SELECT 1 FROM admin_tokens WHERE id = 1 AND token_hash = $1
+                 AND EXISTS (SELECT 1 FROM admin_auth_state WHERE id=1 AND mode='legacy_bootstrap')",
                 &[&token_hash],
             )
             .map(|row| row.is_some())
@@ -6293,7 +6671,8 @@ impl AdminTokenRepository for PostgresStore {
             .query_opt(
                 "SELECT actor_id, role
                  FROM admin_tokens
-                 WHERE id = 1 AND token_hash = $1",
+                 WHERE id = 1 AND token_hash = $1
+                   AND EXISTS (SELECT 1 FROM admin_auth_state WHERE id=1 AND mode='legacy_bootstrap')",
                 &[&token_hash],
             )
             .map(|row| {
@@ -6900,6 +7279,7 @@ impl LocalArtifactStore {
         &self,
         retention_class: ArtifactRetentionClass,
     ) -> Result<PathBuf, StoreError> {
+        let root_was_absent = !self.root.exists();
         std::fs::create_dir_all(&self.root)
             .map_err(|_| artifact_io_error("artifact root create failed"))?;
         let class_dir = self.root.join(retention_class.as_str());
@@ -6912,6 +7292,22 @@ impl LocalArtifactStore {
         }
         std::fs::create_dir_all(&class_dir)
             .map_err(|_| artifact_io_error("artifact class directory create failed"))?;
+        #[cfg(unix)]
+        {
+            std::fs::File::open(&self.root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| artifact_io_error("artifact root directory sync failed"))?;
+            if root_was_absent
+                && let Some(parent) = self.root.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|_| artifact_io_error("artifact root parent sync failed"))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = root_was_absent;
         Ok(class_dir)
     }
 }
@@ -6925,17 +7321,63 @@ impl ArtifactStore for LocalArtifactStore {
             return Err(StoreError::Domain("artifact checksum mismatch".to_owned()));
         }
 
-        self.ensure_class_dir(input.retention_class)?;
+        let class_dir = self.ensure_class_dir(input.retention_class)?;
         let path = self.object_path(&input.id, input.retention_class)?;
-        if let Ok(metadata) = std::fs::symlink_metadata(&path)
-            && metadata.file_type().is_symlink()
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|_| artifact_io_error("artifact temporary name generation failed"))?;
+        let temporary = class_dir.join(format!(
+            ".fleet-{}.tmp",
+            random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
-            return Err(StoreError::Domain(
-                "artifact object cannot be a symlink".to_owned(),
-            ));
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        std::fs::write(&path, &input.bytes)
-            .map_err(|_| artifact_io_error("artifact write failed"))?;
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| artifact_io_error("artifact temporary create failed"))?;
+        let write_result = file.write_all(&input.bytes).and_then(|()| file.sync_all());
+        drop(file);
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(artifact_io_error("artifact temporary write failed"));
+        }
+        let published = std::fs::hard_link(&temporary, &path);
+        let cleanup = std::fs::remove_file(&temporary);
+        if cleanup.is_err() {
+            return Err(artifact_io_error("artifact temporary cleanup failed"));
+        }
+        match published {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(&path)
+                    .map_err(|_| artifact_io_error("artifact existing object inspect failed"))?;
+                if !metadata.file_type().is_file() || metadata.len() != input.bytes.len() as u64 {
+                    return Err(StoreError::Domain(
+                        "artifact object conflicts with existing body".into(),
+                    ));
+                }
+                let existing = std::fs::read(&path)
+                    .map_err(|_| artifact_io_error("artifact existing object read failed"))?;
+                if existing != input.bytes {
+                    return Err(StoreError::Domain(
+                        "artifact object conflicts with existing body".into(),
+                    ));
+                }
+            }
+            Err(_) => return Err(artifact_io_error("artifact publish failed")),
+        }
+        #[cfg(unix)]
+        std::fs::File::open(&class_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| artifact_io_error("artifact directory sync failed"))?;
 
         Ok(AppArtifactStoreRecord {
             id: input.id,
@@ -7183,6 +7625,69 @@ impl PostgresStore {
             occurred_at,
             last_error,
         )
+    }
+
+    pub fn update_active_task_assignment_status_for_owner(
+        &self,
+        task_id: &str,
+        job_id: &str,
+        agent_id: &str,
+        status: AssignmentStatus,
+        occurred_at: SystemTime,
+        last_error: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        if !matches!(
+            status,
+            AssignmentStatus::Accepted | AssignmentStatus::Rejected
+        ) {
+            return Err(StoreError::Domain(
+                "unsupported owner-bound assignment transition".into(),
+            ));
+        }
+        let mut client = self.checkout_client()?;
+        let mut tx = client
+            .transaction()
+            .map_err(|_| postgres_error("postgres owner-bound assignment transaction failed"))?;
+        let owner = tx
+            .query_opt(
+                "SELECT status, job_id, agent_id FROM task_assignments WHERE id = $1 FOR UPDATE",
+                &[&task_id],
+            )
+            .map_err(|_| postgres_error("postgres owner-bound assignment lookup failed"))?;
+        let Some(owner) = owner else {
+            tx.rollback().ok();
+            return Ok(false);
+        };
+        let current_status: String = owner.get(0);
+        let stored_job: String = owner.get(1);
+        let stored_agent: String = owner.get(2);
+        if stored_job != job_id || stored_agent != agent_id {
+            tx.rollback().ok();
+            return Err(StoreError::AssignmentOwnershipMismatch);
+        }
+        if assignment_status_value_is_terminal(&current_status) {
+            tx.rollback().ok();
+            return Ok(false);
+        }
+        let occurred_at = system_time_to_unix_secs(occurred_at);
+        let changed = if status == AssignmentStatus::Accepted {
+            tx.execute(
+                "UPDATE task_assignments SET status = 'accepted', accepted_at = $4
+                 WHERE id = $1 AND job_id = $2 AND agent_id = $3",
+                &[&task_id, &job_id, &agent_id, &occurred_at],
+            )
+        } else {
+            tx.execute(
+                "UPDATE task_assignments SET status = 'rejected', completed_at = $4,
+                     last_error = COALESCE($5, last_error)
+                 WHERE id = $1 AND job_id = $2 AND agent_id = $3",
+                &[&task_id, &job_id, &agent_id, &occurred_at, &last_error],
+            )
+        }
+        .map_err(|_| postgres_error("postgres owner-bound assignment update failed"))?;
+        tx.commit()
+            .map_err(|_| postgres_error("postgres owner-bound assignment commit failed"))?;
+        Ok(changed == 1)
     }
 
     pub fn find_task_assignment_status(&self, task_id: &str) -> Result<Option<String>, StoreError> {
@@ -8096,17 +8601,25 @@ impl RemediationExecutionPersistenceRepository for PostgresStore {
         let mut transaction = client
             .transaction()
             .map_err(|_| postgres_error("postgres remediation execution transaction failed"))?;
-        let current_status = transaction
+        let owner = transaction
             .query_opt(
-                "SELECT status FROM task_assignments WHERE id = $1",
+                "SELECT status, job_id, agent_id FROM task_assignments WHERE id = $1 FOR UPDATE",
                 &[&input.task_id],
             )
-            .map_err(|_| postgres_error("postgres remediation execution assignment lookup failed"))?
-            .map(|row| row.get::<_, String>(0));
-        let Some(current_status) = current_status else {
+            .map_err(|_| {
+                postgres_error("postgres remediation execution assignment lookup failed")
+            })?;
+        let Some(owner) = owner else {
             transaction.rollback().ok();
             return Ok(false);
         };
+        let current_status: String = owner.get(0);
+        let job_id: String = owner.get(1);
+        let agent_id: String = owner.get(2);
+        if job_id != input.job_id || agent_id != input.agent_id {
+            transaction.rollback().ok();
+            return Err(StoreError::AssignmentOwnershipMismatch);
+        }
         if assignment_status_value_is_terminal(&current_status) {
             transaction.rollback().ok();
             return Ok(false);
@@ -8114,15 +8627,24 @@ impl RemediationExecutionPersistenceRepository for PostgresStore {
         let occurred_at = system_time_to_unix_secs(input.occurred_at);
         let changed = match input.assignment_status.as_str() {
             "started" => transaction.execute(
-                "UPDATE task_assignments SET status = $2, started_at = $3 WHERE id = $1",
-                &[&input.task_id, &input.assignment_status, &occurred_at],
+                "UPDATE task_assignments SET status = $4, started_at = $5
+                 WHERE id = $1 AND job_id = $2 AND agent_id = $3",
+                &[
+                    &input.task_id,
+                    &input.job_id,
+                    &input.agent_id,
+                    &input.assignment_status,
+                    &occurred_at,
+                ],
             ),
             "succeeded" | "failed" | "canceled" | "expired" => transaction.execute(
                 "UPDATE task_assignments
-                 SET status = $2, completed_at = $3, last_error = COALESCE($4, last_error)
-                 WHERE id = $1",
+                 SET status = $4, completed_at = $5, last_error = COALESCE($6, last_error)
+                 WHERE id = $1 AND job_id = $2 AND agent_id = $3",
                 &[
                     &input.task_id,
+                    &input.job_id,
+                    &input.agent_id,
                     &input.assignment_status,
                     &occurred_at,
                     &input.assignment_last_error,
@@ -8347,6 +8869,18 @@ impl RemediationVerificationRecoveryRepository for PostgresStore {
         limit: usize,
     ) -> Result<Vec<AppRemediationRequestRecord>, Self::Error> {
         postgres_list_pending_remediation_verification_recovery(self, limit)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl RemediationVerificationResolutionRecoveryRepository for PostgresStore {
+    type Error = StoreError;
+
+    fn list_pending_remediation_verification_resolutions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemediationVerificationResolutionCandidate>, Self::Error> {
+        postgres_list_pending_remediation_verification_resolutions(self, limit)
     }
 }
 
@@ -9230,6 +9764,17 @@ impl RemediationVerificationRecoveryRepository for SqliteStore {
         limit: usize,
     ) -> Result<Vec<AppRemediationRequestRecord>, Self::Error> {
         self.list_pending_remediation_verification_recovery_records(limit)
+    }
+}
+
+impl RemediationVerificationResolutionRecoveryRepository for SqliteStore {
+    type Error = StoreError;
+
+    fn list_pending_remediation_verification_resolutions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemediationVerificationResolutionCandidate>, Self::Error> {
+        self.list_pending_remediation_verification_resolution_records(limit)
     }
 }
 
@@ -11514,6 +12059,63 @@ fn postgres_list_pending_remediation_verification_recovery(
 }
 
 #[cfg(feature = "postgres")]
+fn postgres_list_pending_remediation_verification_resolutions(
+    store: &PostgresStore,
+    limit: usize,
+) -> Result<Vec<RemediationVerificationResolutionCandidate>, StoreError> {
+    let limit = limit.clamp(1, 100) as i64;
+    let rows = store
+        .checkout_client()?
+        .query(
+            "SELECT DISTINCT verification_assignment.job_id, verification_assignment.id
+             FROM remediation_requests AS remediation
+             JOIN remediation_verification_jobs AS verification_job
+               ON verification_job.remediation_id = remediation.id
+             JOIN task_assignments AS verification_assignment
+               ON verification_assignment.job_id = verification_job.job_id
+              AND verification_assignment.agent_id = remediation.agent_id
+             JOIN task_assignments AS execution_assignment
+               ON execution_assignment.job_id = remediation.job_id
+              AND execution_assignment.agent_id = remediation.agent_id
+             JOIN drift_reports AS evidence
+               ON evidence.job_id = verification_assignment.job_id
+              AND evidence.task_id = verification_assignment.id
+             JOIN drift_reports AS origin
+               ON origin.id = remediation.origin_drift_report_id
+              AND origin.agent_id = remediation.agent_id
+             WHERE remediation.status = 'succeeded_pending_verify'
+               AND remediation.job_id IS NOT NULL
+               AND remediation.policy_version IS NOT NULL
+               AND verification_assignment.status = 'succeeded'
+               AND verification_assignment.completed_at IS NOT NULL
+               AND execution_assignment.status = 'succeeded'
+               AND execution_assignment.completed_at IS NOT NULL
+               AND evidence.agent_id = remediation.agent_id
+               AND evidence.policy_id = remediation.policy_id
+               AND evidence.policy_name = remediation.policy_name
+               AND evidence.policy_version = remediation.policy_version
+               AND evidence.purpose = 'remediation_verification'
+               AND evidence.status = 'compliant'
+               AND evidence.checked_at > execution_assignment.completed_at
+               AND origin.resolved_at IS NULL
+             ORDER BY verification_assignment.job_id, verification_assignment.id
+             LIMIT $1",
+            &[&limit],
+        )
+        .map_err(|_| {
+            postgres_error("postgres remediation verification resolution recovery list failed")
+        })?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(RemediationVerificationResolutionCandidate {
+                verification_job_id: row.get(0),
+                verification_task_id: row.get(1),
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "postgres")]
 fn postgres_update_remediation_request_status(
     store: &PostgresStore,
     request_id: &str,
@@ -13031,6 +13633,44 @@ CREATE TABLE IF NOT EXISTS controller_identity (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS controller_delivery_identity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    namespace TEXT NOT NULL,
+    store_epoch TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS controller_report_inbox (
+    controller_namespace TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    report_id TEXT NOT NULL,
+    class TEXT NOT NULL CHECK (class IN ('lifecycle', 'drift_evidence', 'output', 'final_result')),
+    digest_hex TEXT NOT NULL,
+    body BLOB,
+    accounted_bytes INTEGER NOT NULL CHECK (accounted_bytes > 0),
+    status TEXT NOT NULL CHECK (status IN ('pending_effects', 'committed')),
+    PRIMARY KEY (controller_namespace, agent_id, job_id, task_id, report_id)
+);
+CREATE INDEX IF NOT EXISTS controller_report_inbox_pending_agent_idx
+    ON controller_report_inbox (agent_id, status);
+
+CREATE TABLE IF NOT EXISTS controller_report_receipts (
+    controller_namespace TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    report_id TEXT NOT NULL,
+    digest_hex TEXT NOT NULL,
+    store_epoch TEXT NOT NULL,
+    signer_fingerprint TEXT NOT NULL,
+    receipt_bytes BLOB NOT NULL,
+    PRIMARY KEY (controller_namespace, agent_id, job_id, task_id, report_id),
+    FOREIGN KEY (controller_namespace, agent_id, job_id, task_id, report_id)
+        REFERENCES controller_report_inbox (controller_namespace, agent_id, job_id, task_id, report_id)
+        ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS controller_signing_key_rotation (
     controller_id TEXT PRIMARY KEY,
     state TEXT NOT NULL,
@@ -13403,7 +14043,4591 @@ CREATE TABLE IF NOT EXISTS agent_log_chunks (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_application::{CatalogQueryRepository, CatalogRepository};
+    use fleet_application::delivery::{
+        CommitControllerInboxEvidence, CommitControllerInboxFinal, CommitControllerInboxOutput,
+        CommitControllerInboxTaskAck, CommitControllerInboxTaskRejected,
+        CommitControllerInboxTaskStarted, ControllerInboxEvidenceEffect,
+        ControllerInboxFinalEffect, ControllerInboxOutputEffect, ControllerInboxReport,
+        ControllerInboxTaskAckEffect, ControllerInboxTaskRejectedEffect,
+        ControllerInboxTaskStartedEffect, ControllerPreparedArtifact,
+        ControllerPreparedRemediation, InboxEffectOutcome, InboxStageOutcome,
+        LoadCommittedFinalReportsMissingReceipt, LoadPendingFinalReports,
+        PersistControllerStoredReceipt, StageControllerInboxReport, StoredReceiptOutcome,
+        StoredReportReceipt,
+    };
+    use fleet_application::{
+        CatalogQueryRepository, CatalogRepository, ControllerDeliveryIdentityRepository,
+        RotateControllerStoreEpoch,
+    };
+    use fleet_domain::delivery::{ReportClass, ReportKey};
+
+    fn inbox_fixture(store: &SqliteStore) -> String {
+        store.connection.execute_batch(
+            "INSERT INTO agents (id, name, public_key, fingerprint, status)
+             VALUES ('agent-1', 'inbox-agent', 'public', 'inbox-fingerprint', 'offline');
+             INSERT INTO jobs (id, status, risk, approval_requirement, timeout_ms)
+             VALUES ('job-1', 'queued', 'low', 'none', 1000);
+             INSERT INTO task_assignments (id, job_id, agent_id, nonce, payload_hash, signature, expires_at)
+             VALUES ('task-1', 'job-1', 'agent-1', 'nonce-inbox', 'hash', 'signature', 9999999999);"
+        ).unwrap();
+        store.controller_delivery_identity().unwrap().namespace
+    }
+
+    fn assignment_recovery_fixture(
+        store: &SqliteStore,
+        status: &str,
+        dispatched_at: Option<i64>,
+        timeout_ms: i64,
+    ) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents (id, name, public_key, fingerprint, status)
+                 VALUES ('recovery-agent', 'recovery-agent', 'public', 'recovery-fingerprint', 'offline')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO jobs (id, status, risk, approval_requirement, timeout_ms)
+                 VALUES ('recovery-job', 'running', 'low', 'none', ?1)",
+                params![timeout_ms],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO task_assignments
+                 (id, job_id, agent_id, status, nonce, payload_hash, signature, expires_at, dispatched_at)
+                 VALUES ('recovery-task', 'recovery-job', 'recovery-agent', ?1, 'recovery-nonce', 'hash', 'signature', 9999999999, ?2)",
+                params![status, dispatched_at],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn sqlite_assignment_recovery_scan_is_due_time_ordered_and_bounded() {
+        use fleet_application::assignment_recovery::AssignmentRecoveryRepository;
+
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO agents (id, name, public_key, fingerprint, status)
+                 VALUES ('recovery-agent', 'recovery-agent', 'public', 'recovery-fingerprint', 'offline');
+                 INSERT INTO jobs (id, status, risk, approval_requirement, timeout_ms) VALUES
+                   ('job-short', 'running', 'low', 'none', 1000),
+                   ('job-short-tie', 'running', 'low', 'none', 1000),
+                   ('job-fast', 'running', 'low', 'none', 2000),
+                   ('job-long', 'running', 'low', 'none', 10000);
+                 INSERT INTO task_assignments (id, job_id, agent_id, status, nonce, payload_hash, signature, expires_at, dispatched_at) VALUES
+                   ('task-short', 'job-short', 'recovery-agent', 'accepted', 'nonce-short', 'hash', 'signature', 9999999999, 100),
+                   ('task-short-tie', 'job-short-tie', 'recovery-agent', 'started', 'nonce-short-tie', 'hash', 'signature', 9999999999, 100),
+                   ('task-fast', 'job-fast', 'recovery-agent', 'started', 'nonce-fast', 'hash', 'signature', 9999999999, 100),
+                   ('task-long', 'job-long', 'recovery-agent', 'dispatched', 'nonce-long', 'hash', 'signature', 9999999999, 100),
+                   ('task-not-due', 'job-short', 'recovery-agent', 'started', 'nonce-not-due', 'hash', 'signature', 9999999999, 115),
+                   ('task-queued', 'job-short', 'recovery-agent', 'queued', 'nonce-queued', 'hash', 'signature', 9999999999, NULL),
+                   ('task-terminal', 'job-short', 'recovery-agent', 'failed', 'nonce-terminal', 'hash', 'signature', 9999999999, 100);",
+            )
+            .unwrap();
+
+        let candidates = AssignmentRecoveryRepository::list_overdue_assignment_recovery_candidates(
+            &store,
+            UNIX_EPOCH + Duration::from_secs(120),
+            Duration::from_secs(5),
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(candidates[0].task_id.as_str(), "task-short");
+        assert_eq!(candidates[1].task_id.as_str(), "task-short-tie");
+        assert_eq!(candidates[2].task_id.as_str(), "task-fast");
+        assert_eq!(candidates[3].task_id.as_str(), "task-long");
+        assert_eq!(candidates[0].execution_timeout, Duration::from_secs(1));
+        let capped = AssignmentRecoveryRepository::list_overdue_assignment_recovery_candidates(
+            &store,
+            UNIX_EPOCH + Duration::from_secs(120),
+            Duration::from_secs(5),
+            2,
+        )
+        .unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].task_id.as_str(), "task-short");
+        assert_eq!(capped[1].task_id.as_str(), "task-short-tie");
+        assert!(
+            AssignmentRecoveryRepository::list_overdue_assignment_recovery_candidates(
+                &store,
+                UNIX_EPOCH + Duration::from_secs(120),
+                Duration::from_secs(5),
+                101,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sqlite_assignment_recovery_commits_failed_aggregate_and_reason_audit_atomically() {
+        use fleet_application::assignment_recovery::{
+            AssignmentRecoveryRepository, DEFAULT_ASSIGNMENT_RECOVERY_GRACE,
+            RecoverUncertainAssignments, RecoverUncertainAssignmentsInput,
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "fleet-assignment-recovery-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = SqliteStore::open(&path).unwrap();
+        assignment_recovery_fixture(&store, "started", Some(100), 1_000);
+        let now = UNIX_EPOCH + Duration::from_secs(401);
+
+        let output = RecoverUncertainAssignments::execute(
+            &mut store,
+            RecoverUncertainAssignmentsInput {
+                now,
+                grace: DEFAULT_ASSIGNMENT_RECOVERY_GRACE,
+                limit: 10,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output.scanned_count, 1);
+        assert_eq!(output.recovered_count, 1);
+        assert_eq!(output.skipped_count, 0);
+        drop(store);
+
+        let mut reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .find_task_assignment_status("recovery-task")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        let last_error: String = reopened
+            .connection
+            .query_row(
+                "SELECT last_error FROM task_assignments WHERE id = 'recovery-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_error, "execution_outcome_unknown");
+        assert_eq!(
+            reopened
+                .find_job_status_value("recovery-job")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        let audit_events = reopened.list_audit_events(10).unwrap();
+        assert_eq!(audit_events.len(), 1);
+        assert_eq!(
+            audit_events[0].action,
+            "assignment_execution_outcome_unknown"
+        );
+        assert_eq!(
+            audit_events[0].value,
+            AuditValue::Plain("execution_outcome_unknown".into())
+        );
+        assert!(
+            AssignmentRecoveryRepository::list_overdue_assignment_recovery_candidates(
+                &reopened,
+                now,
+                DEFAULT_ASSIGNMENT_RECOVERY_GRACE,
+                10,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let repeated = RecoverUncertainAssignments::execute(
+            &mut reopened,
+            RecoverUncertainAssignmentsInput {
+                now,
+                grace: DEFAULT_ASSIGNMENT_RECOVERY_GRACE,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(repeated.recovered_count, 0);
+        assert_eq!(reopened.list_audit_events(10).unwrap().len(), 1);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sqlite_assignment_recovery_preserves_terminal_race_without_audit() {
+        use fleet_application::assignment_recovery::{
+            AssignmentRecoveryCommitOutcome, AssignmentRecoveryRepository,
+        };
+        use fleet_domain::delivery::InterruptedExecution;
+
+        let mut store = SqliteStore::in_memory().unwrap();
+        assignment_recovery_fixture(&store, "started", Some(100), 1_000);
+        let candidate = AssignmentRecoveryRepository::list_overdue_assignment_recovery_candidates(
+            &store,
+            UNIX_EPOCH + Duration::from_secs(401),
+            Duration::from_secs(300),
+            10,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        store
+            .update_task_assignment_status(
+                "recovery-task",
+                AssignmentStatus::Canceled,
+                UNIX_EPOCH + Duration::from_secs(400),
+                Some("operator canceled"),
+            )
+            .unwrap();
+
+        let outcome = AssignmentRecoveryRepository::commit_unknown_execution_outcome(
+            &mut store,
+            &candidate,
+            InterruptedExecution::OutcomeUnknown,
+            UNIX_EPOCH + Duration::from_secs(401),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, AssignmentRecoveryCommitOutcome::NoLongerEligible);
+        assert_eq!(
+            store
+                .find_task_assignment_status("recovery-task")
+                .unwrap()
+                .as_deref(),
+            Some("canceled")
+        );
+        assert_eq!(
+            store.audit_count_by_category(AuditCategory::Job).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn sqlite_assignment_recovery_rolls_back_status_and_aggregate_if_audit_fails() {
+        use fleet_application::assignment_recovery::{
+            DEFAULT_ASSIGNMENT_RECOVERY_GRACE, RecoverUncertainAssignments,
+            RecoverUncertainAssignmentsInput,
+        };
+
+        let mut store = SqliteStore::in_memory().unwrap();
+        assignment_recovery_fixture(&store, "started", Some(100), 1_000);
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_assignment_recovery_audit
+                 BEFORE INSERT ON audit_events
+                 WHEN NEW.action = 'assignment_execution_outcome_unknown'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected assignment recovery audit failure');
+                 END;",
+            )
+            .unwrap();
+
+        let result = RecoverUncertainAssignments::execute(
+            &mut store,
+            RecoverUncertainAssignmentsInput {
+                now: UNIX_EPOCH + Duration::from_secs(401),
+                grace: DEFAULT_ASSIGNMENT_RECOVERY_GRACE,
+                limit: 10,
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("recovery-task")
+                .unwrap()
+                .as_deref(),
+            Some("started")
+        );
+        assert_eq!(
+            store
+                .find_job_status_value("recovery-job")
+                .unwrap()
+                .as_deref(),
+            Some("running")
+        );
+        assert_eq!(
+            store.audit_count_by_category(AuditCategory::Job).unwrap(),
+            0
+        );
+    }
+
+    fn verification_evidence_effect(
+        key: ReportKey,
+        bytes: Vec<u8>,
+    ) -> ControllerInboxEvidenceEffect {
+        ControllerInboxEvidenceEffect::new(
+            key,
+            bytes,
+            DriftReport {
+                policy_name: "policy-1".into(),
+                status: DriftStatus::Compliant,
+                severity: DriftSeverity::None,
+                acknowledgement: DriftAcknowledgement::Open,
+                expected: "healthy".into(),
+                actual: "healthy".into(),
+            },
+            DriftReportProvenance::verified(
+                JobId::new("job-1").unwrap(),
+                TaskId::new("task-1").unwrap(),
+                "policy-1",
+                1,
+                DriftCheckPurpose::RemediationVerification,
+            ),
+            UNIX_EPOCH + Duration::from_secs(10),
+        )
+    }
+
+    #[test]
+    fn sqlite_inbox_stages_once_and_conflicts_on_changed_body_or_class() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "report-1").unwrap();
+        let report = ControllerInboxReport::new(key.clone(), ReportClass::Output, b"one".to_vec());
+        let stage = |store: &mut SqliteStore, report: &ControllerInboxReport| {
+            StageControllerInboxReport::execute(store, "agent-1", &namespace, 1024, report).unwrap()
+        };
+        assert_eq!(
+            stage(&mut store, &report),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        assert_eq!(
+            stage(&mut store, &report),
+            InboxStageOutcome::DuplicatePendingEffects
+        );
+        let changed_body =
+            ControllerInboxReport::new(key.clone(), ReportClass::Output, b"two".to_vec());
+        assert_eq!(
+            stage(&mut store, &changed_body),
+            InboxStageOutcome::ConflictingBody
+        );
+        let changed_class =
+            ControllerInboxReport::new(key, ReportClass::FinalResult, b"one".to_vec());
+        assert_eq!(
+            stage(&mut store, &changed_class),
+            InboxStageOutcome::ConflictingBody
+        );
+    }
+
+    #[test]
+    fn sqlite_pending_final_reports_recover_exact_bytes_after_reopen_with_bounded_scan() {
+        let root = artifact_test_root("pending-final-recovery");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("controller.db");
+        let mut store = SqliteStore::open(&path).unwrap();
+        let namespace = inbox_fixture(&store);
+        let final_one = ControllerInboxReport::new(
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-1").unwrap(),
+            ReportClass::FinalResult,
+            b"encoded-final-one".to_vec(),
+        );
+        let final_two = ControllerInboxReport::new(
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-2").unwrap(),
+            ReportClass::FinalResult,
+            b"encoded-final-two".to_vec(),
+        );
+        let output = ControllerInboxReport::new(
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "output-1").unwrap(),
+            ReportClass::Output,
+            b"encoded-output".to_vec(),
+        );
+        for report in [&final_one, &output, &final_two] {
+            assert_eq!(
+                StageControllerInboxReport::execute(
+                    &mut store, "agent-1", &namespace, 1024, report
+                )
+                .unwrap(),
+                InboxStageOutcome::StagedPendingEffects
+            );
+        }
+        drop(store);
+
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(LoadPendingFinalReports::execute(&store, 0).is_err());
+        assert!(LoadPendingFinalReports::execute(&store, 101).is_err());
+        let first = LoadPendingFinalReports::execute(&store, 1).unwrap();
+        assert_eq!(first, vec![final_one.clone()]);
+        assert_eq!(
+            LoadPendingFinalReports::execute(&store, 2).unwrap(),
+            vec![final_one, final_two]
+        );
+        let pending: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM controller_report_inbox WHERE status = 'pending_effects'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 3);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_pending_final_report_recovery_rejects_digest_corruption_without_body_leak() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        let report = ControllerInboxReport::new(
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-corrupt").unwrap(),
+            ReportClass::FinalResult,
+            b"sensitive encoded result".to_vec(),
+        );
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE controller_report_inbox SET body = x'01' WHERE report_id = 'final-corrupt'",
+                [],
+            )
+            .unwrap();
+        let error = LoadPendingFinalReports::execute(&store, 1).unwrap_err();
+        assert!(!format!("{error:?}").contains("sensitive"));
+    }
+
+    #[test]
+    fn sqlite_pending_final_report_recovery_bounds_total_body_bytes() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        for index in 0..3 {
+            let report = ControllerInboxReport::new(
+                ReportKey::new(
+                    &namespace,
+                    "agent-1",
+                    "job-1",
+                    "task-1",
+                    &format!("final-{index}"),
+                )
+                .unwrap(),
+                ReportClass::FinalResult,
+                vec![b'x'; 3 * 1024 * 1024],
+            );
+            assert_eq!(
+                StageControllerInboxReport::execute(
+                    &mut store,
+                    "agent-1",
+                    &namespace,
+                    4 * 1024 * 1024,
+                    &report,
+                )
+                .unwrap(),
+                InboxStageOutcome::StagedPendingEffects
+            );
+        }
+        let recovered = LoadPendingFinalReports::execute(&store, 100).unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|report| report.body().len())
+                .sum::<usize>(),
+            6 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn sqlite_committed_final_receipt_recovery_is_bounded_and_retries_after_insert_failure() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET drift_policy_document = 'policy: fixture' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let delivery = store.controller_delivery_identity().unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "committed-final-no-receipt",
+        )
+        .unwrap();
+        let body = b"committed report without receipt".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key.clone(),
+            body,
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(10),
+            None,
+            0,
+        );
+        let InboxEffectOutcome::Committed(digest) =
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap()
+        else {
+            panic!("expected committed final effect");
+        };
+        let receipt = StoredReportReceipt::new(
+            key.clone(),
+            digest,
+            delivery.store_epoch,
+            "a".repeat(64),
+            b"signed receipt fixture".to_vec(),
+        )
+        .unwrap();
+
+        assert!(LoadCommittedFinalReportsMissingReceipt::execute(&store, 0).is_err());
+        assert!(LoadCommittedFinalReportsMissingReceipt::execute(&store, 101).is_err());
+        let candidate = LoadCommittedFinalReportsMissingReceipt::execute(&store, 1).unwrap();
+        assert_eq!(candidate.len(), 1);
+        assert_eq!(candidate[0].key, key);
+        assert_eq!(candidate[0].digest, digest);
+
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER deny_final_receipt BEFORE INSERT ON controller_report_receipts
+                 BEGIN SELECT RAISE(FAIL, 'injected final receipt failure'); END;",
+            )
+            .unwrap();
+        assert!(PersistControllerStoredReceipt::execute(&mut store, &receipt).is_err());
+        assert_eq!(
+            LoadCommittedFinalReportsMissingReceipt::execute(&store, 1)
+                .unwrap()
+                .len(),
+            1,
+            "receipt insert failure leaves only the committed identity/digest recoverable"
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER deny_final_receipt")
+            .unwrap();
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(&mut store, &receipt).unwrap(),
+            StoredReceiptOutcome::Stored(b"signed receipt fixture".to_vec())
+        );
+        assert!(
+            LoadCommittedFinalReportsMissingReceipt::execute(&store, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("succeeded"),
+            "receipt recovery never reapplies the final effect"
+        );
+    }
+
+    #[test]
+    fn sqlite_committed_final_receipt_recovery_rejects_corrupt_digest_and_owner() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET drift_policy_document = 'policy: fixture' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "committed-final-corrupt-digest",
+        )
+        .unwrap();
+        let body = b"committed report".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            body,
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(10),
+            None,
+            0,
+        );
+        CommitControllerInboxFinal::execute(&mut store, &effect).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE controller_report_inbox SET digest_hex = 'broken'
+                 WHERE report_id = 'committed-final-corrupt-digest'",
+                [],
+            )
+            .unwrap();
+        assert!(LoadCommittedFinalReportsMissingReceipt::execute(&store, 1).is_err());
+
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO agents (id, name, public_key, fingerprint, status)
+                 VALUES ('agent-2', 'inbox-agent-2', 'public-2', 'inbox-fingerprint-2', 'offline');
+                 UPDATE controller_report_inbox SET digest_hex = lower(hex(randomblob(32)))
+                 WHERE report_id = 'committed-final-corrupt-digest';
+                 UPDATE task_assignments SET agent_id = 'agent-2' WHERE id = 'task-1';",
+            )
+            .unwrap();
+        assert!(LoadCommittedFinalReportsMissingReceipt::execute(&store, 1).is_err());
+    }
+
+    #[test]
+    fn sqlite_drift_verification_final_commits_without_claiming_evidence() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET drift_policy_document = 'policy: fixture' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "verification-final",
+        )
+        .unwrap();
+        let report = ControllerInboxReport::new(
+            key.clone(),
+            ReportClass::FinalResult,
+            b"verification-result".to_vec(),
+        );
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            b"verification-result".to_vec(),
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(10),
+            None,
+            0,
+        );
+        let outcome = CommitControllerInboxFinal::execute(&mut store, &effect).unwrap();
+        assert!(matches!(outcome, InboxEffectOutcome::Committed(_)));
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM task_assignments WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "succeeded");
+        let inbox_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM controller_report_inbox WHERE report_id = 'verification-final'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inbox_status, "committed");
+        let evidence_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM drift_reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(evidence_count, 0);
+    }
+
+    #[test]
+    fn sqlite_drift_verification_final_marker_failure_rolls_back_and_late_terminal_is_rejected() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET drift_policy_document = 'policy: fixture' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "verification-final-retry",
+        )
+        .unwrap();
+        let body = b"verification-result".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            body,
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(10),
+            None,
+            0,
+        );
+        store.connection.execute_batch("CREATE TRIGGER fail_verification_marker BEFORE UPDATE ON controller_report_inbox BEGIN SELECT RAISE(FAIL, 'injected failure'); END;").unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect).is_err());
+        let assignment_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM task_assignments WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(assignment_status, "queued");
+        let inbox_status: String = store.connection.query_row("SELECT status FROM controller_report_inbox WHERE report_id = 'verification-final-retry'", [], |row| row.get(0)).unwrap();
+        assert_eq!(inbox_status, "pending_effects");
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_verification_marker")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'canceled' WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect).is_err());
+        let assignment_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM task_assignments WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(assignment_status, "canceled");
+        let inbox_status: String = store.connection.query_row("SELECT status FROM controller_report_inbox WHERE report_id = 'verification-final-retry'", [], |row| row.get(0)).unwrap();
+        assert_eq!(inbox_status, "pending_effects");
+    }
+
+    #[test]
+    fn sqlite_late_final_after_g2_is_dispositioned_once_without_overwriting_terminal_state() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute_batch(
+                "UPDATE task_assignments
+                 SET status = 'failed', last_error = 'execution_outcome_unknown',
+                     completed_at = 100
+                 WHERE id = 'task-1';
+                 UPDATE jobs SET status = 'failed', command_program = 'echo' WHERE id = 'job-1';",
+            )
+            .unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "late-final-after-g2",
+        )
+        .unwrap();
+        let body = b"late-success-final-body".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+                .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        let effect = ControllerInboxFinalEffect::new(
+            key.clone(),
+            body,
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(101),
+            None,
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            0, 0, false,
+        ));
+
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_late_result_audit BEFORE INSERT ON audit_events
+             WHEN NEW.action = 'assignment_late_final_result_received'
+             BEGIN SELECT RAISE(FAIL, 'injected late audit failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect).is_err());
+        let pending_status: String = store.connection.query_row(
+            "SELECT status FROM controller_report_inbox WHERE report_id = 'late-final-after-g2'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(pending_status, "pending_effects");
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_late_result_audit")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_late_result_marker BEFORE UPDATE ON controller_report_inbox
+                 WHEN OLD.report_id = 'late-final-after-g2'
+                 BEGIN SELECT RAISE(FAIL, 'injected late marker failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect).is_err());
+        assert!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .all(|event| event.action != "assignment_late_final_result_received")
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_late_result_marker")
+            .unwrap();
+
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::LateDispositionCommitted(_)
+        ));
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+
+        let assignment: (String, Option<String>, Option<i64>) = store
+            .connection
+            .query_row(
+                "SELECT status, last_error, completed_at FROM task_assignments WHERE id = 'task-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            assignment,
+            (
+                "failed".into(),
+                Some("execution_outcome_unknown".into()),
+                Some(100)
+            )
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("failed")
+        );
+        let (inbox_status, inbox_body): (String, Option<Vec<u8>>) = store
+            .connection
+            .query_row(
+                "SELECT status, body FROM controller_report_inbox WHERE report_id = 'late-final-after-g2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(inbox_status, "committed");
+        assert!(inbox_body.is_none());
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap();
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|event| event.action == "assignment_late_final_result_received")
+                .count(),
+            1
+        );
+
+        let changed = ControllerInboxReport::new(
+            key,
+            ReportClass::FinalResult,
+            b"changed-late-final-body".to_vec(),
+        );
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &changed)
+                .unwrap(),
+            InboxStageOutcome::ConflictingBody
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "assignment_late_final_result_received")
+                .count(),
+            1
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET last_error = 'ordinary_command_failure'
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        let other_terminal_key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "late-final-after-ordinary-failure",
+        )
+        .unwrap();
+        let other_terminal_body = b"late result after ordinary failure".to_vec();
+        let other_terminal_report = ControllerInboxReport::new(
+            other_terminal_key.clone(),
+            ReportClass::FinalResult,
+            other_terminal_body.clone(),
+        );
+        assert_eq!(
+            StageControllerInboxReport::execute(
+                &mut store,
+                "agent-1",
+                &namespace,
+                1024,
+                &other_terminal_report,
+            )
+            .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        let other_terminal_effect = ControllerInboxFinalEffect::new(
+            other_terminal_key,
+            other_terminal_body,
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(102),
+            None,
+            0,
+        );
+        assert!(CommitControllerInboxFinal::execute(&mut store, &other_terminal_effect).is_err());
+        let late_audit_count = store
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap()
+            .iter()
+            .filter(|event| event.action == "assignment_late_final_result_received")
+            .count();
+        assert_eq!(late_audit_count, 1);
+    }
+
+    #[test]
+    fn sqlite_late_drift_final_after_g2_is_dispositioned_without_terminal_downgrade() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute_batch(
+                "UPDATE task_assignments
+                 SET status = 'failed', last_error = 'execution_outcome_unknown',
+                     completed_at = 100
+                 WHERE id = 'task-1';
+                 UPDATE jobs SET status = 'failed',
+                     drift_policy_document = 'policy: fixture',
+                     drift_policy_id = 'policy-1', drift_policy_version = 1,
+                     drift_purpose = 'evaluation'
+                 WHERE id = 'job-1';",
+            )
+            .unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "late-drift-final-after-g2",
+        )
+        .unwrap();
+        let body = b"late drift final-result body".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+                .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            body,
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(101),
+            None,
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            0, 0, false,
+        ));
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::LateDispositionCommitted(_)
+        ));
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        let assignment: (String, Option<String>, Option<i64>) = store
+            .connection
+            .query_row(
+                "SELECT status, last_error, completed_at FROM task_assignments WHERE id = 'task-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            assignment,
+            (
+                "failed".into(),
+                Some("execution_outcome_unknown".into()),
+                Some(100)
+            )
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "assignment_late_final_result_received")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn sqlite_drift_verification_final_preserves_evidence_that_arrived_first() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET drift_policy_document = 'policy: fixture' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        store.connection.execute("INSERT INTO drift_reports (agent_id, policy_name, status, expected, actual, checked_at, job_id, task_id, purpose) VALUES ('agent-1', 'fixture', 'compliant', 'expected', 'actual', 5, 'job-1', 'task-1', 'remediation_verification')", []).unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "verification-with-evidence",
+        )
+        .unwrap();
+        let body = b"verification-result".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            body,
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(10),
+            None,
+            0,
+        );
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        let (evidence_status, resolved_at): (String, Option<i64>) = store.connection.query_row("SELECT status, resolved_at FROM drift_reports WHERE job_id = 'job-1' AND task_id = 'task-1'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(evidence_status, "compliant");
+        assert_eq!(resolved_at, None);
+    }
+
+    #[test]
+    fn sqlite_verification_evidence_and_inbox_marker_commit_once_together() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store.connection.execute("UPDATE jobs SET drift_policy_document = 'policy: fixture', drift_policy_id = 'policy-1', drift_policy_version = 1, drift_purpose = 'remediation_verification' WHERE id = 'job-1'", []).unwrap();
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "evidence-1").unwrap();
+        let bytes = b"encoded-verification-evidence".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::DriftEvidence, bytes.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = verification_evidence_effect(key, bytes);
+        assert!(matches!(
+            CommitControllerInboxEvidence::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            CommitControllerInboxEvidence::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM drift_reports WHERE job_id = 'job-1' AND task_id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM controller_report_inbox WHERE report_id = 'evidence-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "committed");
+    }
+
+    #[test]
+    fn sqlite_verification_evidence_marker_failure_rolls_back_and_retries() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store.connection.execute("UPDATE jobs SET drift_policy_document = 'policy: fixture', drift_policy_id = 'policy-1', drift_policy_version = 1, drift_purpose = 'remediation_verification' WHERE id = 'job-1'", []).unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "evidence-rollback",
+        )
+        .unwrap();
+        let bytes = b"encoded-evidence-rollback".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::DriftEvidence, bytes.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = verification_evidence_effect(key, bytes);
+        store.connection.execute_batch("CREATE TRIGGER deny_evidence_marker BEFORE UPDATE ON controller_report_inbox BEGIN SELECT RAISE(FAIL, 'injected failure'); END;").unwrap();
+        assert!(CommitControllerInboxEvidence::execute(&mut store, &effect).is_err());
+        let evidence_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM drift_reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(evidence_count, 0);
+        let audit_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE action = 'drift_report_received'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 0);
+        let inbox_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM controller_report_inbox WHERE report_id = 'evidence-rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inbox_status, "pending_effects");
+        store
+            .connection
+            .execute_batch("DROP TRIGGER deny_evidence_marker")
+            .unwrap();
+        assert!(matches!(
+            CommitControllerInboxEvidence::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+    }
+
+    #[test]
+    fn sqlite_drift_proposal_audits_and_inbox_marker_rollback_together() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store.connection.execute(
+            "UPDATE jobs SET drift_policy_document = 'policy: fixture', drift_policy_id = 'policy-1', drift_policy_version = 1, drift_purpose = 'evaluation' WHERE id = 'job-1'",
+            [],
+        ).unwrap();
+        let key =
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "drift-evidence").unwrap();
+        let checked_at = UNIX_EPOCH + Duration::from_secs(10);
+        let report = DriftReport::drifted("policy-1", "healthy", "unhealthy");
+        let provenance = DriftReportProvenance::verified(
+            JobId::new("job-1").unwrap(),
+            TaskId::new("task-1").unwrap(),
+            "policy-1",
+            1,
+            DriftCheckPurpose::Evaluation,
+        );
+        let encoded = br#"{"status":"drifted","expected":"healthy","actual":"unhealthy"}"#.to_vec();
+        let inbox_report =
+            ControllerInboxReport::new(key.clone(), ReportClass::DriftEvidence, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &inbox_report)
+            .unwrap();
+        let mut remediation = remediation_request_record("rem-1", "agent-1", "policy-1");
+        remediation.policy_version = Some(1);
+        let proposal = AppPersistVerifiedDriftProposalInput {
+            agent_id: "agent-1".to_owned(),
+            report: report.clone(),
+            provenance: provenance.clone(),
+            remediation,
+            drift_audit: AuditEvent {
+                category: AuditCategory::Drift,
+                action: "drift_report_received".to_owned(),
+                actor: AuditActor::new("agent"),
+                target: AuditTarget::new("agent-1"),
+                value: AuditValue::Redacted,
+                occurred_at: checked_at,
+            },
+            proposal_audit: AuditEvent {
+                category: AuditCategory::Policy,
+                action: "remediation_requested".to_owned(),
+                actor: AuditActor::new("controller"),
+                target: AuditTarget::new("agent-1"),
+                value: AuditValue::Redacted,
+                occurred_at: checked_at,
+            },
+            checked_at,
+        };
+        let effect =
+            ControllerInboxEvidenceEffect::new(key, encoded, report, provenance, checked_at)
+                .with_remediation_proposal(proposal);
+        store.connection.execute_batch(
+            "CREATE TRIGGER deny_drift_evidence_marker BEFORE UPDATE ON controller_report_inbox BEGIN SELECT RAISE(FAIL, 'injected failure'); END;",
+        ).unwrap();
+
+        assert!(CommitControllerInboxEvidence::execute(&mut store, &effect).is_err());
+        assert_eq!(row_count(&store, "drift_reports"), 0);
+        assert_eq!(row_count(&store, "remediation_requests"), 0);
+        assert_eq!(row_count(&store, "audit_events"), 0);
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM controller_report_inbox WHERE report_id = 'drift-evidence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending_effects");
+
+        store
+            .connection
+            .execute_batch("DROP TRIGGER deny_drift_evidence_marker")
+            .unwrap();
+        assert!(matches!(
+            CommitControllerInboxEvidence::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert_eq!(row_count(&store, "drift_reports"), 1);
+        assert_eq!(row_count(&store, "remediation_requests"), 1);
+        assert_eq!(row_count(&store, "audit_events"), 2);
+    }
+
+    #[test]
+    fn sqlite_verification_evidence_rejects_wrong_bytes_owner_or_provenance() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store.connection.execute("UPDATE jobs SET drift_policy_document = 'policy: fixture', drift_policy_id = 'policy-1', drift_policy_version = 1, drift_purpose = 'evaluation' WHERE id = 'job-1'", []).unwrap();
+        let key =
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "evidence-guard").unwrap();
+        let bytes = b"encoded-evidence-guard".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::DriftEvidence, bytes.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = verification_evidence_effect(key.clone(), bytes);
+        assert!(CommitControllerInboxEvidence::execute(&mut store, &effect).is_err());
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET drift_purpose = 'remediation_verification' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let changed = verification_evidence_effect(key, b"different-body".to_vec());
+        assert_eq!(
+            CommitControllerInboxEvidence::execute(&mut store, &changed).unwrap(),
+            InboxEffectOutcome::ConflictingBody
+        );
+        let wrong_owner = verification_evidence_effect(
+            ReportKey::new(&namespace, "agent-2", "job-1", "task-1", "evidence-guard").unwrap(),
+            b"encoded-evidence-guard".to_vec(),
+        );
+        assert_eq!(
+            CommitControllerInboxEvidence::execute(&mut store, &wrong_owner).unwrap(),
+            InboxEffectOutcome::NotStaged
+        );
+        let evidence_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM drift_reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(evidence_count, 0);
+    }
+
+    #[test]
+    fn sqlite_verification_final_and_evidence_replay_in_either_order_after_reopen() {
+        for (suffix, evidence_first) in [("first", true), ("last", false)] {
+            let root = artifact_test_root(&format!("inbox-verification-evidence-{suffix}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("controller.db");
+            let mut store = SqliteStore::open(&path).unwrap();
+            let namespace = inbox_fixture(&store);
+            store.connection.execute("UPDATE jobs SET drift_policy_document = 'policy: fixture', drift_policy_id = 'policy-1', drift_policy_version = 1, drift_purpose = 'remediation_verification' WHERE id = 'job-1'", []).unwrap();
+            let final_key =
+                ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final").unwrap();
+            let evidence_key =
+                ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "evidence").unwrap();
+            let final_report = ControllerInboxReport::new(
+                final_key.clone(),
+                ReportClass::FinalResult,
+                b"encoded-final".to_vec(),
+            );
+            let evidence_report = ControllerInboxReport::new(
+                evidence_key.clone(),
+                ReportClass::DriftEvidence,
+                b"encoded-evidence".to_vec(),
+            );
+            for report in [&final_report, &evidence_report] {
+                StageControllerInboxReport::execute(
+                    &mut store, "agent-1", &namespace, 1024, report,
+                )
+                .unwrap();
+            }
+            let final_effect = ControllerInboxFinalEffect::new(
+                final_key,
+                b"encoded-final".to_vec(),
+                AssignmentStatus::Succeeded,
+                UNIX_EPOCH + Duration::from_secs(10),
+                None,
+                0,
+            );
+            let evidence_effect =
+                verification_evidence_effect(evidence_key, b"encoded-evidence".to_vec());
+            if evidence_first {
+                assert!(matches!(
+                    CommitControllerInboxEvidence::execute(&mut store, &evidence_effect).unwrap(),
+                    InboxEffectOutcome::Committed(_)
+                ));
+                assert!(matches!(
+                    CommitControllerInboxFinal::execute(&mut store, &final_effect).unwrap(),
+                    InboxEffectOutcome::Committed(_)
+                ));
+            } else {
+                assert!(matches!(
+                    CommitControllerInboxFinal::execute(&mut store, &final_effect).unwrap(),
+                    InboxEffectOutcome::Committed(_)
+                ));
+                assert!(matches!(
+                    CommitControllerInboxEvidence::execute(&mut store, &evidence_effect).unwrap(),
+                    InboxEffectOutcome::Committed(_)
+                ));
+            }
+            drop(store);
+            let mut reopened = SqliteStore::open(&path).unwrap();
+            assert!(matches!(
+                CommitControllerInboxFinal::execute(&mut reopened, &final_effect).unwrap(),
+                InboxEffectOutcome::AlreadyCommitted(_)
+            ));
+            assert!(matches!(
+                CommitControllerInboxEvidence::execute(&mut reopened, &evidence_effect).unwrap(),
+                InboxEffectOutcome::AlreadyCommitted(_)
+            ));
+            let evidence_count: i64 = reopened.connection.query_row("SELECT COUNT(*) FROM drift_reports WHERE job_id = 'job-1' AND task_id = 'task-1'", [], |row| row.get(0)).unwrap();
+            assert_eq!(evidence_count, 1);
+            drop(reopened);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn sqlite_drift_verification_failure_commits_failed_terminal_only() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET drift_policy_document = 'policy: fixture' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "verification-failed",
+        )
+        .unwrap();
+        let body = b"verification-failed-result".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            body,
+            AssignmentStatus::Failed,
+            UNIX_EPOCH + Duration::from_secs(10),
+            Some("verification failed".into()),
+            0,
+        );
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM task_assignments WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        let job_status: String = store
+            .connection
+            .query_row("SELECT status FROM jobs WHERE id = 'job-1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(job_status, "failed");
+        let evidence_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM drift_reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(evidence_count, 0);
+    }
+
+    #[test]
+    fn sqlite_inbox_simple_final_effect_and_marker_commit_together_after_audit_failure() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET command_program = 'echo' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-atomic").unwrap();
+        let encoded = b"encoded-final-atomic".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key.clone(),
+            encoded.clone(),
+            AssignmentStatus::Succeeded,
+            SystemTime::UNIX_EPOCH,
+            None,
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            0, 0, false,
+        ));
+        store.connection.execute_batch(
+            "CREATE TRIGGER fail_final_audit BEFORE INSERT ON audit_events
+             WHEN NEW.action = 'job_completed' BEGIN SELECT RAISE(FAIL, 'injected audit failure'); END;"
+        ).unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("queued")
+        );
+        let (status, body): (String, Vec<u8>) = store
+            .connection
+            .query_row(
+                "SELECT status, body FROM controller_report_inbox WHERE report_id = 'final-atomic'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "pending_effects");
+        assert_eq!(body, encoded);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_final_audit")
+            .unwrap();
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("succeeded")
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("success")
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        let (status, body): (String, Option<Vec<u8>>) = store
+            .connection
+            .query_row(
+                "SELECT status, body FROM controller_report_inbox WHERE report_id = 'final-atomic'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "committed");
+        assert!(body.is_none());
+
+        let changed = ControllerInboxFinalEffect::new(
+            key,
+            b"different".to_vec(),
+            AssignmentStatus::Succeeded,
+            SystemTime::UNIX_EPOCH,
+            None,
+            0,
+        );
+        assert_eq!(
+            CommitControllerInboxFinal::execute(&mut store, &changed).unwrap(),
+            InboxEffectOutcome::ConflictingBody
+        );
+    }
+
+    #[test]
+    fn sqlite_inbox_final_effect_refuses_external_effects_and_terminal_assignment() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-guard").unwrap();
+        let encoded = b"encoded-final-guard".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = |artifact_count| {
+            ControllerInboxFinalEffect::new(
+                key.clone(),
+                encoded.clone(),
+                AssignmentStatus::Succeeded,
+                SystemTime::UNIX_EPOCH,
+                None,
+                artifact_count,
+            )
+        };
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect(0)).is_err());
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET command_program = 'echo' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect(1)).is_err());
+        store
+            .update_task_assignment_status(
+                "task-1",
+                AssignmentStatus::Canceled,
+                SystemTime::UNIX_EPOCH,
+                None,
+            )
+            .unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect(0)).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("canceled")
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("queued")
+        );
+        let (status, body): (String, Vec<u8>) = store
+            .connection
+            .query_row(
+                "SELECT status, body FROM controller_report_inbox WHERE report_id = 'final-guard'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "pending_effects");
+        assert_eq!(body, encoded);
+        assert!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sqlite_canceled_final_is_acknowledged_without_overwriting_controller_cancellation() {
+        for kind in ["command", "runbook"] {
+            let mut store = SqliteStore::in_memory().unwrap();
+            let namespace = inbox_fixture(&store);
+            store.connection.execute_batch(
+            "UPDATE jobs SET command_program = 'python3', status = 'canceled' WHERE id = 'job-1';
+             UPDATE task_assignments SET status = 'canceled', dispatched_at = 1,
+                 completed_at = 100, last_error = 'operator cancellation'
+             WHERE id = 'task-1';"
+        ).unwrap();
+            if kind == "runbook" {
+                store.connection.execute(
+                "UPDATE jobs SET command_program = NULL, runbook_document = 'fixture no-artifact runbook' WHERE id = 'job-1'",
+                [],
+            ).unwrap();
+            }
+            for sequence in 0..2 {
+                store
+                    .append_job_output_chunk_record(&JobOutputChunk {
+                        job_id: "job-1".into(),
+                        agent_id: "agent-1".into(),
+                        stream: JobOutputStream::Stdout,
+                        sequence,
+                        body: "test start\n".into(),
+                    })
+                    .unwrap();
+            }
+            let original_output = store.list_job_output_chunks_for_job("job-1").unwrap();
+            let key =
+                ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-result").unwrap();
+            let body = b"fixture canceled final".to_vec();
+            let report =
+                ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+            assert_eq!(
+                StageControllerInboxReport::execute(
+                    &mut store, "agent-1", &namespace, 1024, &report
+                )
+                .unwrap(),
+                InboxStageOutcome::StagedPendingEffects
+            );
+            let effect = ControllerInboxFinalEffect::new(
+                key,
+                body,
+                AssignmentStatus::Canceled,
+                UNIX_EPOCH + Duration::from_secs(101),
+                Some("agent observed cancellation".into()),
+                0,
+            )
+            .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+                2, 0, true,
+            ));
+            for (trigger, sql) in [
+                (
+                    "fail_canceled_audit",
+                    "CREATE TRIGGER fail_canceled_audit BEFORE INSERT ON audit_events
+             WHEN NEW.action = 'assignment_canceled_final_result_received'
+             BEGIN SELECT RAISE(ABORT, 'injected canceled audit failure'); END;",
+                ),
+                (
+                    "fail_canceled_marker",
+                    "CREATE TRIGGER fail_canceled_marker BEFORE UPDATE ON controller_report_inbox
+             WHEN OLD.report_id = 'final-result'
+             BEGIN SELECT RAISE(ABORT, 'injected canceled marker failure'); END;",
+                ),
+            ] {
+                store.connection.execute_batch(sql).unwrap();
+                assert!(CommitControllerInboxFinal::execute(&mut store, &effect).is_err());
+                let pending: (String, Option<Vec<u8>>) = store.connection.query_row(
+                "SELECT status, body FROM controller_report_inbox WHERE report_id = 'final-result'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+                assert_eq!(
+                    pending,
+                    (
+                        "pending_effects".into(),
+                        Some(b"fixture canceled final".to_vec())
+                    )
+                );
+                assert!(
+                    store
+                        .list_audit_events_by_category(AuditCategory::Job, 20)
+                        .unwrap()
+                        .is_empty()
+                );
+                store
+                    .connection
+                    .execute_batch(&format!("DROP TRIGGER {trigger}"))
+                    .unwrap();
+            }
+            assert!(matches!(
+                CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+                InboxEffectOutcome::LateDispositionCommitted(_)
+            ));
+            let assignment: (String, String, i64) = store.connection.query_row(
+            "SELECT status, last_error, completed_at FROM task_assignments WHERE id = 'task-1'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+            assert_eq!(
+                assignment,
+                ("canceled".into(), "operator cancellation".into(), 100)
+            );
+            assert_eq!(
+                store.find_job_status_value("job-1").unwrap().as_deref(),
+                Some("canceled")
+            );
+            assert_eq!(
+                store.list_job_output_chunks_for_job("job-1").unwrap(),
+                original_output
+            );
+            assert!(matches!(
+                CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+                InboxEffectOutcome::AlreadyCommitted(_)
+            ));
+            let inbox: (String, Option<Vec<u8>>) = store.connection.query_row(
+            "SELECT status, body FROM controller_report_inbox WHERE report_id = 'final-result'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+            assert_eq!(inbox, ("committed".into(), None));
+            let events = store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.action == "assignment_canceled_final_result_received")
+                    .count(),
+                1
+            );
+            assert!(!events.iter().any(|e| e.action == "job_canceled"));
+        }
+    }
+
+    #[test]
+    fn sqlite_canceled_final_keeps_output_gaps_artifacts_and_drift_pending() {
+        for scenario in ["output-gap", "artifact", "drift"] {
+            let mut store = SqliteStore::in_memory().unwrap();
+            let namespace = inbox_fixture(&store);
+            store.connection.execute_batch(
+                "UPDATE jobs SET command_program = 'true', status = 'canceled' WHERE id = 'job-1';
+                 UPDATE task_assignments SET status = 'canceled', dispatched_at = 1,
+                     completed_at = 100, last_error = 'operator cancellation' WHERE id = 'task-1';"
+            ).unwrap();
+            if scenario == "drift" {
+                store.connection.execute_batch(
+                    "UPDATE jobs SET command_program = NULL, drift_policy_document = 'policy: fixture',
+                         drift_policy_id = 'policy-1', drift_policy_version = 1, drift_purpose = 'evaluation'
+                     WHERE id = 'job-1';"
+                ).unwrap();
+            }
+            let key =
+                ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-result").unwrap();
+            let body = b"unsupported canceled final fixture".to_vec();
+            StageControllerInboxReport::execute(
+                &mut store,
+                "agent-1",
+                &namespace,
+                1024,
+                &ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone()),
+            )
+            .unwrap();
+            let mut effect = ControllerInboxFinalEffect::new(
+                key,
+                body.clone(),
+                AssignmentStatus::Canceled,
+                UNIX_EPOCH + Duration::from_secs(101),
+                None,
+                usize::from(scenario == "artifact"),
+            )
+            .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+                u64::from(scenario == "output-gap"),
+                0,
+                false,
+            ));
+            if scenario == "artifact" {
+                let metadata = RenderedArtifactMetadata::new(
+                    ArtifactId::new("canceled-artifact").unwrap(),
+                    JobId::new("job-1").unwrap(),
+                    AgentId::new("agent-1").unwrap(),
+                    TaskId::new("task-1").unwrap(),
+                    "/tmp/fixture.conf",
+                    ArtifactChecksum::sha256("a".repeat(64)).unwrap(),
+                    1,
+                    ArtifactRetentionClass::RenderedTemplate,
+                    UNIX_EPOCH,
+                )
+                .unwrap();
+                effect = effect
+                    .with_prepared_artifacts(vec![ControllerPreparedArtifact::new(metadata, None)]);
+            }
+            assert!(
+                CommitControllerInboxFinal::execute(&mut store, &effect).is_err(),
+                "{scenario}"
+            );
+            assert_eq!(
+                store
+                    .find_task_assignment_status("task-1")
+                    .unwrap()
+                    .as_deref(),
+                Some("canceled")
+            );
+            assert_eq!(
+                store.find_job_status_value("job-1").unwrap().as_deref(),
+                Some("canceled")
+            );
+            let pending: (String, Vec<u8>) = store.connection.query_row(
+                "SELECT status, body FROM controller_report_inbox WHERE report_id = 'final-result'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(pending, ("pending_effects".into(), body));
+            assert!(
+                store
+                    .list_audit_events_by_category(AuditCategory::Job, 20)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_canceled_final_does_not_acknowledge_other_terminal_states_or_undispatched_tasks() {
+        for (canonical, dispatched, reported) in [
+            ("canceled", false, AssignmentStatus::Canceled),
+            ("succeeded", true, AssignmentStatus::Canceled),
+            ("failed", true, AssignmentStatus::Canceled),
+            ("expired", true, AssignmentStatus::Canceled),
+            ("rejected", true, AssignmentStatus::Canceled),
+        ] {
+            let mut store = SqliteStore::in_memory().unwrap();
+            let namespace = inbox_fixture(&store);
+            store.connection.execute("UPDATE jobs SET command_program = 'true', status = 'canceled' WHERE id = 'job-1'", []).unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE task_assignments SET status = ?1, dispatched_at = ?2,
+                    last_error = 'original reason', completed_at = 100 WHERE id = 'task-1'",
+                    params![canonical, dispatched.then_some(1)],
+                )
+                .unwrap();
+            let key =
+                ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-result").unwrap();
+            let body = b"terminal guard fixture".to_vec();
+            let report =
+                ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+                .unwrap();
+            let effect = ControllerInboxFinalEffect::new(
+                key,
+                body.clone(),
+                reported,
+                UNIX_EPOCH + Duration::from_secs(101),
+                None,
+                0,
+            )
+            .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+                0, 0, false,
+            ));
+            assert!(
+                matches!(
+                    CommitControllerInboxFinal::execute(&mut store, &effect),
+                    Err(StoreError::Domain(message)) if message == "inbox final assignment already terminal"
+                ),
+                "canonical={canonical}, dispatched={dispatched}, report={reported:?}"
+            );
+            let unchanged: (String, String, i64) = store.connection.query_row(
+                "SELECT status, last_error, completed_at FROM task_assignments WHERE id = 'task-1'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(unchanged, (canonical.into(), "original reason".into(), 100));
+            let pending: (String, Vec<u8>) = store.connection.query_row(
+                "SELECT status, body FROM controller_report_inbox WHERE report_id = 'final-result'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(pending, ("pending_effects".into(), body));
+            assert!(
+                store
+                    .list_audit_events_by_category(AuditCategory::Job, 20)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_canceled_lifecycle_reports_preserve_terminal_state_only_after_dispatch() {
+        for dispatched in [true, false] {
+            for report_id in ["task-ack", "task-started", "task-rejected"] {
+                let mut store = SqliteStore::in_memory().unwrap();
+                let namespace = inbox_fixture(&store);
+                store
+                    .connection
+                    .execute("UPDATE jobs SET status = 'canceled' WHERE id = 'job-1'", [])
+                    .unwrap();
+                store.connection.execute(
+                    "UPDATE task_assignments SET status = 'canceled', dispatched_at = ?1,
+                        completed_at = 100, last_error = 'operator cancellation' WHERE id = 'task-1'",
+                    params![dispatched.then_some(1)],
+                ).unwrap();
+                let key =
+                    ReportKey::new(&namespace, "agent-1", "job-1", "task-1", report_id).unwrap();
+                let body = format!("fixture {report_id}").into_bytes();
+                let report =
+                    ControllerInboxReport::new(key.clone(), ReportClass::Lifecycle, body.clone());
+                StageControllerInboxReport::execute(
+                    &mut store, "agent-1", &namespace, 1024, &report,
+                )
+                .unwrap();
+                let commit = |store: &mut SqliteStore| match report_id {
+                    "task-ack" => CommitControllerInboxTaskAck::execute(
+                        store,
+                        &ControllerInboxTaskAckEffect::new(
+                            key.clone(),
+                            body.clone(),
+                            UNIX_EPOCH + Duration::from_secs(101),
+                        ),
+                    ),
+                    "task-started" => CommitControllerInboxTaskStarted::execute(
+                        store,
+                        &ControllerInboxTaskStartedEffect::new(
+                            key.clone(),
+                            body.clone(),
+                            UNIX_EPOCH + Duration::from_secs(101),
+                        ),
+                    ),
+                    _ => CommitControllerInboxTaskRejected::execute(
+                        store,
+                        &ControllerInboxTaskRejectedEffect::new(
+                            key.clone(),
+                            body.clone(),
+                            "invalid_signature".into(),
+                            "private rejection detail".into(),
+                            UNIX_EPOCH + Duration::from_secs(101),
+                        ),
+                    ),
+                };
+                if dispatched {
+                    store.connection.execute_batch(
+                        "CREATE TRIGGER fail_canceled_lifecycle BEFORE INSERT ON audit_events
+                         WHEN NEW.action = 'assignment_canceled_lifecycle_report_received'
+                         BEGIN SELECT RAISE(ABORT, 'injected canceled lifecycle audit failure'); END;"
+                    ).unwrap();
+                    assert!(commit(&mut store).is_err());
+                    store
+                        .connection
+                        .execute_batch("DROP TRIGGER fail_canceled_lifecycle")
+                        .unwrap();
+                    assert!(matches!(
+                        commit(&mut store).unwrap(),
+                        InboxEffectOutcome::LateDispositionCommitted(_)
+                    ));
+                    assert!(matches!(
+                        commit(&mut store).unwrap(),
+                        InboxEffectOutcome::AlreadyCommitted(_)
+                    ));
+                    let events = store
+                        .list_audit_events_by_category(AuditCategory::Job, 20)
+                        .unwrap();
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(
+                        events[0].action,
+                        "assignment_canceled_lifecycle_report_received"
+                    );
+                    assert!(!format!("{:?}", events[0].value).contains("private rejection detail"));
+                } else {
+                    assert!(
+                        matches!(commit(&mut store), Err(StoreError::Domain(message))
+                        if message == "lifecycle report cannot change a terminal assignment")
+                    );
+                    assert!(
+                        store
+                            .list_audit_events_by_category(AuditCategory::Job, 20)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+                let original: (String, String, i64) = store.connection.query_row(
+                    "SELECT status, last_error, completed_at FROM task_assignments WHERE id = 'task-1'",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!(
+                    original,
+                    ("canceled".into(), "operator cancellation".into(), 100)
+                );
+                assert_eq!(
+                    store.find_job_status_value("job-1").unwrap().as_deref(),
+                    Some("canceled")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_inbox_failed_final_applies_max_failures_within_commit() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store.connection.execute_batch(
+            "UPDATE jobs SET command_program = 'echo', strategy_max_failures = 1 WHERE id = 'job-1';
+             INSERT INTO task_assignments (id, job_id, agent_id, nonce, payload_hash, signature, expires_at)
+             VALUES ('task-2', 'job-1', 'agent-1', 'nonce-inbox-2', 'hash', 'signature', 9999999999);"
+        ).unwrap();
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-failed").unwrap();
+        let encoded = b"encoded-final-failed".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            encoded,
+            AssignmentStatus::Failed,
+            SystemTime::UNIX_EPOCH,
+            Some("fixture command failed".into()),
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            0, 0, false,
+        ));
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-2")
+                .unwrap()
+                .as_deref(),
+            Some("canceled")
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("failed")
+        );
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Job, 10)
+            .unwrap();
+        assert_eq!(audits.len(), 3);
+        assert!(
+            audits
+                .iter()
+                .any(|event| event.action == "task_output_capture_summary")
+        );
+        assert!(
+            audits
+                .iter()
+                .any(|event| event.action == "job_max_failures_reached")
+        );
+        assert!(audits.iter().any(|event| event.action == "job_failed"));
+    }
+
+    #[test]
+    fn sqlite_inbox_artifact_final_retries_after_metadata_failure_without_partial_db_effect() {
+        let root = artifact_test_root("inbox-artifact-final-retry");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.db");
+        let mut store = SqliteStore::open(&database).unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET runbook_document = 'fixture' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let key =
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-artifact").unwrap();
+        let encoded = b"encoded-final-with-artifact".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+
+        let bytes = b"rendered fixture artifact".to_vec();
+        let checksum = test_artifact_checksum(&bytes);
+        let artifact_id = ArtifactId::new("artifact-final-retry").unwrap();
+        let mut artifact_store = LocalArtifactStore::new(root.join("artifacts")).unwrap();
+        let put = || ArtifactStorePut {
+            id: artifact_id.clone(),
+            retention_class: ArtifactRetentionClass::RenderedTemplate,
+            expected_checksum: checksum.clone(),
+            bytes: bytes.clone(),
+        };
+        let stored = artifact_store.put(put()).unwrap();
+        let metadata = RenderedArtifactMetadata::new(
+            artifact_id.clone(),
+            JobId::new("job-1").unwrap(),
+            AgentId::new("agent-1").unwrap(),
+            TaskId::new("task-1").unwrap(),
+            "/etc/fixture.conf",
+            checksum.clone(),
+            bytes.len() as u64,
+            ArtifactRetentionClass::RenderedTemplate,
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let effect = |stored| {
+            ControllerInboxFinalEffect::new(
+                key.clone(),
+                encoded.clone(),
+                AssignmentStatus::Succeeded,
+                SystemTime::UNIX_EPOCH,
+                None,
+                1,
+            )
+            .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+                0, 0, false,
+            ))
+            .with_prepared_artifacts(vec![ControllerPreparedArtifact::new(
+                metadata.clone(),
+                Some(stored),
+            )])
+        };
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_artifact_metadata BEFORE INSERT ON rendered_artifacts
+             BEGIN SELECT RAISE(FAIL, 'injected metadata failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect(stored)).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("queued")
+        );
+        assert!(
+            store
+                .list_rendered_artifact_metadata_for_job("job-1")
+                .unwrap()
+                .is_empty()
+        );
+        let pending = LoadPendingFinalReports::execute(&store, 1).unwrap();
+        assert_eq!(pending, vec![report]);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_artifact_metadata")
+            .unwrap();
+        drop(store);
+
+        let mut store = SqliteStore::open(&database).unwrap();
+        let stored_again = artifact_store.put(put()).unwrap();
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect(stored_again.clone())).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect(stored_again)).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("succeeded")
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("success")
+        );
+        assert_eq!(
+            store
+                .list_rendered_artifact_metadata_for_job("job-1")
+                .unwrap(),
+            vec![metadata]
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            artifact_store
+                .get(&artifact_id, ArtifactRetentionClass::RenderedTemplate)
+                .unwrap(),
+            Some(bytes)
+        );
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_command_final_waits_for_exact_output_chunk_prefix_before_commit() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET command_program = 'true' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "final-output-barrier",
+        )
+        .unwrap();
+        let body = b"strict command final report".to_vec();
+        let staged =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone());
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &staged)
+                .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            body,
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(10),
+            None,
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            2, 1, false,
+        ));
+
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect).is_err());
+        let pending: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM controller_report_inbox WHERE report_id = 'final-output-barrier'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, "pending_effects");
+        let assignment: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM task_assignments WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(assignment, "queued");
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO job_output_chunks (job_id, agent_id, stream, chunk_index, body)
+             VALUES ('job-1', 'agent-1', 'stdout', 0, 'first'),
+                    ('job-1', 'agent-1', 'stdout', 2, 'third'),
+                    ('job-1', 'agent-1', 'stderr', 0, 'warning')",
+                [],
+            )
+            .unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect).is_err());
+        store.connection.execute(
+            "UPDATE job_output_chunks SET chunk_index = 1
+             WHERE job_id = 'job-1' AND agent_id = 'agent-1' AND stream = 'stdout' AND chunk_index = 2",
+            [],
+        ).unwrap();
+
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        let stored: i64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM job_output_chunks WHERE job_id = 'job-1' AND agent_id = 'agent-1'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(stored, 3);
+        let audit = store
+            .list_audit_events_by_category(AuditCategory::Job, 10)
+            .unwrap();
+        assert!(audit.iter().any(|event| {
+            event.action == "task_output_capture_summary"
+                && matches!(&event.value, AuditValue::Plain(value)
+                    if value == "stdout_chunks=2,stderr_chunks=1,truncated=false")
+        }));
+        assert!(!audit.iter().any(|event| {
+            matches!(&event.value, AuditValue::Plain(value)
+                if value.contains("first") || value.contains("third") || value.contains("warning"))
+        }));
+    }
+
+    #[test]
+    fn sqlite_truncated_command_final_is_never_success_and_audit_keeps_only_summary() {
+        let mut failed_store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&failed_store);
+        failed_store
+            .connection
+            .execute(
+                "UPDATE jobs SET command_program = 'true' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let failed_key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "truncated-failed-final",
+        )
+        .unwrap();
+        let failed_body = b"truncated failed final".to_vec();
+        StageControllerInboxReport::execute(
+            &mut failed_store,
+            "agent-1",
+            &namespace,
+            1024,
+            &ControllerInboxReport::new(
+                failed_key.clone(),
+                ReportClass::FinalResult,
+                failed_body.clone(),
+            ),
+        )
+        .unwrap();
+        let failed_effect = ControllerInboxFinalEffect::new(
+            failed_key,
+            failed_body,
+            AssignmentStatus::Failed,
+            UNIX_EPOCH + Duration::from_secs(10),
+            Some("output capture incomplete".into()),
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            0, 0, true,
+        ));
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut failed_store, &failed_effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        let audit = failed_store
+            .list_audit_events_by_category(AuditCategory::Job, 10)
+            .unwrap();
+        assert!(audit.iter().any(|event| {
+            event.action == "task_output_capture_summary"
+                && matches!(&event.value, AuditValue::Plain(value)
+                    if value == "stdout_chunks=0,stderr_chunks=0,truncated=true")
+        }));
+        assert!(!audit.iter().any(|event| {
+            matches!(&event.value, AuditValue::Plain(value)
+                if value.contains("output capture incomplete"))
+        }));
+
+        let mut success_store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&success_store);
+        success_store
+            .connection
+            .execute(
+                "UPDATE jobs SET command_program = 'true' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let success_key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "truncated-success-final",
+        )
+        .unwrap();
+        let success_body = b"truncated success final".to_vec();
+        StageControllerInboxReport::execute(
+            &mut success_store,
+            "agent-1",
+            &namespace,
+            1024,
+            &ControllerInboxReport::new(
+                success_key.clone(),
+                ReportClass::FinalResult,
+                success_body.clone(),
+            ),
+        )
+        .unwrap();
+        let success_effect = ControllerInboxFinalEffect::new(
+            success_key,
+            success_body,
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(10),
+            None,
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            0, 0, true,
+        ));
+        assert!(CommitControllerInboxFinal::execute(&mut success_store, &success_effect).is_err());
+        assert_eq!(
+            success_store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("queued")
+        );
+        let pending: String = success_store
+            .connection
+            .query_row(
+                "SELECT status FROM controller_report_inbox WHERE report_id = 'truncated-success-final'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, "pending_effects");
+    }
+
+    #[test]
+    fn sqlite_no_artifact_runbook_final_waits_for_exact_output_prefix() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET runbook_document = 'fixture' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "runbook-output-final",
+        )
+        .unwrap();
+        let body = b"strict no-artifact Runbook final report".to_vec();
+        StageControllerInboxReport::execute(
+            &mut store,
+            "agent-1",
+            &namespace,
+            1024,
+            &ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, body.clone()),
+        )
+        .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            body,
+            AssignmentStatus::Succeeded,
+            UNIX_EPOCH + Duration::from_secs(10),
+            None,
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            1, 0, false,
+        ));
+
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("queued")
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO job_output_chunks (job_id, agent_id, stream, chunk_index, body)
+                 VALUES ('job-1', 'agent-1', 'stdout', 0, 'runbook summary')",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        let audit = store
+            .list_audit_events_by_category(AuditCategory::Job, 10)
+            .unwrap();
+        assert!(audit.iter().any(|event| {
+            event.action == "task_output_capture_summary"
+                && matches!(&event.value, AuditValue::Plain(value)
+                    if value == "stdout_chunks=1,stderr_chunks=0,truncated=false")
+        }));
+        assert!(!audit.iter().any(|event| {
+            matches!(&event.value, AuditValue::Plain(value)
+                if value.contains("runbook summary"))
+        }));
+    }
+
+    #[test]
+    fn sqlite_inbox_artifact_final_marker_failure_rolls_back_metadata_and_rejects_bad_put_record() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET runbook_document = 'fixture' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let key =
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final-meta-only").unwrap();
+        let encoded = b"encoded-final-meta-only".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let metadata = RenderedArtifactMetadata::new(
+            ArtifactId::new("artifact-meta-only").unwrap(),
+            JobId::new("job-1").unwrap(),
+            AgentId::new("agent-1").unwrap(),
+            TaskId::new("task-1").unwrap(),
+            "/etc/fixture.conf",
+            test_artifact_checksum(b"fixture metadata"),
+            16,
+            ArtifactRetentionClass::RenderedTemplate,
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let effect = |stored_body| {
+            ControllerInboxFinalEffect::new(
+                key.clone(),
+                encoded.clone(),
+                AssignmentStatus::Succeeded,
+                SystemTime::UNIX_EPOCH,
+                None,
+                1,
+            )
+            .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+                0, 0, false,
+            ))
+            .with_prepared_artifacts(vec![ControllerPreparedArtifact::new(
+                metadata.clone(),
+                stored_body,
+            )])
+        };
+        let bad_record = fleet_application::ArtifactStoreRecord {
+            id: metadata.id.clone(),
+            retention_class: metadata.retention_class,
+            checksum: metadata.checksum.clone(),
+            size_bytes: metadata.size_bytes + 1,
+        };
+        assert!(
+            CommitControllerInboxFinal::execute(&mut store, &effect(Some(bad_record))).is_err()
+        );
+        store.connection.execute_batch(
+            "CREATE TRIGGER fail_final_marker BEFORE UPDATE ON controller_report_inbox
+             WHEN NEW.status = 'committed' BEGIN SELECT RAISE(FAIL, 'injected marker failure'); END;"
+        ).unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect(None)).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("queued")
+        );
+        assert!(
+            store
+                .list_rendered_artifact_metadata_for_job("job-1")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            LoadPendingFinalReports::execute(&store, 1).unwrap(),
+            vec![report]
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_final_marker")
+            .unwrap();
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect(None)).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert_eq!(
+            store
+                .list_rendered_artifact_metadata_for_job("job-1")
+                .unwrap(),
+            vec![metadata]
+        );
+    }
+
+    #[test]
+    fn sqlite_inbox_remediation_final_commits_verification_intent_with_marker() {
+        use fleet_application::{
+            PrepareRemediationExecutionTransition, RemediationExecutionTransition,
+            RemediationJobResultStatus,
+        };
+
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE jobs SET runbook_document = 'fixture' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+        let current = AppRemediationRequestRecord {
+            status: "running".into(),
+            job_id: Some("job-1".into()),
+            ..remediation_request_record("remediation-inbox", "agent-1", "policy-1")
+        };
+        store.save_remediation_request_record(&current).unwrap();
+        let (updated, audit) = PrepareRemediationExecutionTransition::execute(
+            current,
+            "job-1",
+            RemediationExecutionTransition::Result(RemediationJobResultStatus::Succeeded),
+            "agent-1",
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap()
+        .unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "final-remediation",
+        )
+        .unwrap();
+        let encoded = b"encoded-remediation-final".to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::FinalResult, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxFinalEffect::new(
+            key,
+            encoded,
+            AssignmentStatus::Succeeded,
+            SystemTime::UNIX_EPOCH,
+            None,
+            0,
+        )
+        .with_output_summary(fleet_application::delivery::TaskOutputSummary::new(
+            0, 0, false,
+        ))
+        .with_prepared_remediation(ControllerPreparedRemediation::new(
+            "running", updated, audit,
+        ));
+        let prepared = effect.prepared_remediation().unwrap();
+        let stale = effect
+            .clone()
+            .with_prepared_remediation(ControllerPreparedRemediation::new(
+                "job_created",
+                prepared.updated.clone(),
+                prepared.audit.clone(),
+            ));
+        assert!(CommitControllerInboxFinal::execute(&mut store, &stale).is_err());
+        let mut wrong_audit = prepared.audit.clone();
+        wrong_audit.action = "remediation_job_failed".into();
+        let mismatched =
+            effect
+                .clone()
+                .with_prepared_remediation(ControllerPreparedRemediation::new(
+                    "running",
+                    prepared.updated.clone(),
+                    wrong_audit,
+                ));
+        assert!(CommitControllerInboxFinal::execute(&mut store, &mismatched).is_err());
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_remediation_audit BEFORE INSERT ON audit_events
+             WHEN NEW.action = 'remediation_job_succeeded_pending_verify'
+             BEGIN SELECT RAISE(FAIL, 'injected remediation audit failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxFinal::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            store
+                .find_remediation_request_record("remediation-inbox")
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert_eq!(
+            LoadPendingFinalReports::execute(&store, 1).unwrap(),
+            vec![report]
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_remediation_audit")
+            .unwrap();
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert_eq!(
+            store
+                .find_remediation_request_record("remediation-inbox")
+                .unwrap()
+                .unwrap()
+                .status,
+            "succeeded_pending_verify"
+        );
+        let backlog = store
+            .list_pending_remediation_verification_recovery_records(10)
+            .unwrap();
+        assert_eq!(backlog.len(), 1);
+        assert_eq!(backlog[0].id, "remediation-inbox");
+        let before = store
+            .list_audit_events_by_category(AuditCategory::Policy, 10)
+            .unwrap()
+            .len();
+        assert!(matches!(
+            CommitControllerInboxFinal::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Policy, 10)
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+
+    #[test]
+    fn sqlite_signed_receipt_survives_reopen_and_replays_exact_bytes() {
+        let root = artifact_test_root("signed-receipt-replay");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("controller.db");
+        let mut store = SqliteStore::open(&path).unwrap();
+        let delivery = store.controller_delivery_identity().unwrap();
+        inbox_fixture(&store);
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "output-receipt",
+        )
+        .unwrap();
+        let encoded = b"encoded-output-receipt".to_vec();
+        let report = ControllerInboxReport::new(key.clone(), ReportClass::Output, encoded.clone());
+        assert_eq!(
+            StageControllerInboxReport::execute(
+                &mut store,
+                "agent-1",
+                &delivery.namespace,
+                1024,
+                &report
+            )
+            .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        let effect = ControllerInboxOutputEffect::new(
+            key.clone(),
+            encoded,
+            JobOutputStream::Stdout,
+            0,
+            "hello".into(),
+        );
+        let InboxEffectOutcome::Committed(digest) =
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap()
+        else {
+            panic!("expected committed output");
+        };
+        let receipt = StoredReportReceipt::new(
+            key.clone(),
+            digest,
+            delivery.store_epoch.clone(),
+            "a".repeat(64),
+            b"signed-receipt-1".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(&mut store, &receipt).unwrap(),
+            StoredReceiptOutcome::Stored(b"signed-receipt-1".to_vec())
+        );
+        drop(store);
+
+        let mut reopened = SqliteStore::open(&path).unwrap();
+        let retry = StoredReportReceipt::new(
+            key,
+            digest,
+            delivery.store_epoch,
+            "a".repeat(64),
+            b"signed-receipt-2".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(&mut reopened, &retry).unwrap(),
+            StoredReceiptOutcome::AlreadyStored(b"signed-receipt-1".to_vec())
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn output_retention_keeps_committed_report_tombstone_and_receipt_without_resurrecting_output() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        let delivery = store.controller_delivery_identity().unwrap();
+        let key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "retained-output-tombstone",
+        )
+        .unwrap();
+        let encoded = b"encoded-retained-output".to_vec();
+        let report = ControllerInboxReport::new(key.clone(), ReportClass::Output, encoded.clone());
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report,)
+                .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        let effect = ControllerInboxOutputEffect::new(
+            key.clone(),
+            encoded,
+            JobOutputStream::Stdout,
+            0,
+            "retained output".into(),
+        );
+        let InboxEffectOutcome::Committed(digest) =
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap()
+        else {
+            panic!("expected committed output");
+        };
+        let receipt = StoredReportReceipt::new(
+            key.clone(),
+            digest,
+            delivery.store_epoch,
+            "a".repeat(64),
+            b"stored-receipt".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(&mut store, &receipt).unwrap(),
+            StoredReceiptOutcome::Stored(b"stored-receipt".to_vec())
+        );
+
+        store
+            .connection
+            .execute("UPDATE job_output_chunks SET created_at = 0", [])
+            .unwrap();
+        let cleanup = store
+            .cleanup_retention(UNIX_EPOCH + Duration::from_secs(1), false)
+            .unwrap();
+        assert_eq!(cleanup.job_output_chunks, 1);
+        assert_eq!(row_count(&store, "job_output_chunks"), 0);
+
+        let (status, body_is_null): (String, bool) = store
+            .connection
+            .query_row(
+                "SELECT status, body IS NULL FROM controller_report_inbox WHERE report_id = ?1",
+                ["retained-output-tombstone"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "committed");
+        assert!(body_is_null);
+        assert_eq!(row_count(&store, "controller_report_receipts"), 1);
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report,)
+                .unwrap(),
+            InboxStageOutcome::AlreadyCommitted
+        );
+        assert!(matches!(
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(&mut store, &receipt).unwrap(),
+            StoredReceiptOutcome::AlreadyStored(b"stored-receipt".to_vec())
+        );
+        assert_eq!(row_count(&store, "job_output_chunks"), 0);
+    }
+
+    #[test]
+    fn sqlite_signed_receipt_rejects_pending_digest_epoch_and_reissues_for_current_signer() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let delivery = store.controller_delivery_identity().unwrap();
+        inbox_fixture(&store);
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "output-receipt-guards",
+        )
+        .unwrap();
+        let encoded = b"guarded-output".to_vec();
+        let report = ControllerInboxReport::new(key.clone(), ReportClass::Output, encoded.clone());
+        StageControllerInboxReport::execute(
+            &mut store,
+            "agent-1",
+            &delivery.namespace,
+            1024,
+            &report,
+        )
+        .unwrap();
+        let candidate = |digest, epoch: String, signer: &str, body: &[u8]| {
+            StoredReportReceipt::new(key.clone(), digest, epoch, signer.repeat(64), body.to_vec())
+                .unwrap()
+        };
+        let digest = fleet_domain::delivery::ReportDigest(Sha256::digest(&encoded).into());
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &candidate(digest, delivery.store_epoch.clone(), "a", b"receipt-1")
+            )
+            .unwrap(),
+            StoredReceiptOutcome::NotCommitted
+        );
+        let effect = ControllerInboxOutputEffect::new(
+            key.clone(),
+            encoded.clone(),
+            JobOutputStream::Stdout,
+            0,
+            "output".into(),
+        );
+        assert!(matches!(
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &candidate(
+                    fleet_domain::delivery::ReportDigest([0; 32]),
+                    delivery.store_epoch.clone(),
+                    "a",
+                    b"receipt-1"
+                )
+            )
+            .unwrap(),
+            StoredReceiptOutcome::ConflictingDigest
+        );
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &candidate(digest, "old-epoch".into(), "a", b"receipt-1")
+            )
+            .unwrap(),
+            StoredReceiptOutcome::StaleEpoch
+        );
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &candidate(digest, delivery.store_epoch.clone(), "a", b"receipt-1")
+            )
+            .unwrap(),
+            StoredReceiptOutcome::Stored(b"receipt-1".to_vec())
+        );
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &candidate(digest, delivery.store_epoch.clone(), "b", b"receipt-2")
+            )
+            .unwrap(),
+            StoredReceiptOutcome::Stored(b"receipt-2".to_vec())
+        );
+        let rotated = RotateControllerStoreEpoch::execute(&mut store).unwrap();
+        assert_eq!(rotated.namespace, delivery.namespace);
+        assert_ne!(rotated.store_epoch, delivery.store_epoch);
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &candidate(digest, delivery.store_epoch, "a", b"receipt-old")
+            )
+            .unwrap(),
+            StoredReceiptOutcome::StaleEpoch
+        );
+        assert_eq!(
+            StageControllerInboxReport::execute(
+                &mut store,
+                "agent-1",
+                &rotated.namespace,
+                1024,
+                &report,
+            )
+            .unwrap(),
+            InboxStageOutcome::AlreadyCommitted,
+            "an exact pending Agent replay finds its committed pre-restore inbox effect"
+        );
+        assert!(matches!(
+            CommitControllerInboxOutput::execute(
+                &mut store,
+                &ControllerInboxOutputEffect::new(
+                    key.clone(),
+                    encoded.clone(),
+                    JobOutputStream::Stdout,
+                    0,
+                    "output".into(),
+                )
+            )
+            .unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &candidate(digest, rotated.store_epoch.clone(), "b", b"receipt-new")
+            )
+            .unwrap(),
+            StoredReceiptOutcome::Stored(b"receipt-new".to_vec())
+        );
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &candidate(digest, rotated.store_epoch.clone(), "b", b"receipt-newer")
+            )
+            .unwrap(),
+            StoredReceiptOutcome::AlreadyStored(b"receipt-new".to_vec())
+        );
+        let unknown_key = ReportKey::new(
+            &rotated.namespace,
+            "agent-1",
+            "job-1",
+            "missing-task",
+            "output-report",
+        )
+        .unwrap();
+        let unknown_report = ControllerInboxReport::new(
+            unknown_key.clone(),
+            ReportClass::Output,
+            b"unknown-owner-report".to_vec(),
+        );
+        assert!(matches!(
+            StageControllerInboxReport::execute(
+                &mut store,
+                "agent-1",
+                &rotated.namespace,
+                1024,
+                &unknown_report,
+            ),
+            Err(
+                fleet_application::delivery::InboxAdmissionError::Repository(StoreError::Domain(_))
+            )
+        ));
+        let unknown_digest =
+            fleet_domain::delivery::ReportDigest(Sha256::digest(unknown_report.body()).into());
+        let unknown_receipt = StoredReportReceipt::new(
+            unknown_key,
+            unknown_digest,
+            rotated.store_epoch,
+            "b".repeat(64),
+            b"must-not-be-stored".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(&mut store, &unknown_receipt).unwrap(),
+            StoredReceiptOutcome::NotCommitted,
+            "missing assignment ownership never becomes an ACK"
+        );
+    }
+
+    #[test]
+    fn sqlite_signed_receipt_reissues_exact_committed_report_after_signing_key_rotation() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let delivery = store.controller_delivery_identity().unwrap();
+        inbox_fixture(&store);
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "rotation-receipt",
+        )
+        .unwrap();
+        let encoded = b"committed-before-signing-key-rotation".to_vec();
+        let report = ControllerInboxReport::new(key.clone(), ReportClass::Output, encoded.clone());
+        StageControllerInboxReport::execute(
+            &mut store,
+            "agent-1",
+            &delivery.namespace,
+            1024,
+            &report,
+        )
+        .unwrap();
+        let effect = ControllerInboxOutputEffect::new(
+            key.clone(),
+            encoded.clone(),
+            JobOutputStream::Stdout,
+            0,
+            "committed output".into(),
+        );
+        let InboxEffectOutcome::Committed(digest) =
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap()
+        else {
+            panic!("expected first output effect commit");
+        };
+        let receipt = |signer: &str, body: &[u8]| {
+            StoredReportReceipt::new(
+                key.clone(),
+                digest,
+                delivery.store_epoch.clone(),
+                signer.repeat(64),
+                body.to_vec(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &receipt("a", b"old-signer-receipt"),
+            )
+            .unwrap(),
+            StoredReceiptOutcome::Stored(b"old-signer-receipt".to_vec())
+        );
+
+        assert_eq!(
+            StageControllerInboxReport::execute(
+                &mut store,
+                "agent-1",
+                &delivery.namespace,
+                1024,
+                &report,
+            )
+            .unwrap(),
+            InboxStageOutcome::AlreadyCommitted
+        );
+        assert!(matches!(
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &receipt("b", b"current-signer-receipt"),
+            )
+            .unwrap(),
+            StoredReceiptOutcome::Stored(b"current-signer-receipt".to_vec()),
+            "same-epoch current-signer receipt replaces only the exact committed report's prior signer"
+        );
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(
+                &mut store,
+                &receipt("b", b"newer-current-signer-receipt"),
+            )
+            .unwrap(),
+            StoredReceiptOutcome::AlreadyStored(b"current-signer-receipt".to_vec())
+        );
+        assert_eq!(
+            store.list_output_chunks("job-1", "agent-1").unwrap().len(),
+            1,
+            "receipt reissue does not repeat the stored report effect"
+        );
+    }
+
+    #[test]
+    fn sqlite_signed_receipt_insert_failure_leaves_no_ack_row() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let delivery = store.controller_delivery_identity().unwrap();
+        inbox_fixture(&store);
+        let key = ReportKey::new(
+            &delivery.namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "output-receipt-fail",
+        )
+        .unwrap();
+        let encoded = b"insert-failure-output".to_vec();
+        let report = ControllerInboxReport::new(key.clone(), ReportClass::Output, encoded.clone());
+        StageControllerInboxReport::execute(
+            &mut store,
+            "agent-1",
+            &delivery.namespace,
+            1024,
+            &report,
+        )
+        .unwrap();
+        let effect = ControllerInboxOutputEffect::new(
+            key.clone(),
+            encoded.clone(),
+            JobOutputStream::Stdout,
+            0,
+            "output".into(),
+        );
+        let InboxEffectOutcome::Committed(digest) =
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap()
+        else {
+            panic!("expected committed output");
+        };
+        let receipt = StoredReportReceipt::new(
+            key,
+            digest,
+            delivery.store_epoch,
+            "a".repeat(64),
+            b"signed-after-retry".to_vec(),
+        )
+        .unwrap();
+        store.connection.execute_batch("CREATE TRIGGER deny_receipt BEFORE INSERT ON controller_report_receipts BEGIN SELECT RAISE(FAIL, 'injected failure'); END;").unwrap();
+        assert!(PersistControllerStoredReceipt::execute(&mut store, &receipt).is_err());
+        let rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM controller_report_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER deny_receipt")
+            .unwrap();
+        assert_eq!(
+            PersistControllerStoredReceipt::execute(&mut store, &receipt).unwrap(),
+            StoredReceiptOutcome::Stored(b"signed-after-retry".to_vec())
+        );
+    }
+
+    #[test]
+    fn sqlite_inbox_output_effect_and_committed_marker_are_atomic_and_idempotent() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "output-1").unwrap();
+        let encoded = b"encoded-output-one".to_vec();
+        let report = ControllerInboxReport::new(key.clone(), ReportClass::Output, encoded.clone());
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+                .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        let effect = ControllerInboxOutputEffect::new(
+            key.clone(),
+            encoded.clone(),
+            JobOutputStream::Stdout,
+            0,
+            "hello".into(),
+        );
+        assert!(matches!(
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        let (status, body): (String, Option<Vec<u8>>) = store
+            .connection
+            .query_row(
+                "SELECT status, body FROM controller_report_inbox WHERE report_id = 'output-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "committed");
+        assert!(body.is_none());
+        let chunks = store.list_job_output_chunks("job-1", "agent-1").unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].body, "hello");
+        let changed = ControllerInboxOutputEffect::new(
+            key,
+            b"encoded-other".to_vec(),
+            JobOutputStream::Stdout,
+            0,
+            "hello".into(),
+        );
+        assert_eq!(
+            CommitControllerInboxOutput::execute(&mut store, &changed).unwrap(),
+            InboxEffectOutcome::ConflictingBody
+        );
+        store
+            .connection
+            .execute(
+                "DELETE FROM job_output_chunks WHERE job_id = 'job-1' AND agent_id = 'agent-1'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        assert!(
+            store
+                .list_job_output_chunks("job-1", "agent-1")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sqlite_inbox_output_conflict_rolls_back_marker_and_does_not_overwrite_effect() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "output-1").unwrap();
+        let encoded = b"encoded-output-one".to_vec();
+        let report = ControllerInboxReport::new(key.clone(), ReportClass::Output, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO job_output_chunks (job_id, agent_id, stream, chunk_index, body)
+             VALUES ('job-1', 'agent-1', 'stdout', 0, 'different')",
+                [],
+            )
+            .unwrap();
+        let effect = ControllerInboxOutputEffect::new(
+            key,
+            encoded,
+            JobOutputStream::Stdout,
+            0,
+            "hello".into(),
+        );
+        assert_eq!(
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::ConflictingBody
+        );
+        let (status, body): (String, Vec<u8>) = store
+            .connection
+            .query_row(
+                "SELECT status, body FROM controller_report_inbox WHERE report_id = 'output-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "pending_effects");
+        assert_eq!(body, b"encoded-output-one");
+        assert_eq!(
+            store.list_job_output_chunks("job-1", "agent-1").unwrap()[0].body,
+            "different"
+        );
+    }
+
+    #[test]
+    fn sqlite_inbox_task_ack_effect_commits_assignment_job_audit_and_marker_atomically() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'dispatched', dispatched_at = 10
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        store
+            .recompute_job_status_from_assignments("job-1")
+            .unwrap();
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "task-ack").unwrap();
+        let encoded = br#"{"event":"task_ack"}"#.to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::Lifecycle, encoded.clone());
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+                .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        let effect = ControllerInboxTaskAckEffect::new(
+            key.clone(),
+            encoded,
+            UNIX_EPOCH + Duration::from_secs(20),
+        );
+
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_task_ack_audit BEFORE INSERT ON audit_events
+                 WHEN NEW.action = 'task_accepted'
+                 BEGIN SELECT RAISE(FAIL, 'injected task ACK audit failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxTaskAck::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("dispatched")
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_task_ack_audit")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_task_ack_marker BEFORE UPDATE ON controller_report_inbox
+                 WHEN OLD.report_id = 'task-ack'
+                 BEGIN SELECT RAISE(FAIL, 'injected task ACK marker failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxTaskAck::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("dispatched")
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "task_accepted")
+                .count(),
+            0
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_task_ack_marker")
+            .unwrap();
+
+        assert!(matches!(
+            CommitControllerInboxTaskAck::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            CommitControllerInboxTaskAck::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("running")
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "task_accepted")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT status FROM controller_report_inbox WHERE report_id = 'task-ack'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "committed"
+        );
+
+        let changed = ControllerInboxReport::new(
+            key,
+            ReportClass::Lifecycle,
+            br#"{"event":"task_ack","different":true}"#.to_vec(),
+        );
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &changed)
+                .unwrap(),
+            InboxStageOutcome::ConflictingBody
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'failed', last_error = 'operator_failed'
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        let late_key = ReportKey::new(
+            &namespace,
+            "agent-1",
+            "job-1",
+            "task-1",
+            "task-ack-after-terminal",
+        )
+        .unwrap();
+        let late_report = ControllerInboxReport::new(
+            late_key.clone(),
+            ReportClass::Lifecycle,
+            br#"{"event":"task_ack"}"#.to_vec(),
+        );
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &late_report)
+            .unwrap();
+        assert!(
+            CommitControllerInboxTaskAck::execute(
+                &mut store,
+                &ControllerInboxTaskAckEffect::new(
+                    late_key,
+                    br#"{"event":"task_ack"}"#.to_vec(),
+                    UNIX_EPOCH + Duration::from_secs(30),
+                ),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn sqlite_inbox_task_rejected_effect_commits_terminal_reason_job_audit_and_marker_atomically() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'dispatched', dispatched_at = 10
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        store
+            .recompute_job_status_from_assignments("job-1")
+            .unwrap();
+        let key =
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "task-rejected").unwrap();
+        let encoded = br#"{"event":"task_rejected","reason_code":"invalid_signature","reason":"signature check failed"}"#.to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::Lifecycle, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxTaskRejectedEffect::new(
+            key,
+            encoded,
+            "invalid_signature".to_owned(),
+            "signature check failed".to_owned(),
+            UNIX_EPOCH + Duration::from_secs(20),
+        );
+
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_task_rejected_audit BEFORE INSERT ON audit_events
+                 WHEN NEW.action = 'task_rejected'
+                 BEGIN SELECT RAISE(FAIL, 'injected rejection audit failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxTaskRejected::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("dispatched")
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("running")
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT status FROM controller_report_inbox WHERE report_id = 'task-rejected'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "pending_effects"
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_task_rejected_audit")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'failed', last_error = 'operator_failed'
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        assert!(CommitControllerInboxTaskRejected::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "task_rejected")
+                .count(),
+            0
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'dispatched', last_error = ''
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            CommitControllerInboxTaskRejected::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            CommitControllerInboxTaskRejected::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT last_error FROM task_assignments WHERE id = 'task-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "invalid_signature: signature check failed"
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "task_rejected")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn sqlite_inbox_task_started_effect_commits_assignment_job_audit_and_marker_atomically() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'accepted', accepted_at = 10
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        store
+            .recompute_job_status_from_assignments("job-1")
+            .unwrap();
+        let mut remediation = remediation_request_record("remediation-1", "agent-1", "policy-1");
+        remediation.status = "job_created".to_owned();
+        remediation.job_id = Some("job-1".to_owned());
+        store.save_remediation_request_record(&remediation).unwrap();
+        let remediation_transition =
+            fleet_application::PrepareRemediationExecutionTransition::execute(
+                remediation,
+                "job-1",
+                fleet_application::RemediationExecutionTransition::Started,
+                "agent-1",
+                UNIX_EPOCH + Duration::from_secs(20),
+            )
+            .unwrap();
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "task-started").unwrap();
+        let encoded = br#"{"event":"task_started"}"#.to_vec();
+        let report =
+            ControllerInboxReport::new(key.clone(), ReportClass::Lifecycle, encoded.clone());
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+                .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        let effect = ControllerInboxTaskStartedEffect::new(
+            key.clone(),
+            encoded,
+            UNIX_EPOCH + Duration::from_secs(20),
+        )
+        .with_remediation_transition(remediation_transition);
+
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_task_started_remediation_audit BEFORE INSERT ON audit_events
+                 WHEN NEW.action = 'remediation_job_running'
+                 BEGIN SELECT RAISE(FAIL, 'injected remediation start audit failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxTaskStarted::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_remediation_request_record("remediation-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            "job_created"
+        );
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("accepted")
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_task_started_remediation_audit")
+            .unwrap();
+
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_task_started_audit BEFORE INSERT ON audit_events
+                 WHEN NEW.action = 'task_started'
+                 BEGIN SELECT RAISE(FAIL, 'injected task started audit failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxTaskStarted::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(
+            store
+                .find_remediation_request_record("remediation-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            "job_created"
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_task_started_audit")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_task_started_marker BEFORE UPDATE ON controller_report_inbox
+                 WHEN OLD.report_id = 'task-started'
+                 BEGIN SELECT RAISE(FAIL, 'injected task started marker failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxTaskStarted::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "task_started")
+                .count(),
+            0
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_task_started_marker")
+            .unwrap();
+
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'failed', last_error = 'operator_failed'
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        assert!(CommitControllerInboxTaskStarted::execute(&mut store, &effect).is_err());
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'accepted', last_error = ''
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            CommitControllerInboxTaskStarted::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            CommitControllerInboxTaskStarted::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::AlreadyCommitted(_)
+        ));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("started")
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().as_deref(),
+            Some("running")
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "task_started")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .find_remediation_request_record("remediation-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Policy, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "remediation_job_running")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT status FROM controller_report_inbox WHERE report_id = 'task-started'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "committed"
+        );
+    }
+
+    #[test]
+    fn sqlite_inbox_late_g2_lifecycle_reports_commit_disposition_without_changing_terminal_state() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'dispatched', dispatched_at = 10
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        store
+            .recompute_job_status_from_assignments("job-1")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET status = 'failed', completed_at = 40,
+                        last_error = 'execution_outcome_unknown' WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        store
+            .recompute_job_status_from_assignments("job-1")
+            .unwrap();
+        let job_status_before = store.find_job_status_value("job-1").unwrap();
+
+        let ack_key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "task-ack").unwrap();
+        let ack_body = br#"{"event":"task_ack"}"#.to_vec();
+        let ack_report =
+            ControllerInboxReport::new(ack_key.clone(), ReportClass::Lifecycle, ack_body.clone());
+        let started_key =
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "task-started").unwrap();
+        let started_body = br#"{"event":"task_started"}"#.to_vec();
+        let started_report = ControllerInboxReport::new(
+            started_key.clone(),
+            ReportClass::Lifecycle,
+            started_body.clone(),
+        );
+        let rejected_key =
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "task-rejected").unwrap();
+        let rejected_body = br#"{"event":"task_rejected","reason_code":"invalid_signature","reason":"secret-reason-must-not-be-audited"}"#.to_vec();
+        let rejected_report = ControllerInboxReport::new(
+            rejected_key.clone(),
+            ReportClass::Lifecycle,
+            rejected_body.clone(),
+        );
+        for report in [&ack_report, &started_report, &rejected_report] {
+            assert_eq!(
+                StageControllerInboxReport::execute(
+                    &mut store, "agent-1", &namespace, 1024, report,
+                )
+                .unwrap(),
+                InboxStageOutcome::StagedPendingEffects
+            );
+        }
+
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET last_error = 'operator_failed' WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            CommitControllerInboxTaskAck::execute(
+                &mut store,
+                &ControllerInboxTaskAckEffect::new(
+                    ack_key.clone(),
+                    ack_body.clone(),
+                    UNIX_EPOCH + Duration::from_secs(49),
+                ),
+            )
+            .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments SET last_error = 'execution_outcome_unknown'
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
+
+        let ack = ControllerInboxTaskAckEffect::new(
+            ack_key.clone(),
+            ack_body.clone(),
+            UNIX_EPOCH + Duration::from_secs(50),
+        );
+        let started = ControllerInboxTaskStartedEffect::new(
+            started_key.clone(),
+            started_body.clone(),
+            UNIX_EPOCH + Duration::from_secs(51),
+        );
+        let rejected = ControllerInboxTaskRejectedEffect::new(
+            rejected_key.clone(),
+            rejected_body.clone(),
+            "invalid_signature".to_owned(),
+            "secret-reason-must-not-be-audited".to_owned(),
+            UNIX_EPOCH + Duration::from_secs(52),
+        );
+
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_late_lifecycle_audit BEFORE INSERT ON audit_events
+                 WHEN NEW.action = 'assignment_late_lifecycle_report_received'
+                 BEGIN SELECT RAISE(FAIL, 'injected late lifecycle audit failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxTaskAck::execute(&mut store, &ack).is_err());
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT status FROM controller_report_inbox WHERE report_id = 'task-ack'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "pending_effects"
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_late_lifecycle_audit")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_late_lifecycle_marker BEFORE UPDATE ON controller_report_inbox
+                 WHEN OLD.report_id = 'task-ack'
+                 BEGIN SELECT RAISE(FAIL, 'injected late lifecycle marker failure'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxTaskAck::execute(&mut store, &ack).is_err());
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Job, 20)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "assignment_late_lifecycle_report_received")
+                .count(),
+            0
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_late_lifecycle_marker")
+            .unwrap();
+
+        for (report_id, outcome, retry) in [
+            (
+                "task-ack",
+                CommitControllerInboxTaskAck::execute(&mut store, &ack).unwrap(),
+                CommitControllerInboxTaskAck::execute(&mut store, &ack).unwrap(),
+            ),
+            (
+                "task-started",
+                CommitControllerInboxTaskStarted::execute(&mut store, &started).unwrap(),
+                CommitControllerInboxTaskStarted::execute(&mut store, &started).unwrap(),
+            ),
+            (
+                "task-rejected",
+                CommitControllerInboxTaskRejected::execute(&mut store, &rejected).unwrap(),
+                CommitControllerInboxTaskRejected::execute(&mut store, &rejected).unwrap(),
+            ),
+        ] {
+            let InboxEffectOutcome::LateDispositionCommitted(digest) = outcome else {
+                panic!("{report_id} should be dispositioned after G2");
+            };
+            assert_eq!(retry, InboxEffectOutcome::AlreadyCommitted(digest));
+            assert_eq!(
+                store
+                    .connection
+                    .query_row::<String, _, _>(
+                        "SELECT status FROM controller_report_inbox WHERE report_id = ?1",
+                        [report_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                "committed"
+            );
+        }
+
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-1")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT last_error FROM task_assignments WHERE id = 'task-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "execution_outcome_unknown"
+        );
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap(),
+            job_status_before
+        );
+        let job_audits = store
+            .list_audit_events_by_category(AuditCategory::Job, 20)
+            .unwrap();
+        assert_eq!(
+            job_audits
+                .iter()
+                .filter(|event| event.action == "assignment_late_lifecycle_report_received")
+                .count(),
+            3
+        );
+        assert!(job_audits.iter().all(|event| {
+            !matches!(
+                &event.value,
+                AuditValue::Plain(value) if value.contains("secret-reason-must-not-be-audited")
+            )
+        }));
+    }
+
+    #[test]
+    fn sqlite_inbox_output_marker_failure_rolls_back_new_output_effect() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "output-1").unwrap();
+        let encoded = b"encoded-output-one".to_vec();
+        let report = ControllerInboxReport::new(key.clone(), ReportClass::Output, encoded.clone());
+        StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &report)
+            .unwrap();
+        let effect = ControllerInboxOutputEffect::new(
+            key,
+            encoded,
+            JobOutputStream::Stdout,
+            0,
+            "hello".into(),
+        );
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER injected_inbox_failure BEFORE UPDATE ON controller_report_inbox
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        assert!(CommitControllerInboxOutput::execute(&mut store, &effect).is_err());
+        assert!(
+            store
+                .list_job_output_chunks("job-1", "agent-1")
+                .unwrap()
+                .is_empty()
+        );
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM controller_report_inbox WHERE report_id = 'output-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending_effects");
+        store
+            .connection
+            .execute_batch("DROP TRIGGER injected_inbox_failure;")
+            .unwrap();
+        assert!(matches!(
+            CommitControllerInboxOutput::execute(&mut store, &effect).unwrap(),
+            InboxEffectOutcome::Committed(_)
+        ));
+    }
+
+    #[test]
+    fn sqlite_inbox_rejects_unknown_assignment_and_keeps_pending_body_on_reopen() {
+        let path = artifact_test_root("controller-inbox").with_extension("db");
+        let namespace = {
+            let mut store = SqliteStore::open(&path).unwrap();
+            let namespace = inbox_fixture(&store);
+            let wrong = ControllerInboxReport::new(
+                ReportKey::new(&namespace, "agent-1", "job-1", "other-task", "report-1").unwrap(),
+                ReportClass::Output,
+                b"private-output".to_vec(),
+            );
+            assert!(
+                StageControllerInboxReport::execute(
+                    &mut store, "agent-1", &namespace, 1024, &wrong
+                )
+                .is_err()
+            );
+            let report = ControllerInboxReport::new(
+                ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "report-1").unwrap(),
+                ReportClass::Output,
+                b"private-output".to_vec(),
+            );
+            assert_eq!(
+                StageControllerInboxReport::execute(
+                    &mut store, "agent-1", &namespace, 1024, &report
+                )
+                .unwrap(),
+                InboxStageOutcome::StagedPendingEffects
+            );
+            namespace
+        };
+        let mut reopened = SqliteStore::open(&path).unwrap();
+        let report = ControllerInboxReport::new(
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "report-1").unwrap(),
+            ReportClass::Output,
+            b"private-output".to_vec(),
+        );
+        assert_eq!(
+            StageControllerInboxReport::execute(
+                &mut reopened,
+                "agent-1",
+                &namespace,
+                1024,
+                &report
+            )
+            .unwrap(),
+            InboxStageOutcome::DuplicatePendingEffects
+        );
+        let body: Vec<u8> = reopened
+            .connection
+            .query_row(
+                "SELECT body FROM controller_report_inbox WHERE report_id = 'report-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, b"private-output");
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sqlite_inbox_reserves_four_pending_slots_for_final_results() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        {
+            let tx = store.connection.transaction().unwrap();
+            for index in 0..4092 {
+                tx.execute(
+                    "INSERT INTO controller_report_inbox (
+                        controller_namespace, agent_id, job_id, task_id, report_id,
+                        class, digest_hex, body, accounted_bytes, status
+                     ) VALUES (?1, 'agent-1', 'job-1', 'task-1', ?2,
+                        'output', 'digest', x'01', 1, 'pending_effects')",
+                    params![namespace, format!("existing-{index}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "new-output").unwrap();
+        let output = ControllerInboxReport::new(key, ReportClass::Output, b"out".to_vec());
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &output)
+                .unwrap(),
+            InboxStageOutcome::CapacityExceeded
+        );
+        let final_key = ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final").unwrap();
+        let final_report =
+            ControllerInboxReport::new(final_key, ReportClass::FinalResult, b"done".to_vec());
+        assert_eq!(
+            StageControllerInboxReport::execute(
+                &mut store,
+                "agent-1",
+                &namespace,
+                1024,
+                &final_report
+            )
+            .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+    }
+
+    #[test]
+    fn sqlite_inbox_reserves_pending_bytes_for_final_result() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let namespace = inbox_fixture(&store);
+        store
+            .connection
+            .execute(
+                "INSERT INTO controller_report_inbox (
+                controller_namespace, agent_id, job_id, task_id, report_id,
+                class, digest_hex, body, accounted_bytes, status
+             ) VALUES (?1, 'agent-1', 'job-1', 'task-1', 'existing',
+                'output', 'digest', x'01', ?2, 'pending_effects')",
+                params![namespace, 60 * 1024 * 1024 - 1],
+            )
+            .unwrap();
+        let output = ControllerInboxReport::new(
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "new-output").unwrap(),
+            ReportClass::Output,
+            b"out".to_vec(),
+        );
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &output)
+                .unwrap(),
+            InboxStageOutcome::CapacityExceeded
+        );
+        let final_report = ControllerInboxReport::new(
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "final").unwrap(),
+            ReportClass::FinalResult,
+            b"done".to_vec(),
+        );
+        assert_eq!(
+            StageControllerInboxReport::execute(
+                &mut store,
+                "agent-1",
+                &namespace,
+                1024,
+                &final_report
+            )
+            .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+    }
+
+    #[test]
+    fn controller_inbox_schema_migrates_v23_without_replacing_delivery_namespace() {
+        let connection = Connection::open_in_memory().unwrap();
+        let namespace = "a".repeat(64);
+        let epoch = "b".repeat(64);
+        connection.execute_batch(
+            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
+             INSERT INTO schema_migrations (name, version, applied_at) VALUES ('fleet_store', 23, 1);
+             CREATE TABLE controller_delivery_identity (id INTEGER PRIMARY KEY, namespace TEXT NOT NULL, store_epoch TEXT NOT NULL);"
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO controller_delivery_identity (id, namespace, store_epoch) VALUES (1, ?1, ?2)",
+            params![namespace, epoch]
+        ).unwrap();
+        let store = SqliteStore { connection };
+        store.migrate().unwrap();
+        assert_eq!(
+            store.controller_delivery_identity().unwrap().namespace,
+            namespace
+        );
+        assert_eq!(
+            store.current_schema_version().unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        assert!(
+            store
+                .has_column("controller_report_inbox", "status")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn controller_receipt_schema_migrates_v24_preserving_committed_inbox_row() {
+        let connection = Connection::open_in_memory().unwrap();
+        let namespace = "a".repeat(64);
+        let epoch = "b".repeat(64);
+        connection.execute_batch(
+            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
+             INSERT INTO schema_migrations (name, version, applied_at) VALUES ('fleet_store', 24, 1);
+             CREATE TABLE controller_delivery_identity (id INTEGER PRIMARY KEY, namespace TEXT NOT NULL, store_epoch TEXT NOT NULL);
+             CREATE TABLE controller_report_inbox (
+                 controller_namespace TEXT NOT NULL, agent_id TEXT NOT NULL, job_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL, report_id TEXT NOT NULL, class TEXT NOT NULL,
+                 digest_hex TEXT NOT NULL, body BLOB, accounted_bytes INTEGER NOT NULL,
+                 status TEXT NOT NULL,
+                 PRIMARY KEY (controller_namespace, agent_id, job_id, task_id, report_id));"
+        ).unwrap();
+        connection.execute("INSERT INTO controller_delivery_identity (id, namespace, store_epoch) VALUES (1, ?1, ?2)", params![namespace, epoch]).unwrap();
+        connection.execute("INSERT INTO controller_report_inbox (controller_namespace, agent_id, job_id, task_id, report_id, class, digest_hex, body, accounted_bytes, status) VALUES (?1, 'agent-1', 'job-1', 'task-1', 'report-1', 'output', ?2, NULL, 100, 'committed')", params![namespace, "c".repeat(64)]).unwrap();
+        let store = SqliteStore { connection };
+        store.migrate().unwrap();
+        assert_eq!(
+            store.current_schema_version().unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            store.controller_delivery_identity().unwrap().store_epoch,
+            epoch
+        );
+        let (status, digest): (String, String) = store.connection.query_row("SELECT status, digest_hex FROM controller_report_inbox WHERE report_id = 'report-1'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(status, "committed");
+        assert_eq!(digest, "c".repeat(64));
+        let table_exists: bool = store.connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'controller_report_receipts')", [], |row| row.get(0)).unwrap();
+        assert!(table_exists);
+        store.migrate().unwrap();
+        assert_eq!(
+            store.current_schema_version().unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn controller_inbox_v25_migration_preserves_receipts_and_accepts_drift_evidence() {
+        let connection = Connection::open_in_memory().unwrap();
+        let namespace = "a".repeat(64);
+        let epoch = "b".repeat(64);
+        let receipt_bytes = b"previous-signed-receipt".to_vec();
+        connection.execute_batch(
+            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
+             INSERT INTO schema_migrations (name, version, applied_at) VALUES ('fleet_store', 25, 1);
+             CREATE TABLE controller_delivery_identity (id INTEGER PRIMARY KEY, namespace TEXT NOT NULL, store_epoch TEXT NOT NULL);
+             CREATE TABLE controller_report_inbox (
+                 controller_namespace TEXT NOT NULL, agent_id TEXT NOT NULL, job_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL, report_id TEXT NOT NULL,
+                 class TEXT NOT NULL CHECK (class IN ('lifecycle', 'output', 'final_result')),
+                 digest_hex TEXT NOT NULL, body BLOB, accounted_bytes INTEGER NOT NULL,
+                 status TEXT NOT NULL CHECK (status IN ('pending_effects', 'committed')),
+                 PRIMARY KEY (controller_namespace, agent_id, job_id, task_id, report_id));
+             CREATE INDEX controller_report_inbox_pending_agent_idx
+                 ON controller_report_inbox (agent_id, status);
+             CREATE TABLE controller_report_receipts (
+                 controller_namespace TEXT NOT NULL, agent_id TEXT NOT NULL, job_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL, report_id TEXT NOT NULL, digest_hex TEXT NOT NULL,
+                 store_epoch TEXT NOT NULL, signer_fingerprint TEXT NOT NULL, receipt_bytes BLOB NOT NULL,
+                 PRIMARY KEY (controller_namespace, agent_id, job_id, task_id, report_id),
+                 FOREIGN KEY (controller_namespace, agent_id, job_id, task_id, report_id)
+                     REFERENCES controller_report_inbox (controller_namespace, agent_id, job_id, task_id, report_id)
+                     ON DELETE CASCADE);"
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO controller_delivery_identity (id, namespace, store_epoch) VALUES (1, ?1, ?2)",
+            params![namespace, epoch],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO controller_report_inbox (controller_namespace, agent_id, job_id, task_id, report_id, class, digest_hex, body, accounted_bytes, status)
+             VALUES (?1, 'agent-1', 'job-1', 'task-1', 'prior-report', 'output', ?2, NULL, 100, 'committed')",
+            params![namespace, "c".repeat(64)],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO controller_report_receipts (controller_namespace, agent_id, job_id, task_id, report_id, digest_hex, store_epoch, signer_fingerprint, receipt_bytes)
+             VALUES (?1, 'agent-1', 'job-1', 'task-1', 'prior-report', ?2, ?3, ?4, ?5)",
+            params![namespace, "c".repeat(64), epoch, "d".repeat(64), receipt_bytes],
+        ).unwrap();
+        let mut store = SqliteStore { connection };
+
+        store.migrate().unwrap();
+        assert_eq!(
+            store.current_schema_version().unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            store.controller_delivery_identity().unwrap().store_epoch,
+            epoch
+        );
+        let (prior_status, prior_receipt): (String, Vec<u8>) = store.connection.query_row(
+            "SELECT i.status, r.receipt_bytes FROM controller_report_inbox i
+             JOIN controller_report_receipts r USING (controller_namespace, agent_id, job_id, task_id, report_id)
+             WHERE i.report_id='prior-report'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(prior_status, "committed");
+        assert_eq!(prior_receipt, b"previous-signed-receipt");
+
+        assert_eq!(inbox_fixture(&store), namespace);
+        let evidence_key =
+            ReportKey::new(&namespace, "agent-1", "job-1", "task-1", "drift-evidence").unwrap();
+        let evidence = ControllerInboxReport::new(
+            evidence_key,
+            ReportClass::DriftEvidence,
+            br#"{"status":"compliant","expected":"running","actual":"running"}"#.to_vec(),
+        );
+        assert_eq!(
+            StageControllerInboxReport::execute(&mut store, "agent-1", &namespace, 1024, &evidence)
+                .unwrap(),
+            InboxStageOutcome::StagedPendingEffects
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT class FROM controller_report_inbox WHERE report_id='drift-evidence'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "drift_evidence"
+        );
+        store.migrate().unwrap();
+        assert_eq!(
+            store.current_schema_version().unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        let preserved_receipt: Vec<u8> = store.connection.query_row(
+            "SELECT receipt_bytes FROM controller_report_receipts WHERE report_id='prior-report'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(preserved_receipt, b"previous-signed-receipt");
+    }
+
+    #[test]
+    fn controller_delivery_identity_survives_reopen_but_epoch_rotates_explicitly() {
+        let path = artifact_test_root("delivery-identity").with_extension("db");
+        let initial = {
+            let store = SqliteStore::open(&path).unwrap();
+            store.controller_delivery_identity().unwrap()
+        };
+        let mut reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(reopened.controller_delivery_identity().unwrap(), initial);
+        let rotated = RotateControllerStoreEpoch::execute(&mut reopened).unwrap();
+        assert_eq!(rotated.namespace, initial.namespace);
+        assert_ne!(rotated.store_epoch, initial.store_epoch);
+        drop(reopened);
+        let final_store = SqliteStore::open(&path).unwrap();
+        assert_eq!(final_store.controller_delivery_identity().unwrap(), rotated);
+        drop(final_store);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn controller_delivery_identity_migrates_v22_without_replacing_legacy_identity() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
+             INSERT INTO schema_migrations (name, version, applied_at) VALUES ('fleet_store', 22, 1);
+             CREATE TABLE controller_identity (id INTEGER PRIMARY KEY, public_key TEXT NOT NULL,
+                 public_fingerprint TEXT NOT NULL, private_key_path TEXT NOT NULL, created_at INTEGER NOT NULL);
+             INSERT INTO controller_identity VALUES (1, 'legacy-public', 'legacy-fingerprint', 'legacy-path', 1);"
+        ).unwrap();
+        let store = SqliteStore { connection };
+        store.migrate().unwrap();
+        let delivery = store.controller_delivery_identity().unwrap();
+        assert_eq!(delivery.namespace.len(), 64);
+        assert_eq!(delivery.store_epoch.len(), 64);
+        assert_eq!(
+            store.current_schema_version().unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        let public_key: String = store
+            .connection
+            .query_row(
+                "SELECT public_key FROM controller_identity WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(public_key, "legacy-public");
+        store.migrate().unwrap();
+        assert_eq!(store.controller_delivery_identity().unwrap(), delivery);
+    }
+
+    #[test]
+    fn malformed_delivery_identity_fails_closed_without_reinitializing() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE controller_delivery_identity SET namespace = 'invalid' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        assert!(store.controller_delivery_identity().is_err());
+        assert!(store.migrate().is_err());
+    }
+
+    #[test]
+    fn newer_controller_schema_is_rejected_without_overwriting_version() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at INTEGER NOT NULL);"
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO schema_migrations (name, version, applied_at) VALUES ('fleet_store', ?1, 1)",
+            params![CURRENT_SCHEMA_VERSION + 1]
+        ).unwrap();
+        let store = SqliteStore { connection };
+        assert!(store.migrate().is_err());
+        let version: i64 = store
+            .connection
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE name = 'fleet_store'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION + 1);
+    }
 
     fn agent() -> Agent {
         agent_with_id("a1", "web-01", "0123456789abcdef")
@@ -13576,6 +18800,16 @@ mod tests {
         }
 
         let mut store = SqliteStore::open(&path).unwrap();
+        let persisted_operation_id = fleet_domain::CatalogSyncOperationId::new("sync-001").unwrap();
+        assert_eq!(
+            CatalogQueryRepository::find_catalog_sync_operation_status(
+                &store,
+                &persisted_operation_id
+            )
+            .unwrap(),
+            CatalogRepository::find_catalog_sync_operation(&store, &persisted_operation_id)
+                .unwrap()
+        );
         assert_eq!(
             store
                 .find_catalog_sync_operation(
@@ -15091,6 +20325,11 @@ mod tests {
         );
         assert_eq!(
             store.find_catalog_sync_operation(operation.id()).unwrap(),
+            Some(operation.clone())
+        );
+        assert_eq!(
+            CatalogQueryRepository::find_catalog_sync_operation_status(&store, operation.id())
+                .unwrap(),
             Some(operation)
         );
         assert_eq!(
@@ -17200,7 +22439,15 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(<S as AuditRepository>::list(store, 10).unwrap().len(), 1);
+        assert!(
+            <S as AuditRepository>::list(store, 100)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.action == "retention_contract"
+                        && event.target.as_str() == "retention-contract"
+                })
+        );
 
         let cleanup =
             <S as RetentionRepository>::cleanup_retention(store, future_cutoffs, false).unwrap();
@@ -17229,7 +22476,15 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(<S as AuditRepository>::list(store, 10).unwrap().len(), 1);
+        assert!(
+            <S as AuditRepository>::list(store, 100)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.action == "retention_contract"
+                        && event.target.as_str() == "retention-contract"
+                })
+        );
     }
 
     fn assert_remediation_request_repository_contracts<S>(store: &mut S)
@@ -18375,6 +23630,142 @@ mod tests {
     }
 
     #[test]
+    fn output_read_characterization_legacy_order_differs_from_late_agent_append_order() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        store
+            .save_agent(agent_with_id("b2", "web-02", "fedcba9876543210"))
+            .unwrap();
+        store
+            .save_job_record(&fleet_domain::Job::new(
+                fleet_domain::JobId::new("job-1").unwrap(),
+                fleet_domain::TaskRisk::Low,
+                fleet_domain::ApprovalRequirement::NotRequired,
+                Duration::from_secs(30),
+            ))
+            .unwrap();
+        for (agent_id, stream, sequence, body) in [
+            ("a1", JobOutputStream::Stdout, 0, "a-first"),
+            ("b2", JobOutputStream::Stderr, 0, "b-stderr"),
+            ("a1", JobOutputStream::Stdout, 1, "a-late"),
+            ("b2", JobOutputStream::Stdout, 0, "b-stdout"),
+        ] {
+            store
+                .append_job_output_chunk_record(&JobOutputChunk {
+                    job_id: "job-1".into(),
+                    agent_id: agent_id.into(),
+                    stream,
+                    sequence,
+                    body: body.into(),
+                })
+                .unwrap();
+        }
+        let legacy = store.list_job_output_chunks_for_job("job-1").unwrap();
+        assert_eq!(
+            legacy
+                .iter()
+                .map(|chunk| chunk.body.as_str())
+                .collect::<Vec<_>>(),
+            ["a-first", "a-late", "b-stderr", "b-stdout"]
+        );
+        let mut statement = store
+            .connection
+            .prepare("SELECT body FROM job_output_chunks WHERE job_id = ?1 ORDER BY id")
+            .unwrap();
+        let appended = statement
+            .query_map(["job-1"], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(appended, ["a-first", "b-stderr", "a-late", "b-stdout"]);
+    }
+
+    #[test]
+    fn output_read_characterization_retention_keeps_epoch_and_append_ids_survive_reopen() {
+        let path = artifact_test_root("output-read-characterization.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.save_agent(agent()).unwrap();
+        store
+            .save_job_record(&fleet_domain::Job::new(
+                fleet_domain::JobId::new("job-1").unwrap(),
+                fleet_domain::TaskRisk::Low,
+                fleet_domain::ApprovalRequirement::NotRequired,
+                Duration::from_secs(30),
+            ))
+            .unwrap();
+        let first = JobOutputChunk {
+            job_id: "job-1".into(),
+            agent_id: "a1".into(),
+            stream: JobOutputStream::Stdout,
+            sequence: 0,
+            body: "before retention".into(),
+        };
+        store.append_job_output_chunk_record(&first).unwrap();
+        let initial_id: i64 = store
+            .connection
+            .query_row("SELECT id FROM job_output_chunks", [], |row| row.get(0))
+            .unwrap();
+        let identity = store.controller_delivery_identity().unwrap();
+        store
+            .connection
+            .execute("UPDATE job_output_chunks SET created_at = 0", [])
+            .unwrap();
+        let cutoff = UNIX_EPOCH + Duration::from_secs(1);
+        assert_eq!(
+            store
+                .cleanup_retention(cutoff, true)
+                .unwrap()
+                .job_output_chunks,
+            1
+        );
+        assert_eq!(
+            store
+                .list_job_output_chunks_for_job("job-1")
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&first)
+        );
+        assert_eq!(
+            store
+                .cleanup_retention(cutoff, false)
+                .unwrap()
+                .job_output_chunks,
+            1
+        );
+        assert!(
+            store
+                .list_job_output_chunks_for_job("job-1")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.controller_delivery_identity().unwrap(), identity);
+        drop(store);
+
+        let reopened = SqliteStore::open(&path).unwrap();
+        let next = JobOutputChunk {
+            sequence: 1,
+            body: "after retention".into(),
+            ..first
+        };
+        reopened.append_job_output_chunk_record(&next).unwrap();
+        let next_id: i64 = reopened
+            .connection
+            .query_row("SELECT id FROM job_output_chunks", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            next_id > initial_id,
+            "a deleted output row ID must not be reused"
+        );
+        assert_eq!(
+            reopened.list_job_output_chunks_for_job("job-1").unwrap(),
+            [next]
+        );
+        assert_eq!(reopened.controller_delivery_identity().unwrap(), identity);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn duplicate_job_output_chunks_with_same_body_are_idempotent() {
         let store = SqliteStore::in_memory().unwrap();
         store.save_agent(agent()).unwrap();
@@ -18743,6 +24134,90 @@ mod tests {
                 if expected == checksum && actual != checksum
         ));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn local_artifact_store_put_replay_never_replaces_existing_object() {
+        let root = artifact_test_root("artifact-put-replay");
+        let mut store = LocalArtifactStore::new(&root).unwrap();
+        let id = ArtifactId::new("artifact-replay").unwrap();
+        let original = b"first rendered body".to_vec();
+        let original_checksum = test_artifact_checksum(&original);
+        let original_put = || ArtifactStorePut {
+            id: id.clone(),
+            retention_class: ArtifactRetentionClass::RenderedTemplate,
+            expected_checksum: original_checksum.clone(),
+            bytes: original.clone(),
+        };
+        store.put(original_put()).unwrap();
+        store.put(original_put()).unwrap();
+        let replacement = b"different rendered body".to_vec();
+        let error = store
+            .put(ArtifactStorePut {
+                id: id.clone(),
+                retention_class: ArtifactRetentionClass::RenderedTemplate,
+                expected_checksum: test_artifact_checksum(&replacement),
+                bytes: replacement,
+            })
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Domain(_)));
+        assert_eq!(
+            store
+                .get(&id, ArtifactRetentionClass::RenderedTemplate)
+                .unwrap(),
+            Some(original.clone())
+        );
+
+        let path = store
+            .object_path(&id, ArtifactRetentionClass::RenderedTemplate)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::write(&path, b"corrupt prior body").unwrap();
+        assert!(store.put(original_put()).is_err());
+        assert_eq!(
+            store
+                .get(&id, ArtifactRetentionClass::RenderedTemplate)
+                .unwrap(),
+            Some(b"corrupt prior body".to_vec())
+        );
+        let entries = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(entries, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_artifact_store_put_rejects_existing_symlink_without_temporary_leak() {
+        let root = artifact_test_root("artifact-put-symlink");
+        let mut store = LocalArtifactStore::new(&root).unwrap();
+        let class = ArtifactRetentionClass::RenderedTemplate;
+        let class_dir = store.ensure_class_dir(class).unwrap();
+        let id = ArtifactId::new("artifact-symlink").unwrap();
+        let object = store.object_path(&id, class).unwrap();
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, &object).unwrap();
+        let body = b"new rendered body".to_vec();
+        assert!(
+            store
+                .put(ArtifactStorePut {
+                    id,
+                    retention_class: class,
+                    expected_checksum: test_artifact_checksum(&body),
+                    bytes: body,
+                })
+                .is_err()
+        );
+        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+        assert_eq!(std::fs::read_dir(class_dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -19142,6 +24617,244 @@ mod tests {
     }
 
     #[test]
+    fn verification_resolution_recovery_lists_only_bounded_durable_successes() {
+        fn seed(
+            store: &SqliteStore,
+            suffix: &str,
+            verification_status: &str,
+            evidence_status: DriftStatus,
+            purpose: DriftCheckPurpose,
+            checked_at: u64,
+        ) {
+            let agent_id = format!("agent-{suffix}");
+            let mut fingerprint_bytes = [0_u8; 8];
+            for (target, source) in fingerprint_bytes.iter_mut().zip(suffix.as_bytes()) {
+                *target = *source;
+            }
+            store
+                .save_agent(agent_with_id(
+                    &agent_id,
+                    &agent_id,
+                    &format!("{:016x}", u64::from_be_bytes(fingerprint_bytes)),
+                ))
+                .unwrap();
+            let execution_job_id = format!("job-execution-{suffix}");
+            let verification_job_id = format!("job-verification-{suffix}");
+            for job_id in [&execution_job_id, &verification_job_id] {
+                store
+                    .save_job_record(&Job::new(
+                        JobId::new(job_id).unwrap(),
+                        fleet_domain::TaskRisk::Low,
+                        fleet_domain::ApprovalRequirement::NotRequired,
+                        Duration::from_secs(30),
+                    ))
+                    .unwrap();
+            }
+            let execution_task_id = format!("task-execution-{suffix}");
+            let verification_task_id = format!("task-verification-{suffix}");
+            store
+                .save_task_assignment_record(&task_envelope_for_job(
+                    &execution_job_id,
+                    &agent_id,
+                    &format!("nonce-execution-{suffix}"),
+                    &execution_task_id,
+                ))
+                .unwrap();
+            store
+                .save_task_assignment_record(&task_envelope_for_job(
+                    &verification_job_id,
+                    &agent_id,
+                    &format!("nonce-verification-{suffix}"),
+                    &verification_task_id,
+                ))
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE task_assignments SET status = ?2, completed_at = ?3 WHERE id = ?1",
+                    params![execution_task_id, "succeeded", 10_i64],
+                )
+                .unwrap();
+            if suffix != "b-valid" {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE task_assignments SET status = ?2, completed_at = ?3 WHERE id = ?1",
+                        params![verification_task_id, verification_status, 20_i64],
+                    )
+                    .unwrap();
+            }
+
+            let policy_id = format!("policy-{suffix}");
+            let mut origin =
+                remediation_request_record(&format!("remediation-{suffix}"), &agent_id, &policy_id);
+            origin.status = "succeeded_pending_verify".to_owned();
+            origin.job_id = Some(execution_job_id);
+            origin.policy_version = Some(1);
+            let drifted = DriftReport {
+                policy_name: policy_id.clone(),
+                status: DriftStatus::Drifted,
+                severity: DriftSeverity::for_status(DriftStatus::Drifted),
+                acknowledgement: DriftAcknowledgement::Open,
+                expected: "running".to_owned(),
+                actual: "stopped".to_owned(),
+            };
+            store
+                .insert_drift_report(
+                    &agent_id,
+                    &drifted,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                )
+                .unwrap();
+            origin.origin_drift_report_id =
+                Some(store.latest_drift_report(&agent_id).unwrap().unwrap().id);
+            store.save_remediation_request_record(&origin).unwrap();
+            store
+                .save_remediation_verification_job(
+                    &origin.id,
+                    &verification_job_id,
+                    SystemTime::UNIX_EPOCH,
+                )
+                .unwrap();
+            let evidence = DriftReport {
+                policy_name: policy_id.clone(),
+                status: evidence_status.clone(),
+                severity: DriftSeverity::for_status(evidence_status),
+                acknowledgement: DriftAcknowledgement::Open,
+                expected: "running".to_owned(),
+                actual: "running".to_owned(),
+            };
+            if suffix == "a-valid" {
+                assert!(
+                    store
+                        .list_pending_remediation_verification_resolution_records(100)
+                        .unwrap()
+                        .iter()
+                        .all(|candidate| candidate.verification_job_id != verification_job_id)
+                );
+            }
+            store
+                .insert_drift_report_with_provenance(
+                    &agent_id,
+                    &evidence,
+                    &DriftReportProvenance::verified(
+                        JobId::new(&verification_job_id).unwrap(),
+                        TaskId::new(&verification_task_id).unwrap(),
+                        if suffix == "wrong-policy" {
+                            "policy-unrelated"
+                        } else {
+                            &policy_id
+                        },
+                        1,
+                        purpose,
+                    ),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(checked_at),
+                )
+                .unwrap();
+            if suffix == "b-valid" {
+                assert!(
+                    store
+                        .list_pending_remediation_verification_resolution_records(100)
+                        .unwrap()
+                        .iter()
+                        .all(|candidate| candidate.verification_job_id != verification_job_id)
+                );
+                store
+                    .connection
+                    .execute(
+                        "UPDATE task_assignments SET status = ?2, completed_at = ?3 WHERE id = ?1",
+                        params![verification_task_id, verification_status, 20_i64],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let store = SqliteStore::in_memory().unwrap();
+        seed(
+            &store,
+            "a-valid",
+            "succeeded",
+            DriftStatus::Compliant,
+            DriftCheckPurpose::RemediationVerification,
+            30,
+        );
+        seed(
+            &store,
+            "b-valid",
+            "succeeded",
+            DriftStatus::Compliant,
+            DriftCheckPurpose::RemediationVerification,
+            30,
+        );
+        seed(
+            &store,
+            "c-valid",
+            "succeeded",
+            DriftStatus::Compliant,
+            DriftCheckPurpose::RemediationVerification,
+            30,
+        );
+        seed(
+            &store,
+            "failed-final",
+            "failed",
+            DriftStatus::Compliant,
+            DriftCheckPurpose::RemediationVerification,
+            30,
+        );
+        seed(
+            &store,
+            "stale-evidence",
+            "succeeded",
+            DriftStatus::Compliant,
+            DriftCheckPurpose::RemediationVerification,
+            5,
+        );
+        seed(
+            &store,
+            "wrong-purpose",
+            "succeeded",
+            DriftStatus::Compliant,
+            DriftCheckPurpose::Evaluation,
+            30,
+        );
+        seed(
+            &store,
+            "wrong-policy",
+            "succeeded",
+            DriftStatus::Compliant,
+            DriftCheckPurpose::RemediationVerification,
+            30,
+        );
+        seed(
+            &store,
+            "drifted-evidence",
+            "succeeded",
+            DriftStatus::Drifted,
+            DriftCheckPurpose::RemediationVerification,
+            30,
+        );
+
+        let candidates = store
+            .list_pending_remediation_verification_resolution_records(2)
+            .unwrap();
+
+        assert_eq!(
+            candidates,
+            vec![
+                RemediationVerificationResolutionCandidate {
+                    verification_job_id: "job-verification-a-valid".to_owned(),
+                    verification_task_id: "task-verification-a-valid".to_owned(),
+                },
+                RemediationVerificationResolutionCandidate {
+                    verification_job_id: "job-verification-b-valid".to_owned(),
+                    verification_task_id: "task-verification-b-valid".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn remediation_requests_list_in_deterministic_order_and_update_status() {
         let mut store = SqliteStore::in_memory().unwrap();
         store
@@ -19235,6 +24948,8 @@ mod tests {
         missing.job_id = Some("job-execution".to_owned());
         let input = AppRemediationExecutionPersistenceInput {
             task_id: "task-execution".to_owned(),
+            job_id: "job-execution".to_owned(),
+            agent_id: "agent-1".to_owned(),
             assignment_status: "started".to_owned(),
             assignment_last_error: None,
             occurred_at: SystemTime::UNIX_EPOCH,

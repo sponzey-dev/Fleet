@@ -26,3 +26,14 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio-rustls = { workspace = true }
 tungstenite = { workspace = true }
+zeroize = "1"
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs", "termios"] }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["pty"] }

@@ -7,6 +7,8 @@ INCLUDE_MANUAL=0
 INCLUDE_REGISTRY=0
 VERIFY_MANUAL_REBOOT=0
 RELEASE_PUBLIC_KEY="docs/release-signing-public.pem"
+FLEET_DATA_DIR="${FLEET_DATA_DIR:-/var/lib/fleet}"
+export FLEET_DATA_DIR
 
 usage() {
   echo "usage: $0 [--include-manual] [--include-registry] [--verify-manual-reboot] [--release-public-key <path>]" >&2
@@ -49,6 +51,24 @@ run() {
   "$@"
 }
 
+# Capture this smoke's output so a future CLI change cannot copy its one-time admin token into gate logs.
+run_mvp_smoke() {
+  echo "==> ./scripts/smoke_mvp.sh"
+  if ! MVP_SMOKE_OUTPUT="$(./scripts/smoke_mvp.sh 2>&1)"; then
+    if printf '%s\n' "$MVP_SMOKE_OUTPUT" | grep -qi 'admin token'; then
+      echo "MVP smoke failed; output suppressed because it contained an admin token" >&2
+    else
+      printf '%s\n' "$MVP_SMOKE_OUTPUT" >&2
+    fi
+    return 1
+  fi
+  if printf '%s\n' "$MVP_SMOKE_OUTPUT" | grep -qi 'admin token'; then
+    echo "MVP smoke output must not contain an admin token" >&2
+    return 1
+  fi
+  printf '%s\n' "$MVP_SMOKE_OUTPUT"
+}
+
 require_linux_root() {
   if [ "$(uname -s)" != "Linux" ]; then
     echo "manual release checks require Linux; current host is $(uname -s)" >&2
@@ -60,6 +80,17 @@ require_linux_root() {
   fi
 }
 
+if [ "$INCLUDE_MANUAL" -eq 1 ]; then
+  require_linux_root
+  if [ "${FLEET_MANUAL_DISPOSABLE_CONFIRMATION:-}" != "YES" ]; then
+    echo "set FLEET_MANUAL_DISPOSABLE_CONFIRMATION=YES only on a disposable Linux VM" >&2
+    exit 1
+  fi
+  run ./scripts/manual_systemd_reboot_smoke.sh preflight
+elif [ "$VERIFY_MANUAL_REBOOT" -eq 1 ]; then
+  require_linux_root
+fi
+
 run cargo fmt --all --check
 run cargo test --workspace
 run cargo clippy --workspace --all-targets -- -D warnings
@@ -69,7 +100,7 @@ run npm run typecheck --workspace web-admin
 run ./scripts/npm_local_pack_smoke.sh
 run ./scripts/npm_platform_local_install_smoke.sh
 run ./scripts/npm_demo_smoke.sh
-run ./scripts/smoke_mvp.sh
+run_mvp_smoke
 run ./scripts/smoke_immediate_dispatch.sh
 run ./scripts/smoke_remote_tls_loopback.sh
 run ./scripts/signature_verification_smoke.sh
@@ -96,6 +127,7 @@ else
 fi
 run ./scripts/hardening_audit.sh
 run node ./scripts/test_catalog_performance_gate.js
+run python3 -m unittest scripts/test_manual_task_recovery_smoke.py
 
 if [ "$INCLUDE_REGISTRY" -eq 1 ]; then
   run ./scripts/manual_npm_registry_smoke.sh
@@ -106,20 +138,21 @@ else
 fi
 
 if [ "$VERIFY_MANUAL_REBOOT" -eq 1 ]; then
-  require_linux_root
   run ./scripts/manual_systemd_reboot_smoke.sh verify
+  run python3 scripts/manual_task_recovery_smoke.py verify-reboot
 elif [ "$INCLUDE_MANUAL" -eq 1 ]; then
-  require_linux_root
   run ./scripts/manual_linux_nginx_runbook_smoke.sh
   run ./scripts/manual_systemd_reboot_smoke.sh install
-  echo "manual systemd install completed. Reboot, then run:"
-  echo "  sudo ./scripts/release_readiness_gate.sh --verify-manual-reboot"
+  echo "manual service install completed. Run these recovery checks before reboot:"
+  echo "  sudo env FLEET_MANUAL_DISPOSABLE_CONFIRMATION=YES FLEET_DATA_DIR=$FLEET_DATA_DIR python3 scripts/manual_task_recovery_smoke.py controller-restart"
+  echo "  sudo env FLEET_MANUAL_DISPOSABLE_CONFIRMATION=YES FLEET_DATA_DIR=$FLEET_DATA_DIR python3 scripts/manual_task_recovery_smoke.py agent-restart"
+  echo "  sudo env FLEET_MANUAL_DISPOSABLE_CONFIRMATION=YES FLEET_DATA_DIR=$FLEET_DATA_DIR python3 scripts/manual_task_recovery_smoke.py prepare-reboot"
+  echo "Then reboot manually and verify:"
+  echo "  sudo env FLEET_DATA_DIR=$FLEET_DATA_DIR ./scripts/release_readiness_gate.sh --verify-manual-reboot"
 else
   echo "manual checks skipped."
   echo "To include destructive Linux checks, run:"
-  echo "  sudo ./scripts/release_readiness_gate.sh --include-manual"
-  echo "After reboot from the manual install phase, run:"
-  echo "  sudo ./scripts/release_readiness_gate.sh --verify-manual-reboot"
+  echo "  sudo env FLEET_MANUAL_DISPOSABLE_CONFIRMATION=YES FLEET_DATA_DIR=/var/lib/fleet-task056 ./scripts/release_readiness_gate.sh --include-manual"
 fi
 
 echo "release readiness gate ok"

@@ -27,7 +27,7 @@
           <a href="#audit" data-route-link="audit"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h10v18H7zM9 8h6M9 12h6M9 16h4"/><path d="M5 6h2M5 10h2M5 14h2"/></svg>Audit</a>
           <a href="#settings" data-route-link="settings"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.2 2.2-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-3.2v-.2a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L6.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H4.8v-3.2H5a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 2.2-2.2.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6v-.2h3.2v.2a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1 2.2 2.2-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2V14H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>Settings</a>
         </nav>
-        <div class="sidebar-foot"><span><i aria-hidden="true"></i>Controller online</span><small>v0.0.18 · SQLite</small></div>
+        <div class="sidebar-foot"><span>Fleet Admin</span><small>Controller operations console</small></div>
       </aside>
     <main>
       <header class="topbar">
@@ -35,10 +35,16 @@
           <strong>Local controller</strong>
           <span class="transport-chip"><i aria-hidden="true"></i>HTTP · test only</span>
         </div>
+        <div id="personal-account-header" class="account-header" hidden>
+          <a id="current-admin-user" href="#settings"></a>
+          <button id="refresh-controller" type="button" class="account-secondary">Refresh data</button>
+          <button id="logout-admin" type="button" class="account-secondary">Sign out</button>
+        </div>
         <form id="admin-auth" class="auth-form" method="post" action="/admin/">
           <label class="sr-only" for="admin-token">Admin token</label>
           <input id="admin-token" name="admin-token" type="password" autocomplete="off" placeholder="Admin token" />
           <button type="submit">Refresh</button>
+          <button id="clear-admin-token" type="button">Clear token</button>
         </form>
       </header>
 
@@ -49,12 +55,49 @@
         HTTP transport is test-only. Tokens, commands, and operational data are not encrypted.
       </section>
 
+
+      <section id="personal-login" class="panel account-login" hidden aria-labelledby="login-title">
+        <div class="panel-heading"><div><h1 id="login-title">Sign in to Fleet</h1><p class="muted">Use the username and password set up for this Controller.</p></div></div>
+        <form id="personal-login-form" class="account-form" method="post" action="/admin/">
+          <div class="form-field"><label for="login-username">Username</label><input id="login-username" name="username" autocomplete="username" required maxlength="64" /></div>
+          <div class="form-field"><label for="login-password">Password</label><input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="2048" /></div>
+          <button type="submit">Sign in</button>
+        </form>
+        <p class="muted">A login lasts 8 hours. Refreshing data does not extend it.</p>
+        <button id="open-password-setup" type="button" class="account-secondary">Set up or reset a password</button>
+        <form id="password-setup-form" class="account-form" method="post" action="/admin/" hidden>
+          <p class="muted">Ask an owner for your username and one-time code. Codes expire after 15 minutes.</p>
+          <div class="form-field"><label for="setup-code">One-time setup or reset code</label><input id="setup-code" name="code" type="password" autocomplete="off" required /></div>
+          <div class="form-field"><label for="setup-password">New password</label><input id="setup-password" name="new_password" type="password" autocomplete="new-password" required minlength="15" maxlength="2048" aria-describedby="setup-password-help" /><small id="setup-password-help">Use at least 15 characters. A long, uncommon passphrase is easier to remember.</small></div>
+          <button type="submit">Set password</button>
+          <button id="close-password-setup" type="button" class="account-secondary">Back to sign in</button>
+        </form>
+      </section>
+      <section id="local-owner-required" class="panel account-login" hidden>
+        <h1>Set up the first owner</h1>
+        <p>The Controller needs a local owner. On the Controller server, stop Fleet and run <code>fleet controller admin init-owner --data-dir &lt;controller data directory&gt; --username &lt;your username&gt;</code>, then start the Controller again.</p>
+      </section>
+      <section id="account-error" class="status error" role="alert" hidden></section>
+      <section id="once-secret-panel" class="panel once-secret-panel" hidden aria-labelledby="once-secret-title">
+        <h2 id="once-secret-title">Shown once</h2>
+        <p id="once-secret-help" class="muted"></p>
+        <label for="once-secret">One-time value</label>
+        <input id="once-secret" type="password" readonly autocomplete="off" aria-describedby="once-secret-help" />
+        <div class="panel-actions">
+          <button id="reveal-once-secret" type="button" class="account-secondary" aria-pressed="false">Show value</button>
+          <button id="copy-once-secret" type="button" class="account-secondary">Copy value</button>
+          <button id="dismiss-once-secret" type="button" class="account-secondary">Done — clear value</button>
+        </div>
+        <p id="once-secret-feedback" class="muted" role="status" aria-live="polite"></p>
+      </section>
+
+      <p id="job-permission-note" class="status" hidden>Viewer accounts can inspect jobs. Running, approving or canceling jobs requires operator, admin or owner access.</p>
       <header class="page-heading">
         <h1 id="page-title">Overview</h1>
         <p id="page-subtitle">Live operational state from the Controller — no inferred health.</p>
       </header>
 
-      <section class="layout">
+      <section id="admin-workspace" class="layout">
         <article class="panel overview-panel" data-route="overview" data-route-focus="overview" tabindex="-1">
           <div id="overview-summary" class="overview-summary empty">Authenticate to load the current fleet summary.</div>
         </article>
@@ -71,7 +114,62 @@
           <div id="agent-detail" class="detail-panel empty">Select an agent.</div>
         </article>
 
-        <article class="panel token-panel" data-route="settings" data-route-focus="settings" tabindex="-1">
+
+
+        <nav id="account-settings-tabs" class="panel settings-tabs" data-route="settings" data-route-focus="settings" tabindex="-1" role="tablist" aria-label="Settings sections" hidden>
+          <button id="settings-account-tab" type="button" class="account-secondary" role="tab" aria-controls="personal-account-panel" aria-selected="true" tabindex="0" data-settings-tab="account">My account</button>
+          <button id="settings-people-tab" type="button" class="account-secondary" role="tab" aria-controls="owner-accounts-panel" aria-selected="false" tabindex="-1" data-settings-tab="people">People</button>
+          <button id="settings-controller-tab" type="button" class="account-secondary" role="tab" aria-controls="controller-settings-panel" aria-selected="false" tabindex="-1" data-settings-tab="controller">Controller</button>
+        </nav>
+
+        <article id="personal-account-panel" class="panel account-panel" role="tabpanel" aria-labelledby="settings-account-tab" data-route="settings" hidden>
+          <div class="panel-heading"><div><h2>Your account</h2><p id="account-profile" class="muted"></p></div></div>
+          <div class="account-grid">
+            <form id="own-password-form" class="account-form" method="post" action="/admin/">
+              <h3>Change your password</h3>
+              <p class="muted">This signs you out everywhere and revokes your personal tokens. Running Agent jobs continue.</p>
+              <div class="form-field"><label for="own-current-password">Your current password</label><input id="own-current-password" name="current_password" type="password" autocomplete="current-password" required /></div>
+              <div class="form-field"><label for="own-new-password">New password</label><input id="own-new-password" name="new_password" type="password" autocomplete="new-password" required minlength="15" maxlength="2048" /></div>
+              <button type="submit" class="account-secondary">Change password and sign out</button>
+            </form>
+            <form id="personal-token-form" class="account-form" method="post" action="/admin/">
+              <h3>Connect CLI or API</h3><p class="muted">Create a personal token for this Controller. It expires after 30 days and is shown once.</p>
+              <div class="form-field"><label for="personal-token-label">Token label (optional)</label><input id="personal-token-label" name="label" autocomplete="off" maxlength="256" placeholder="My laptop" /></div>
+              <div class="form-field"><label for="personal-token-password">Your current password</label><input id="personal-token-password" name="current_password" type="password" autocomplete="current-password" required /></div>
+              <button type="submit" class="account-secondary">Create personal token</button>
+            </form>
+          </div>
+          <div class="panel-heading"><h3>Your personal tokens</h3><button id="refresh-personal-tokens" type="button" class="account-secondary">Refresh tokens</button></div>
+          <div id="personal-tokens-list" class="list" aria-live="polite">Refresh to load your tokens. Secret values cannot be retrieved.</div>
+          <div class="panel-actions"><button id="first-personal-tokens" type="button" class="account-secondary">First page</button><button id="next-personal-tokens" type="button" class="account-secondary" disabled>Next page</button></div>
+        </article>
+        <article id="owner-accounts-panel" class="panel account-panel" role="tabpanel" aria-labelledby="settings-people-tab" data-route="settings" hidden>
+          <div class="panel-heading"><div><h2>People</h2><p class="muted">Owner only. Each person signs in with a separate account.</p></div><button id="refresh-admin-users" type="button" class="account-secondary">Refresh accounts</button></div>
+          <div id="admin-users-list" class="list" aria-live="polite">Refresh to load accounts.</div>
+          <div class="panel-actions"><button id="first-admin-users" type="button" class="account-secondary">First page</button><button id="next-admin-users" type="button" class="account-secondary" disabled>Next page</button></div>
+          <div class="account-grid">
+            <form id="create-admin-user-form" class="account-form" method="post" action="/admin/">
+              <h3>Create an account</h3>
+              <div class="form-field"><label for="new-admin-username">New username</label><input id="new-admin-username" name="username" required minlength="3" maxlength="64" autocomplete="off" /><small>3–64 ASCII letters, numbers, dot, dash or underscore. No spaces.</small></div>
+              <div class="form-field"><label for="new-admin-name">Display name</label><input id="new-admin-name" name="display_name" required maxlength="240" autocomplete="off" aria-describedby="new-admin-name-help" /><small id="new-admin-name-help">Up to 120 characters.</small></div>
+              <div class="form-field"><label for="new-admin-role">Role</label><select id="new-admin-role" name="role"><option value="operator">Operator</option><option value="viewer">Viewer</option><option value="admin">Admin</option><option value="owner">Owner</option></select></div>
+              <div class="form-field"><label for="create-admin-password">Your current password</label><input id="create-admin-password" name="current_password" type="password" autocomplete="current-password" required /></div>
+              <button type="submit" class="account-secondary">Create account and setup code</button>
+            </form>
+            <form id="edit-admin-user-form" class="account-form" method="post" action="/admin/" hidden>
+              <h3>Edit selected account</h3><p id="selected-admin-user" class="muted"></p>
+              <div class="form-field"><label for="edit-admin-name">Display name</label><input id="edit-admin-name" name="display_name" required maxlength="240" autocomplete="off" aria-describedby="edit-admin-name-help" /><small id="edit-admin-name-help">Up to 120 characters.</small></div>
+              <div class="form-field"><label for="edit-admin-role">Role</label><select id="edit-admin-role" name="role"><option value="operator">Operator</option><option value="viewer">Viewer</option><option value="admin">Admin</option><option value="owner">Owner</option></select></div>
+              <p class="muted">Role changes, disabling and password reset revoke this person's existing logins and personal tokens. Running jobs continue. The last owner is protected.</p>
+              <div class="form-field"><label for="edit-admin-password">Your current password</label><input id="edit-admin-password" name="current_password" type="password" autocomplete="current-password" required /></div>
+              <button type="submit" class="account-secondary">Save name and role</button>
+              <div class="panel-actions"><button id="reset-admin-password" type="button" class="account-secondary">Reset password</button><button id="disable-admin-user" type="button" class="account-danger">Disable account</button></div>
+            </form>
+          </div>
+        </article>
+
+        <section id="controller-settings-panel" class="controller-settings-group" data-route="settings" role="tabpanel" aria-labelledby="settings-controller-tab" hidden>
+        <article class="panel token-panel" data-route="settings">
           <div class="panel-heading">
             <h2>Enrollment</h2>
             <span class="muted">One-time agent tokens</span>
@@ -96,6 +194,7 @@
               <button id="refresh-signing-rotation" type="button">Refresh</button>
             </div>
           </div>
+          <p id="controller-access-note" class="muted" hidden>Your role can read signing status. Only owners and admins may change Controller trust or manage Agent enrollment.</p>
           <div id="signing-rotation-status" class="signing-grid empty">No signing status loaded.</div>
           <form id="staged-trust-bundle-form" class="signing-form">
             <div class="form-field form-field-full"><label for="staged-previous-public-key-path">Previous public key path</label><input id="staged-previous-public-key-path" name="previous-public-key-path" autocomplete="off" placeholder="/var/lib/fleet/controller/controller_public.key.bak" /></div>
@@ -146,6 +245,8 @@
           <div id="drift-history" class="list compact-list empty">Select an agent.</div>
         </article>
 
+        </section>
+
         <article class="panel job-panel" data-route="run" data-route-focus="run" tabindex="-1">
           <div class="panel-heading">
             <h2>Run</h2>
@@ -172,9 +273,8 @@
             </label>
             <button type="submit">Run</button>
           </form>
-          <div id="job-targets" class="table-view empty">Run a command or select a job.</div>
-          <div id="job-artifacts" class="artifact-list empty">No rendered artifacts.</div>
-          <pre id="job-output" class="snapshot output-viewer">Run a command or select a job to view output.</pre>
+          <p id="command-submission-status" class="muted" role="status" aria-live="polite">No submission yet.</p>
+          <button id="command-check-submission" type="button" hidden>Check stored Job</button>
         </article>
 
         <article class="panel approval-panel" data-route="run runbooks">
@@ -219,9 +319,10 @@
             <div class="form-field form-field-full"><label for="runbook-document">Runbook YAML</label><textarea id="runbook-document" name="runbook-document" rows="9">apiVersion: fleet.sponzey.dev/v1alpha1
 kind: Runbook
 name: quick-inventory
+selector: role=web
 steps:
   - id: collect-facts
-    facts.collect: {}
+    facts.collect:
 </textarea></div>
             <div class="form-field"><label for="runbook-selector">Target selector</label><input id="runbook-selector" name="selector" autocomplete="off" placeholder="role=web" /></div>
             <button id="preview-runbook-targets" type="button">Preview targets</button>
@@ -232,7 +333,33 @@ steps:
             </label>
             <button type="submit">Create runbook job</button>
           </form>
+          <p id="runbook-submission-status" class="muted" role="status" aria-live="polite">No submission yet.</p>
+          <button id="runbook-check-submission" type="button" hidden>Check stored Job</button>
           <pre id="runbook-result" class="snapshot output-viewer">Create a runbook job to view status here.</pre>
+        </article>
+
+        <article class="panel job-panel job-result-panel" data-route="run runbooks" aria-labelledby="job-result-title">
+          <div class="panel-heading">
+            <h2 id="job-result-title">Selected job</h2>
+            <span class="muted">Server results · observation does not cancel execution</span>
+          </div>
+          <pre id="job-catalog-provenance" class="catalog-job-reference job-provenance">Select a Job to inspect its document provenance.</pre>
+          <div class="job-observation-controls">
+            <div class="job-observation-meta">
+              <p id="job-observation-status" role="status" aria-live="polite" aria-atomic="true">Select a job to observe.</p>
+              <p id="job-last-updated" class="muted">Last successful update: Not yet.</p>
+            </div>
+            <button id="pause-job-observation" type="button" aria-controls="job-output" disabled>Pause observation</button>
+            <button id="resume-job-observation" type="button" aria-controls="job-output" disabled>Resume observation</button>
+          </div>
+          <div id="job-targets" class="table-view empty" tabindex="0" role="region" aria-label="Selected job assignments">Run a command or select a job.</div>
+          <div id="job-artifacts" class="artifact-list empty">No rendered artifacts.</div>
+          <div class="job-output-controls" aria-label="Stored output navigation">
+            <p id="job-output-info" class="muted" aria-live="polite" aria-atomic="true">Select a job to read stored output.</p>
+            <button id="browse-job-output" type="button" aria-controls="job-output" disabled>Browse stored history</button>
+            <button id="next-job-output-page" type="button" aria-controls="job-output" disabled>Next page</button>
+          </div>
+          <pre id="job-output" class="snapshot output-viewer" tabindex="0" role="region" aria-label="Selected job output">Run a command or select a job to view output.</pre>
         </article>
 
         <article class="panel catalog-panel" data-route="runbooks policies">
@@ -243,17 +370,39 @@ steps:
           <div class="catalog-browser">
             <section class="catalog-section" aria-labelledby="catalog-sources-title">
               <h3 id="catalog-sources-title">Sources</h3>
-              <div id="catalog-list" class="list empty" aria-live="polite">Authenticate to load catalog sources.</div>
+              <p id="catalog-sources-status" class="muted" role="status" aria-live="polite">Authenticate to load catalog sources.</p>
+              <div id="catalog-list" class="list empty" tabindex="0" role="region" aria-label="Catalog sources">Authenticate to load catalog sources.</div>
+              <div class="catalog-pagination"><button id="catalog-sources-first" type="button" aria-label="First sources page" disabled>First page</button><button id="catalog-sources-next" type="button" aria-label="Next sources page" disabled>Next page</button><button id="catalog-sources-retry" type="button" aria-label="Retry sources page" disabled>Retry</button></div>
             </section>
             <section class="catalog-section" aria-labelledby="catalog-revisions-title">
               <h3 id="catalog-revisions-title">Revisions</h3>
-              <div id="catalog-revisions" class="list empty" aria-live="polite">Choose a source to load its revisions.</div>
+              <p id="catalog-revisions-status" class="muted" role="status" aria-live="polite">Choose a source to load its revisions.</p>
+              <div id="catalog-revisions" class="list empty" tabindex="0" role="region" aria-label="Catalog revisions">Choose a source to load its revisions.</div>
+              <div class="catalog-pagination"><button id="catalog-revisions-first" type="button" aria-label="First revisions page" disabled>First page</button><button id="catalog-revisions-next" type="button" aria-label="Next revisions page" disabled>Next page</button><button id="catalog-revisions-retry" type="button" aria-label="Retry revisions page" disabled>Retry</button></div>
             </section>
             <section class="catalog-section" aria-labelledby="catalog-documents-title">
               <h3 id="catalog-documents-title">Documents</h3>
-              <div id="catalog-documents" class="list empty" aria-live="polite">Choose a revision to load document metadata.</div>
+              <p id="catalog-documents-status" class="muted" role="status" aria-live="polite">Choose a revision to load document metadata.</p>
+              <div id="catalog-documents" class="list empty" tabindex="0" role="region" aria-label="Catalog documents">Choose a revision to load document metadata.</div>
+              <div class="catalog-pagination"><button id="catalog-documents-first" type="button" aria-label="First documents page" disabled>First page</button><button id="catalog-documents-next" type="button" aria-label="Next documents page" disabled>Next page</button><button id="catalog-documents-retry" type="button" aria-label="Retry documents page" disabled>Retry</button></div>
             </section>
           </div>
+          <p id="catalog-selection" class="catalog-selection muted" aria-live="polite">No catalog selection.</p>
+          <section id="catalog-job-panel" class="catalog-execution" data-route="runbooks" aria-labelledby="catalog-job-title">
+            <div class="panel-heading"><h3 id="catalog-job-title">Run from this catalog</h3><span class="muted">Review → create → approve → inspect results</span></div>
+            <p class="muted">Select a Runbook in the active revision above. Review its document and exact Agent targets before creating a Job.</p>
+            <pre id="catalog-job-reference" class="catalog-job-reference">No executable catalog selection.</pre>
+            <div class="catalog-job-selection">
+              <div class="form-field"><label for="catalog-job-selector">Target selector</label><input id="catalog-job-selector" placeholder="role=web,env=test" autocomplete="off" aria-describedby="catalog-job-target-help" /><small id="catalog-job-target-help">Enter the Agents you intend to target. Creation uses the exact IDs shown in the review.</small></div>
+              <button id="catalog-job-review" type="button" disabled>Review document and targets</button>
+            </div>
+            <details class="catalog-job-document"><summary>Review stored Runbook</summary><pre id="catalog-job-body" class="snapshot" tabindex="0" role="region" aria-label="Selected catalog Runbook document"></pre></details>
+            <div id="catalog-job-preview" class="catalog-job-targets" tabindex="0" role="region" aria-label="Reviewed catalog Job targets"><p class="muted">Review targets to see the exact Agent IDs this Job will use.</p></div>
+            <label class="risk-confirmation"><input id="catalog-job-confirm" type="checkbox" disabled />I reviewed this document and these Agent targets. Create a signed Job for approval.</label>
+            <div class="button-row"><button id="catalog-job-submit" type="button" disabled>Create catalog Job</button><button id="catalog-job-check" type="button" hidden disabled>Check stored Job ID</button><button id="catalog-job-retry" type="button" hidden disabled>Retry the same Job ID</button><button id="catalog-job-reset" type="button" hidden>Prepare another Job</button></div>
+            <p id="catalog-job-status" role="status" aria-live="polite" tabindex="-1">Choose an active, ready Runbook and enter a target selector.</p>
+          </section>
+          <details class="catalog-management"><summary>Manage catalog sources and revisions</summary>
           <form id="catalog-action-form" class="catalog-form">
             <div class="form-field"><label for="catalog-source-id">Source ID</label><input id="catalog-source-id" name="source-id" required placeholder="public-operations" /></div>
             <div class="form-field"><label for="catalog-operation-id">Sync operation ID</label><input id="catalog-operation-id" name="operation-id" placeholder="sync-001" /></div>
@@ -262,12 +411,24 @@ steps:
             <div class="form-field"><label for="catalog-commit">Ready commit (activation only)</label><input id="catalog-commit" name="commit" placeholder="40 or 64 lowercase hex" /></div>
             <div class="button-row"><button name="catalog-action" value="register" type="submit">Register source</button><button name="catalog-action" value="sync" type="submit">Start sync</button><button name="catalog-action" value="activate" type="submit">Activate ready revision</button></div>
           </form>
+          <section class="catalog-operation" aria-label="Catalog sync observation">
+            <p id="catalog-action-status" role="status" aria-live="polite" tabindex="-1">No Catalog action submitted.</p>
+            <p id="catalog-operation-status" class="muted">No verified sync operation loaded.</p>
+            <div class="button-row"><button id="check-catalog-sync" type="button">Check entered operation</button><button id="stop-catalog-sync" type="button" disabled>Stop observing</button><button id="resume-catalog-sync" type="button" disabled>Check again</button></div>
+            <p class="muted">Status reads stop after three minutes. A stopped observation does not stop the Controller operation. Sync never activates or executes a revision.</p>
+          </section>
+          </details>
+          <dialog id="catalog-activation-dialog" aria-labelledby="catalog-activation-title" aria-describedby="catalog-activation-details">
+            <h2 id="catalog-activation-title">Activate this ready revision?</h2>
+            <p id="catalog-activation-details"></p>
+            <div class="button-row"><button id="cancel-catalog-activation" type="button" autofocus>Cancel</button><button id="confirm-catalog-activation" type="button">Activate exact revision</button></div>
+          </dialog>
         </article>
 
-        <article class="panel" data-route="run">
+        <article class="panel job-history-panel" data-route="run runbooks">
           <div class="panel-heading">
             <h2>Jobs</h2>
-            <span class="muted">Recent command history</span>
+            <span class="muted">History snapshot. Refresh to update; select a job for its current result.</span>
           </div>
           <div id="jobs-list" class="list empty">No jobs loaded.</div>
         </article>

@@ -16,8 +16,11 @@ if rg -n 'std::env::set_var|std::env::remove_var' crates >/tmp/fleet-hardening-e
   fail "production code must not mutate process environment"
 fi
 
+# These additional reads belong to the inspected #[test]/ignored child-process entrypoints.
+# Scope exceptions to their exact source locations and variable names, not a global TEST prefix.
 if rg -n 'std::env::var|std::env::vars|std::env::var_os|std::env::vars_os' crates \
-  | grep -vE 'FLEET_TEST_(POSTGRES_URL|PUBLIC_CATALOG_URL)' >/tmp/fleet-hardening-env-read.txt; then
+  | grep -vE 'FLEET_TEST_(POSTGRES_URL|PUBLIC_CATALOG_(URL|REFERENCE)|JOURNAL_CRASH_(DIR|PHASE))' \
+  | grep -vE '^crates/fleet-cli/src/controller_snapshot_tests\.rs:[0-9]+:.*std::env::var(_os)?\("FLEET_TEST_RESTORE_(ROOT|AFTER)"\)|^crates/fleet-core/src/controller_data\.rs:[0-9]+:.*std::env::var(_os)?\("FLEET_CORE_LEASE_PROBE_(DIR|EXPECT)"\)' >/tmp/fleet-hardening-env-read.txt; then
   cat /tmp/fleet-hardening-env-read.txt >&2
   fail "production code must not read environment outside bootstrap settings"
 fi

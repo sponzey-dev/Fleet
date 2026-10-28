@@ -44,7 +44,7 @@ for (const endpoint of schema.endpoints) {
   );
 
   const args = pathArguments(endpoint.path);
-  if (endpoint.method === "POST") {
+  if (["POST", "PATCH"].includes(endpoint.method)) {
     args.push({});
   }
   await client[endpoint.name](...args);
@@ -54,9 +54,14 @@ for (const [index, endpoint] of schema.endpoints.entries()) {
   const call = calls[index];
   assert(call, `API client did not call ${endpoint.name}`);
   assert(!call.path.includes("{"), `${endpoint.name} must replace path parameters`);
-  assert(call.options.headers.Authorization === "Bearer typecheck-token", "client must attach bearer token");
-  if (endpoint.method === "POST") {
-    assert(call.options.method === "POST", `${endpoint.name} must use POST`);
+  if (["public", "cookie"].includes(endpoint.authentication)) {
+    assert(!Object.hasOwn(call.options.headers, "Authorization"), "cookie/public auth effects must not mix a bearer");
+    assert(call.options.credentials === "same-origin" && call.options.cache === "no-store", "human auth effects must use private same-origin reads");
+  } else {
+    assert(call.options.headers.Authorization === "Bearer typecheck-token", "client must attach bearer token");
+  }
+  if (["POST", "PATCH"].includes(endpoint.method)) {
+    assert(call.options.method === endpoint.method, `${endpoint.name} must use ${endpoint.method}`);
     assert(typeof call.options.body === "string", `${endpoint.name} must JSON encode request bodies`);
   } else if (endpoint.method === "DELETE") {
     assert(call.options.method === "DELETE", `${endpoint.name} must use DELETE`);

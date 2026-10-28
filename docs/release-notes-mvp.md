@@ -2,6 +2,133 @@
 
 This document captures the current post-MVP state and known limits.
 
+## Unreleased personal administrator accounts
+
+- SQLite schema 28 and the feature-gated Postgres adapter add human accounts, credential records,
+  a separate human epoch and atomic account/mode/audit transactions. Previous-schema history is
+  preserved; Controller Postgres readiness remains unsupported.
+- `fleet controller admin init-owner` now composes local OS authority, hidden bounded TTY input
+  or explicit `--password-stdin`, the fixed-profile bounded password worker, and atomic first-owner
+  activation/shared-token cutover. Init/owner/start accept the same custom SQLite `--db` selection.
+- Local `controller admin recover-owner --username <login-name>` uses the same authority/input
+  boundary to replace an existing person's password, restore owner access and revoke only their
+  credentials. Original signing-pair validation and missing-key preservation precede password input.
+- Controller data directories now require the running OS user and mode `0700`; runtime and local
+  setup share an exclusive lease. Stop older binaries explicitly before upgrade. Personal/restored
+  initialization retains the original signing identity; missing keys require backup recovery.
+- Backup/dry-run inspect SQLite without source migration and validate the retained signing pair. New archives use 0600 files and never overwrite an existing output. Actual restore holds the local lease, invalidates all human credentials and rotates the independent Agent delivery epoch in private staging before atomic directory exchange. Installation and later durability/cleanup warnings are distinct. Fresh official-binary recovery/restore and safety-backup rollback rehearsal pass on the owned marked fixture; scoped two-user HTTPS/API/CLI/Linux-Agent acceptance has passed.
+- Application login now issues fixed eight-hour sessions; PAT minting requires current password proof and a current actor at commit. PATs expire after 30 days, metadata is bounded/self-scoped and excludes proof material, logout/revoke affect only the selected own credential, and retired lookup cleanup is bounded at128/purpose. Per-user/global physical-row quotas and SQLite/Postgres concurrency/audit rollback contracts pass. HTTP login/session/logout, setup and purpose-specific cookie/PAT authentication are now connected through a bounded Controller adapter; business commit guards and the personal Admin/CLI flows are connected.
+- Owner-only account collection/detail metadata reads now use bounded keyset pages and scoped opaque cursors; pending/disabled accounts remain visible to owner. Valid admin/operator/viewer callers are forbidden, and malformed rows fail without partial metadata. These reads do not clean or renew credentials. Owner create/change/reset now require same-request password proof and atomic current-owner/last-owner/audit checks; target credentials are revoked and one-time grants returned only once. Audit rollback, cancelled/revoked late proofs and scoped HTTPS self-reset are tested. Own password replacement/PAT issuance now pass actual HTTP for all four roles, per-user token quota/expired lookup reclamation and private audit rollback; the authenticated credential alone determines the subject. Own PAT metadata/selected revocation are also connected: strict scoped paging, proof-free projection, foreign-row isolation, no GET cleanup/renewal, uniform404 including retained revoked rows, self-caller revocation and audit rollback pass actual HTTP. Name/role changes preserve immutable audit actors.
+- Scoped two-user HTTPS browser/API/CLI acceptance, Linux execution during credential revocation,
+  local recovery/restore and bounded login-load safety pass. OIDC, project isolation, a real
+  SecretProvider, full capacity/SLA and release publication remain separate.
+- Recurring heartbeats now update stored receipt time without clearing degraded health or producing
+  unexpected-message audit noise. Idle dispatch checks use FieldDebug; Product logs retain actual
+  dispatch/failure effects. CLI demo reads wait for committed output with a bounded deadline and never
+  resubmit the Job.
+
+## Unreleased execution-reliability work
+
+- Darwin/Linux command runners now drain bounded output while checking cancel/timeout. Output callback
+  failure cleans up the newly owned process group; inherited pipes cannot force an unbounded reader join.
+  The leader stays unreaped until group cleanup to avoid recycled-PID signalling. Already-completed
+  host effects and daemons that escape the group are not rolled back.
+- Agent-local journal schema v4 persists exact reports, including DriftEvidence, and single-active
+  execution admission/start intent, reserves final-result capacity, and atomically commits final
+  reports with execution completion. Schema v4 migrates v3 while preserving report bytes; earlier
+  additive migrations preserve pending rows, with unsafe active v2 StartIntent upgrades rejected.
+  A bounded single-owner worker keeps blocking journal I/O off the session path. Persistent Command
+  and no-artifact Runbook execution admission/restart recovery, TaskAck/TaskStarted/TaskRejected,
+  output/final replay, and signed-receipt cleanup are connected. Persistent DriftCheck evidence and
+  its terminal TaskResult are separate journaled/replayed reports with separate receipts; an evidence
+  receipt confirms evidence storage, not task completion.
+- The v2 receipt shape/canonical signing preimage and Agent-side Ed25519/trust/ownership verifier
+  are used by persistent lifecycle, output, final-result, and DriftEvidence reports. The active v2 handshake transfers
+  Controller namespace/epoch; the journal binds namespace plus Agent ID and checks receipts against
+  the current session epoch.
+- Active v2 `WireMessage` now carries bounded `task_report`/`report_receipt` payloads and validates
+  version, body digest/size, receipt shape and outer Agent ownership before dispatch.
+- The authenticated Controller WebSocket handles SQLite lifecycle, `drift_evidence`, `output`, and
+  supported `final_result` reports for Command, Runbook, and persistent DriftCheck, including
+  artifact-bearing persistent Runbook finals: it validates authenticated ownership, commits each
+  effect and inbox marker atomically, persists a signed
+  `stored` receipt, then queues it through the session's single writer. Same-key/same-body retry
+  replays the exact receipt without duplicating output; changed body or owner mismatch is rejected
+  and Security-audited. Postgres report handling fails closed.
+- Controller schema v25 persists and replays signed receipt bytes for an exact committed inbox
+  key/digest across reopen; schema v26 adds the `drift_evidence` class while preserving inbox rows
+  and receipt references. Stale epoch, signer change and pending/conflicting rows fail closed.
+  Persistent Command and no-artifact Runbook stdout/stderr now use the journal and receipt path. The strict final report
+  includes counts of locally committed stdout/stderr chunks and a truncation flag; SQLite verifies
+  exact `[0, count)` storage before final effects or receipt, and a truncated result cannot succeed.
+  The Job audit keeps only counts and truncation, never output bytes. This proves delivery of the
+  Agent-journaled prefix, not capture of every byte emitted by task execution. Artifact-bearing
+  Runbook finals now use a strict v2 Controller effect/receipt transaction. SQLite also retries
+  already-staged pending final reports before listener bind and every 30 seconds in batches bounded
+  to 100 rows/8 MiB. It revalidates exact body and owner, commits effects before receipt persistence,
+  and queues receipts through the active session's single writer. Output gaps, corrupt/unsupported
+  reports, and terminal assignments remain pending and fail closed. Artifact final reports and
+  output are not Agent-journaled, so a pre-inbox disconnect remains unrecoverable. A separate
+  bounded scan retries receipt persistence for already-committed finals using only key/digest and
+  never repeats effects. The Controller performs bounded
+  SQLite G2 recovery before listener bind and every 30 seconds, atomically marking overdue active
+  assignments failed with `execution_outcome_unknown`; it never retries them. Postgres startup is
+  rejected until that backend implements the recovery contract.
+- Staged drift-check verification final results can atomically commit Assignment, Job, audit and
+  inbox marker without claiming that a separate evidence report arrived. Persistent DriftEvidence
+  is now journaled by the Agent and live on the authenticated v2 path. The Controller validates
+  Controller-stored policy provenance and atomically commits the correlated drift row, required
+  redacted audit, eligible remediation proposal/audit, and inbox marker before issuing its signed
+  receipt. Exact retries replay the receipt without repeating effects. Either verification final or
+  evidence can arrive first; a bounded pre-listener scan resolves only matching successful-final/fresh-
+  compliant evidence pairs and the matching remediation origin. DriftCheck terminal `TaskResult` is a
+  separate durable final-result report; its receipt commits the terminal effect, while the evidence
+  receipt alone is never completion proof.
+- Controller schema v23 persists a delivery namespace independent of signing keys and rotates its
+  store epoch during actual backup restore. The Agent binds the local journal to the namespace and
+  Agent ID and validates receipts against the current session epoch. It does not recover post-backup
+  results already ACKed and removed from an Agent; cross-epoch reconciliation remains unimplemented.
+- Controller incoming-report Application admission validates authenticated owner/namespace and
+  encoded-body limit before repository staging. SQLite durably stages pending-effects task reports
+  with duplicate/conflict/assignment-owner/capacity checks. Staging by itself never issues a receipt.
+- SQLite atomically applies supported staged report effects and their inbox committed markers,
+  preserving digest tombstones after output retention. Lifecycle, DriftEvidence, output, and
+  supported Command/Runbook/DriftCheck final-result reports (including artifact-bearing Runbook
+  finals) are live on the authenticated v2 session and emit persisted signed receipts after commit.
+  Artifact bodies are size/checksum validated and put immutably before the SQLite transaction;
+  exact retry is safe, but a crash can leave a file orphan. Postgres report runtime remains
+  unsupported and fails closed.
+- SQLite can now read bounded pending final-result reports after reopen and reject a changed
+  body/digest without exposing the body. A bounded startup pass and periodic Controller worker
+  reapply supported pending final effects, persist receipts only after commit, and queue receipts
+  through an active session's single writer. A second bounded scan recovers receipt persistence for
+  already-committed finals from key/digest without repeating their effects. Corrupt rows, owner
+  mismatch, output gaps, unsupported effects, and terminal Assignments remain pending and fail closed.
+- SQLite can atomically commit a staged command/runbook final's prepared artifact metadata,
+  Assignment, Job aggregate, Job audit, and inbox marker. Failed metadata/marker/audit writes roll
+  back DB effects; a pending inbox report survives reopen for idempotent file-put and DB retry.
+  Prepared remediation execution status/Policy audit can join the same transaction; its persisted
+  `succeeded_pending_verify` state is recovered into one verification Job after reopen.
+  DriftEvidence effects and eligible proposal/audits also commit with the inbox marker atomically.
+  Artifact-bearing Runbook final effects are now connected to the live v2 handler and bounded
+  SQLite pending-inbox recovery. Agent-side artifact report replay, Postgres report recovery,
+  remediation final-result follow-up, and file/DB orphan cleanup remain pending.
+- Local artifact body `put` now preserves the first object for an ID/class across retries, rejects
+  changed/corrupt prior bodies, and publishes a synced owner-only temporary file without clobbering
+  an existing object. DB/file recovery and leftover temporary cleanup remain pending.
+- Direct one-shot TaskAck/TaskRejected/TaskStarted/TaskResult transitions reject an authenticated
+  Agent or Job that does not own the Assignment and record a Security audit. Persistent TaskAck,
+  TaskStarted, and pre-execution TaskRejected use the v2 owner-bound journal/report-receipt path;
+  artifact-bearing Runbook finals use a strict v2 Controller effect/receipt but are not durable in
+  the Agent journal; direct one-shot delivery is still separate.
+- A matching persistent TaskAck/TaskStarted/TaskRejected received after SQLite G2 marks its owner
+  `failed/execution_outcome_unknown` now gets one terminal-preserving audit/inbox disposition and
+  an exact signed `stored` receipt, allowing ordered Agent replay to continue without implying success.
+- A matching no-artifact persistent DriftCheck final received after SQLite G2 marks its Assignment
+  `failed/execution_outcome_unknown` gets the same terminal-preserving durable disposition; exact retry
+  replays its signed receipt without repeating the effect or audit.
+- Workspace tests pass locally; these changes are not a published release or a real Linux reboot gate.
+
 ## Included
 
 - Rust workspace with layered crate boundaries.
@@ -39,6 +166,11 @@ This document captures the current post-MVP state and known limits.
 
 ## Known Limits And Post-MVP Phase Mapping
 
+Numbered Phase labels in this section belong to the historical roadmap, not the
+active execution plan. Use the [capability map](../.docs/product/capabilities.md)
+and [overall plan](../.docs/plans/plan.md) for current priorities and support boundaries.
+This release note is not evidence that uncommitted checkout changes were published.
+
 - Controller HTTP/WebSocket serving uses Axum.
 - HTTPS is supported through built-in TLS or reverse proxy deployment. HTTP remains allowed for tests only and emits warnings.
 - CLI login/profile storage exists at `.fleet/cli-profile.json` with owner-only permission checks. OIDC/SSO, API token lifecycle, project/team RBAC, and full multi-admin sessions are Phase 6 work.
@@ -51,7 +183,9 @@ This document captures the current post-MVP state and known limits.
 - Automatic self-upgrade, one-line installer, `.deb`, `.rpm`, Homebrew, Docker, and Windows service packaging are Phase 9 and Phase 12 work.
 - Release checksum signatures use a committed public key and a fail-closed GitHub signing secret; tagged releases upload `SHA256SUMS.sig`, while manual dry-runs retain short-lived signed verification evidence. Key rotation policy remains Phase 9 work.
 - Retention worker uses code-default MVP durations and has no runtime configuration endpoint or HA lease/leader election. Cleanup keeps audit events out of normal deletion and separates job output, facts, metrics, and agent log cutoffs. HA-safe lease coordination is Phase 10 work; runtime config patching remains prohibited.
-- No production controller signing key rotation, agent certificate rotation, or mTLS client-certificate lifecycle exists. These are Phase 5 work.
+- Controller signing key rotation/trust rollout and audited external restart boundaries exist (SEC-001).
+  Agent certificate lifecycle foundations do not establish full mTLS client-certificate enforcement (EXT-001).
+  In-process signer hot reload/self-restart is not the current path.
 - Capability reporting, persistence, and basic dispatch rejection gate exist with a 24-hour stale snapshot guard. Platform-specific privilege/package/service probing and manual platform smoke are Phase 12 and Phase 15 work.
 - Replay nonce protection is local and file-backed on each agent. Cross-controller/global replay correlation is not implemented; HA-safe coordination belongs to Phase 10.
 - Approval request lifecycle and Web Admin approval queue exist. Product-grade multi-admin identity, sessions, and external auth are Phase 6 work.
@@ -59,7 +193,7 @@ This document captures the current post-MVP state and known limits.
 - Scheduled drift entries are stored, queried, and consumed by a controller worker that creates signed due drift-check jobs. The worker is single-controller safe only; multi-controller lease/leader election is Phase 10 work.
 - Policy-based remediation request domain/application proposal state machine, SQLite metadata persistence, persisted approval request creation, approved signed runbook job creation, task-event lifecycle reconciliation, Controller API surface, and thin CLI/Web Admin surface exist. A Controller-verified, signed, drifted policy check creates one idempotent `Proposed` request with its origin report and redacted audits in the same persistence transaction; compliant and unverified reports remain observations. A successful remediation result creates one correlated signed verification drift Job, assignment, and audit atomically, then attempts dispatch after commit; a disconnected agent remains queued. Before listener readiness, a single bounded startup scan reconciles correlation-free pending verification rows through the same create boundary; unverifiable legacy rows are audit-skipped without dispatch. A successful verification result and fresh compliant persisted evidence after remediation execution atomically resolve the remediation and only its origin drift, regardless of report/result delivery order; stale, drifted, unknown, failed, or mismatched evidence remains pending. The legacy manual running/result/verify API and CLI commands remain only as deprecated `409` compatibility endpoints; Web Admin displays persisted lifecycle state and provides no manual transition control. Execution is still approval-gated: there is no approval-bypassing auto-remediation worker. Phase 3 now has typed database backend settings, startup-only Postgres URL/SSL mode/connect timeout/pool parsing, a blocking Postgres client pool boundary, a minimum native TLS adapter for `sslmode=prefer/require`, a shared SQLite repository contract harness, a feature-gated Postgres migration skeleton with ignored integration gate, repository slices through RemediationRequest, `ControllerStore`/`ControllerStoreRef` boundaries, feature-gated Controller Postgres open/migration wiring, direct server runtime adapter dispatch, typed job+assignment transaction boundary, and queued-only dispatch claim/release contract. Custom CA/client certificate rotation, scheduled drift/retention lease, and HA claim semantics remain.
 - Audit events are append-only at the controller API/application boundary and are excluded from normal retention cleanup. The SQLite MVP store is not a tamper-proof WORM audit store; tamper-evident hash chain, signed export manifest, and compliance report are Phase 11 work.
-- Slack/Teams notification and Prometheus/OpenTelemetry export are Phase 8 work. Public HTTPS Git runbook/policy catalog sync, validation, explicit activation, protected API/CLI, and Admin metadata exploration are available; private Git credentials and project scope remain separate work.
+- Slack/Teams notification and Prometheus/OpenTelemetry export are Phase 8 work. Public HTTPS Git runbook/policy catalog sync, validation, explicit activation, protected API/CLI, and Admin metadata exploration are available. The current checkout also adds strict catalog-reference Job creation and immutable provenance in protected Job detail; Admin review and reference-only submission now connect to the shared approval/result view with immutable provenance. Scoped Node and synthetic native-browser checks cover this UI; the public Git-to-result journey now has scoped two-Agent Linux/native-browser acceptance, including fixed targets, approval gates and revision-invariant Job provenance. Private Git credentials and project scope remain separate work.
 - Plugin/external adapter execution is not available. Signed manifest, disabled-by-default policy, and approval/capability/audit boundaries are Phase 14 work.
 - 100-agent heartbeat and 1,000-output load gates are Phase 15 work.
 

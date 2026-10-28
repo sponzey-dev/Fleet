@@ -1,7 +1,14 @@
 use clap::{Args, Parser, Subcommand};
+mod admin_local;
+mod admin_password_input;
+#[cfg(test)]
+mod cli_profile_tests;
+#[cfg(test)]
+mod controller_snapshot_tests;
+pub use admin_password_input::PasswordInputError;
 use fleet_application::{
-    DisabledSecretProvider, ResolvedSecret, RetentionPolicy, RunRetentionCleanup,
-    RunRetentionCleanupInput, SecretProvider, SecretProviderError,
+    ControllerDeliveryIdentity, DisabledSecretProvider, ResolvedSecret, RetentionPolicy,
+    RunRetentionCleanup, RunRetentionCleanupInput, SecretProvider, SecretProviderError,
 };
 use fleet_core::{
     DatabaseSettings, LogProfile, format_error_message, format_warning_message, init_logging,
@@ -9,6 +16,7 @@ use fleet_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
@@ -30,7 +38,7 @@ use tungstenite::{Connector, Message};
 use std::sync::mpsc;
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 const LOG_TAIL_MAX_LINES: usize = 50;
 const LOG_TAIL_MAX_LINE_BYTES: usize = 4096;
@@ -38,6 +46,19 @@ const LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REMOTE_RUN_EXPIRES_IN_SECONDS: u64 = 300;
 const AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const AGENT_SESSION_READ_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const AGENT_JOURNAL_MAX_REPORTS: u64 = 4096;
+const AGENT_JOURNAL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const AGENT_JOURNAL_FINAL_RESERVE_REPORTS: u64 = 4;
+const AGENT_JOURNAL_FINAL_RESERVE_BYTES: u64 = 4 * 1024 * 1024;
+const AGENT_JOURNAL_WORKER_REQUESTS: usize = 16;
+const AGENT_JOURNAL_WORKER_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
+const AGENT_REPORT_BATCH_SIZE: u32 = 16;
+const AGENT_REPORT_BATCH_BYTES: u64 = 8 * 1024 * 1024;
+const AGENT_REPORT_SENDS_PER_TICK: usize = 4;
+const AGENT_REPORT_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const AGENT_REPORT_RETRY_BASE: Duration = Duration::from_secs(1);
+const AGENT_REPORT_RETRY_MAX: Duration = Duration::from_secs(30);
+const AGENT_JOURNAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CLI_PROFILE_PATH: &str = ".fleet/cli-profile.json";
 const CONTROLLER_SIGNING_STAGED_TRUST_BUNDLE_PATH: &str =
     "/api/controller/signing-rotation/rollout-trust-bundle/staged";
@@ -105,14 +126,34 @@ pub struct DemoCommand {
     port: Option<u16>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct LoginCommand {
     #[arg(long)]
     controller_url: String,
-    #[arg(long)]
-    admin_token: String,
+    #[arg(
+        long,
+        conflicts_with = "token_stdin",
+        help = "Legacy explicit token input; prefer the hidden prompt or --token-stdin to avoid shell history/process arguments"
+    )]
+    admin_token: Option<String>,
+    #[arg(
+        long,
+        help = "Read one personal token from stdin through EOF; default is a hidden terminal prompt"
+    )]
+    token_stdin: bool,
+    #[arg(
+        long,
+        help = "PEM public CA certificate for this Controller; saves its canonical path in this profile without changing system trust"
+    )]
+    tls_ca_cert: Option<PathBuf>,
     #[arg(long, default_value = DEFAULT_CLI_PROFILE_PATH)]
     profile_path: PathBuf,
+}
+
+impl std::fmt::Debug for LoginCommand {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LoginCommand([REDACTED])")
+    }
 }
 
 #[derive(Debug, Args, Clone)]
@@ -136,6 +177,16 @@ pub enum ControllerSubcommand {
     Init {
         #[arg(long, default_value = ".fleet")]
         data_dir: PathBuf,
+        #[arg(
+            long,
+            help = "The same SQLite database URL used by controller start --db"
+        )]
+        db: Option<String>,
+    },
+    #[command(about = "Manage personal administrators locally while the Controller is stopped")]
+    Admin {
+        #[command(subcommand)]
+        command: ControllerAdminSubcommand,
     },
     #[command(
         about = "Start the Sponzey Fleet controller",
@@ -245,6 +296,84 @@ pub enum ControllerSubcommand {
         )]
         force: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ControllerAdminSubcommand {
+    #[command(
+        about = "Initialize the first personal owner and disable the shared admin token atomically"
+    )]
+    InitOwner(ControllerOwnerInitArgs),
+    #[command(
+        about = "Recover a personal owner's access using local OS authority while the Controller is stopped"
+    )]
+    RecoverOwner(ControllerOwnerRecoveryArgs),
+}
+
+#[derive(Args)]
+pub struct ControllerOwnerInitArgs {
+    #[arg(long, default_value = ".fleet")]
+    data_dir: PathBuf,
+    #[arg(
+        long,
+        help = "The same SQLite database URL used by controller start --db"
+    )]
+    db: Option<String>,
+    #[arg(long)]
+    username: String,
+    #[arg(long)]
+    display_name: Option<String>,
+    #[arg(
+        long,
+        help = "Read one UTF-8 password through EOF from stdin instead of a hidden terminal prompt; never put passwords in arguments or environment variables"
+    )]
+    password_stdin: bool,
+}
+
+impl std::fmt::Debug for ControllerOwnerInitArgs {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControllerOwnerInitArgs")
+            .field("data_dir", &"[CONFIGURED]")
+            .field("db", &self.db.as_ref().map(|_| "[CONFIGURED]"))
+            .field("username", &self.username)
+            .field("display_name", &self.display_name)
+            .field("password_stdin", &self.password_stdin)
+            .finish()
+    }
+}
+
+#[derive(Args)]
+pub struct ControllerOwnerRecoveryArgs {
+    #[arg(long, default_value = ".fleet")]
+    data_dir: PathBuf,
+    #[arg(
+        long,
+        help = "The same SQLite database URL used by controller start --db"
+    )]
+    db: Option<String>,
+    #[arg(
+        long,
+        help = "Immutable login name of the existing person whose owner access will be recovered"
+    )]
+    username: String,
+    #[arg(
+        long,
+        help = "Read one UTF-8 password through EOF from stdin instead of hidden terminal confirmation"
+    )]
+    password_stdin: bool,
+}
+
+impl std::fmt::Debug for ControllerOwnerRecoveryArgs {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControllerOwnerRecoveryArgs")
+            .field("data_dir", &"[CONFIGURED]")
+            .field("db", &self.db.as_ref().map(|_| "[CONFIGURED]"))
+            .field("username", &self.username)
+            .field("password_stdin", &self.password_stdin)
+            .finish()
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -892,6 +1021,11 @@ impl UpgradeChannelArg {
 
 #[derive(Debug)]
 pub enum CliError {
+    AdminInput(PasswordInputError),
+    AdminIdentity(fleet_application::admin_identity::AdminAccessError),
+    AdminLocalRequiresSqlite,
+    MissingControllerSigningIdentity,
+    InvalidControllerSigningIdentity,
     Io(std::io::Error),
     Controller(Box<fleet_controller::ControllerError>),
     Identity(fleet_core::IdentityError),
@@ -912,6 +1046,11 @@ pub enum CliError {
 impl Display for CliError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AdminInput(error) => Display::fmt(error, formatter),
+            Self::AdminIdentity(error) => Display::fmt(error, formatter),
+            Self::AdminLocalRequiresSqlite => formatter.write_str("local administrator commands require the same SQLite database as the Controller; Postgres Controller readiness is unsupported"),
+            Self::MissingControllerSigningIdentity => formatter.write_str("personal Controller signing identity is missing; restore the original signing keys from backup"),
+            Self::InvalidControllerSigningIdentity => formatter.write_str("Controller signing identity is invalid; restore the original signing keys from backup"),
             Self::Io(error) => write!(formatter, "{error}"),
             Self::Controller(error) => write!(formatter, "{error}"),
             Self::Identity(error) => write!(formatter, "identity error: {error}"),
@@ -968,6 +1107,24 @@ impl Display for CliError {
 }
 
 impl std::error::Error for CliError {}
+
+impl From<PasswordInputError> for CliError {
+    fn from(value: PasswordInputError) -> Self {
+        Self::AdminInput(value)
+    }
+}
+
+impl From<fleet_application::admin_identity::AdminAccessError> for CliError {
+    fn from(value: fleet_application::admin_identity::AdminAccessError) -> Self {
+        Self::AdminIdentity(value)
+    }
+}
+
+impl From<fleet_core::controller_data::ControllerDataError> for CliError {
+    fn from(value: fleet_core::controller_data::ControllerDataError) -> Self {
+        Self::from(fleet_controller::ControllerError::from(value))
+    }
+}
 
 impl From<std::io::Error> for CliError {
     fn from(value: std::io::Error) -> Self {
@@ -1031,22 +1188,95 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct CliProfile {
     controller_url: String,
     admin_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_ca_cert: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ProtectedApiClient {
     controller_url: String,
     admin_token: String,
+    tls_ca_pem: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for CliProfile {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CliProfile([REDACTED])")
+    }
+}
+
+impl std::fmt::Debug for ProtectedApiClient {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProtectedApiClient([REDACTED])")
+    }
+}
+
+impl Drop for CliProfile {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.admin_token);
+    }
+}
+
+impl Drop for ProtectedApiClient {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.admin_token);
+    }
 }
 
 fn execute_login(command: LoginCommand) -> Result<(), CliError> {
+    let controller_url = canonical_profile_url(&command.controller_url)?;
+    let tls_ca_cert = command
+        .tls_ca_cert
+        .as_deref()
+        .map(|path| {
+            fs::canonicalize(path)
+                .map_err(|_| CliError::Http("could not resolve CLI public CA certificate".into()))
+        })
+        .transpose()?;
+    let tls_ca_pem = read_profile_ca(tls_ca_cert.as_deref())?;
+    let legacy_input = command.admin_token.is_some();
+    let token = match command.admin_token {
+        Some(token) => zeroize::Zeroizing::new(token),
+        None => admin_password_input::read_personal_token(command.token_stdin)
+            .map_err(|_| CliError::Http("personal token input failed; use the hidden terminal prompt or --token-stdin with one token followed by EOF".into()))?,
+    };
+    validate_profile_token(&token)?;
+    if !legacy_input {
+        validate_personal_token(&token)?;
+    }
+    if token.starts_with("fpat_") {
+        // Verify current server authority before replacing an existing profile.
+        let client = ProtectedApiClient {
+            controller_url: controller_url.clone(),
+            admin_token: token.to_string(),
+            tls_ca_pem,
+        };
+        let body = zeroize::Zeroizing::new(client.get("/api/auth/session")?);
+        let session: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| CliError::Http("invalid personal session response".into()))?;
+        if session
+            .get("user")
+            .and_then(|user| user.get("id"))
+            .and_then(|id| id.as_str())
+            .is_none()
+            || session
+                .get("expires_at")
+                .and_then(|expiry| expiry.as_u64())
+                .is_none()
+            || session.get("csrf_token") != Some(&serde_json::Value::Null)
+        {
+            return Err(CliError::Http("invalid personal session response".into()));
+        }
+    }
     let profile = CliProfile {
-        controller_url: command.controller_url,
-        admin_token: command.admin_token,
+        controller_url,
+        admin_token: token.to_string(),
+        tls_ca_cert,
     };
     save_cli_profile(&command.profile_path, &profile)?;
     println!("profile_path={}", command.profile_path.display());
@@ -1056,56 +1286,195 @@ fn execute_login(command: LoginCommand) -> Result<(), CliError> {
 }
 
 fn save_cli_profile(path: &Path, profile: &CliProfile) -> Result<(), CliError> {
+    canonical_profile_url(&profile.controller_url)?;
+    validate_profile_token(&profile.admin_token)?;
+    if fs::symlink_metadata(path).is_ok() {
+        ensure_secure_profile_permissions(path)?;
+    }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(parent)?;
     }
-    let body =
-        serde_json::to_string_pretty(profile).map_err(|error| CliError::Http(error.to_string()))?;
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     #[cfg(unix)]
     {
-        options.mode(0o600);
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(parent)?;
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o022 != 0 {
+            return Err(CliError::Http("CLI profile directory must be owned by the current user and not writable by others".into()));
+        }
     }
-    let mut file = options.open(path)?;
+    let body = zeroize::Zeroizing::new(
+        serde_json::to_string_pretty(profile)
+            .map_err(|_| CliError::Http("could not serialize CLI profile".into()))?,
+    );
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(body.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path)
+        .map_err(|_| CliError::Http("could not atomically save CLI profile".into()))?;
     #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
 fn read_cli_profile(path: &Path) -> Result<CliProfile, CliError> {
     ensure_secure_profile_permissions(path)?;
-    let body = fs::read_to_string(path)?;
-    serde_json::from_str(&body).map_err(|error| CliError::Http(error.to_string()))
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    let file = options.open(path)?;
+    validate_profile_metadata(&file.metadata()?)?;
+    let mut body = zeroize::Zeroizing::new(String::new());
+    file.take(16_385)
+        .read_to_string(&mut body)
+        .map_err(|_| CliError::Http("could not read CLI profile".into()))?;
+    if body.len() > 16_384 {
+        return Err(CliError::Http("CLI profile exceeds the size limit".into()));
+    }
+    let mut profile: CliProfile = serde_json::from_str(&body).map_err(|_| {
+        CliError::Http("invalid CLI profile; save a new profile with fleet login".into())
+    })?;
+    profile.controller_url = canonical_profile_url(&profile.controller_url)?;
+    validate_profile_token(&profile.admin_token)?;
+    Ok(profile)
 }
 
 fn ensure_secure_profile_permissions(path: &Path) -> Result<(), CliError> {
-    let metadata = fs::metadata(path).map_err(|error| {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             CliError::Http(format!(
-                "CLI profile not found: {}; run `fleet login --controller-url <url> --admin-token <token>` or pass --controller-url and --admin-token",
+                "CLI profile not found: {}; run `fleet login --controller-url <url>` and enter your personal token at the hidden prompt",
                 path.display()
             ))
         } else {
             CliError::Io(error)
         }
     })?;
+    validate_profile_metadata(&metadata)
+}
+
+fn validate_profile_metadata(metadata: &fs::Metadata) -> Result<(), CliError> {
+    if !metadata.is_file() {
+        return Err(CliError::Http(
+            "CLI profile must be a regular file, not a symlink".into(),
+        ));
+    }
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
         let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(CliError::Http(format!(
-                "CLI profile has insecure permissions: {}; expected mode 600",
-                path.display()
-            )));
+        if mode & 0o7777 != 0o600
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.nlink() != 1
+        {
+            return Err(CliError::Http("CLI profile has insecure ownership, links or permissions; expected an owned mode 600 file".into()));
         }
     }
     Ok(())
+}
+
+fn canonical_profile_url(raw: &str) -> Result<String, CliError> {
+    let invalid = || {
+        CliError::Http("controller URL must be an HTTP(S) origin without credentials, path, query, fragment or wildcard host".into())
+    };
+    if raw.len() > 2048 || raw.contains('\\') || raw.chars().any(char::is_whitespace) {
+        return Err(invalid());
+    }
+    let url = reqwest::Url::parse(raw).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port_or_known_default() == Some(0)
+    {
+        return Err(invalid());
+    }
+    let canonical = url.origin().ascii_serialization();
+    parse_controller_url(&canonical).map_err(|_| invalid())?;
+    Ok(canonical)
+}
+
+fn validate_profile_token(token: &str) -> Result<(), CliError> {
+    if token.is_empty()
+        || token.len() > 1024
+        || !token.bytes().all(|value| value.is_ascii_graphic())
+    {
+        return Err(CliError::Http(
+            "invalid CLI token input; expected one nonempty token without whitespace".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_personal_token(token: &str) -> Result<(), CliError> {
+    if !token.strip_prefix("fpat_").is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|v| v.is_ascii_digit() || matches!(v, b'a'..=b'f'))
+    }) {
+        return Err(CliError::Http("enter the personal token shown in Settings > My account; passwords and web session cookies cannot be used as CLI tokens".into()));
+    }
+    Ok(())
+}
+
+/// Loads one bounded public CA at CLI bootstrap; request effects use these immutable bytes.
+fn read_profile_ca(path: Option<&Path>) -> Result<Option<Vec<u8>>, CliError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let invalid = || {
+        CliError::Http("invalid CLI public CA certificate; expected a regular PEM certificate file of at most 16 KiB".into())
+    };
+    if path.as_os_str().len() > 2048 {
+        return Err(invalid());
+    }
+    if !fs::metadata(path).map_err(|_| invalid())?.is_file() {
+        return Err(invalid());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    let file = options.open(path).map_err(|_| invalid())?;
+    let metadata = file.metadata().map_err(|_| invalid())?;
+    if !metadata.is_file() || metadata.len() > 16_384 {
+        return Err(invalid());
+    }
+    let mut pem = zeroize::Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    file.take(16_385)
+        .read_to_end(&mut pem)
+        .map_err(|_| invalid())?;
+    if pem.len() > 16_384 {
+        return Err(invalid());
+    }
+    let mut reader = BufReader::new(pem.as_slice());
+    let items = rustls_pemfile::read_all(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid())?;
+    if items.is_empty() {
+        return Err(invalid());
+    }
+    let mut roots = RootCertStore::empty();
+    for item in items {
+        let rustls_pemfile::Item::X509Certificate(certificate) = item else {
+            return Err(invalid());
+        };
+        roots.add(certificate).map_err(|_| invalid())?;
+    }
+    Ok(Some(pem.to_vec()))
 }
 
 fn resolve_protected_api(args: &ProtectedApiArgs) -> Result<ProtectedApiClient, CliError> {
@@ -1124,14 +1493,24 @@ fn resolve_protected_api(args: &ProtectedApiArgs) -> Result<ProtectedApiClient, 
                 .map(|profile| profile.controller_url.clone())
         })
         .ok_or_else(|| CliError::Http("--controller-url is required".to_owned()))?;
+    let controller_url = canonical_profile_url(&controller_url)?;
+    if args.admin_token.is_none()
+        && profile
+            .as_ref()
+            .is_some_and(|p| p.controller_url != controller_url)
+    {
+        return Err(CliError::Http("saved CLI token belongs to a different Controller URL; run fleet login for this server".into()));
+    }
     let admin_token = args
         .admin_token
         .clone()
         .or_else(|| profile.as_ref().map(|profile| profile.admin_token.clone()))
         .ok_or_else(|| CliError::Http("--admin-token is required".to_owned()))?;
+    validate_profile_token(&admin_token)?;
     Ok(ProtectedApiClient {
         controller_url,
         admin_token,
+        tls_ca_pem: read_profile_ca(profile.as_ref().and_then(|p| p.tls_ca_cert.as_deref()))?,
     })
 }
 
@@ -1145,7 +1524,20 @@ fn run_command_api_args(command: &RunCommand) -> ProtectedApiArgs {
 
 impl ProtectedApiClient {
     fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String, CliError> {
-        let response = http_request_url(
+        let mut builder = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(10));
+        if let Some(pem) = &self.tls_ca_pem {
+            let certificate = reqwest::Certificate::from_pem(pem)
+                .map_err(|_| CliError::Http("invalid CLI public CA certificate".into()))?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        let client = builder
+            .build()
+            .map_err(|_| CliError::Http("could not initialize protected HTTP client".into()))?;
+        let response = http_request_url_with_client(
+            &client,
             &self.controller_url,
             method,
             path,
@@ -1188,8 +1580,8 @@ fn http_response_body(response: &str) -> &str {
 
 fn render_http_status_error(status: u16) -> String {
     match status {
-        401 => "unauthorized: admin token is missing or invalid".to_owned(),
-        403 => "forbidden: admin token lacks required permission".to_owned(),
+        401 => "unauthorized: credential is missing, invalid, expired or revoked; create a personal token in Settings > My account and run fleet login again".to_owned(),
+        403 => "forbidden: your account lacks the required permission".to_owned(),
         404 => "not found: requested resource does not exist".to_owned(),
         409 => "conflict: request conflicts with current state".to_owned(),
         0 => "request failed: malformed HTTP response".to_owned(),
@@ -1483,18 +1875,57 @@ fn json_optional_number(json: &serde_json::Value, key: &str) -> Option<String> {
 
 fn execute_controller(command: ControllerCommand) -> Result<(), CliError> {
     match command.command {
-        ControllerSubcommand::Init { data_dir } => {
-            fs::create_dir_all(controller_dir(&data_dir))?;
+        ControllerSubcommand::Init { data_dir, db } => {
+            use fleet_application::admin_identity::AdminIdentityRead;
+            let database = parse_controller_database_settings(db.as_deref(), &data_dir)?;
+            let database_path = database
+                .sqlite_path()
+                .ok_or(CliError::AdminLocalRequiresSqlite)?;
+            let _lease = fleet_core::controller_data::ControllerDataLease::acquire(&data_dir)?;
+            admin_local::prepare_controller_dir(&data_dir)?;
             fs::create_dir_all(agent_dir(&data_dir))?;
-            let store = fleet_store::SqliteStore::open(controller_db_path(&data_dir))?;
-            let controller_fingerprint = ensure_controller_identity(&data_dir)?;
+            let store = fleet_store::SqliteStore::open(database_path)?;
+            let mode = store.auth_state()?.mode;
+            let controller_fingerprint = admin_local::bootstrap_signing_identity(&data_dir, mode)?;
             println!("controller initialized at {}", data_dir.display());
             println!("controller fingerprint: {controller_fingerprint}");
-            if let Some(admin_token) = fleet_controller::create_admin_token(&store)? {
+            if mode != fleet_domain::AdminAuthMode::LegacyBootstrap {
+                println!("personal administrator mode: shared admin token disabled");
+            } else if let Some(admin_token) = fleet_controller::create_admin_token(&store)? {
                 println!("admin token: {admin_token}");
             } else {
                 println!("admin token: already initialized");
             }
+            Ok(())
+        }
+        ControllerSubcommand::Admin {
+            command: ControllerAdminSubcommand::InitOwner(args),
+        } => {
+            let account = admin_local::initialize_owner_with(&args, || {
+                admin_password_input::read_new_password(args.password_stdin)
+            })?;
+            println!(
+                "owner initialized: id={} username={}",
+                account.id.as_str(),
+                account.username.as_str()
+            );
+            println!("personal administrator mode enabled; shared admin token disabled");
+            Ok(())
+        }
+        ControllerSubcommand::Admin {
+            command: ControllerAdminSubcommand::RecoverOwner(args),
+        } => {
+            let account = admin_local::recover_owner_with(&args, || {
+                admin_password_input::read_new_password(args.password_stdin)
+            })?;
+            println!(
+                "owner access recovered: id={} username={}",
+                account.id.as_str(),
+                account.username.as_str()
+            );
+            println!(
+                "previous sessions, personal tokens and unused setup codes for this person are invalid"
+            );
             Ok(())
         }
         ControllerSubcommand::Start {
@@ -1772,7 +2203,7 @@ fn controller_signing_staged_trust_bundle_request_body(
 const CONTROLLER_BACKUP_FORMAT: &str = "fleet-controller-backup";
 const CONTROLLER_BACKUP_FORMAT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ControllerBackupArchive {
     format: String,
     format_version: u32,
@@ -1784,7 +2215,7 @@ struct ControllerBackupArchive {
     files: Vec<ControllerBackupFile>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ControllerBackupFile {
     path: String,
     size_bytes: u64,
@@ -1792,7 +2223,34 @@ struct ControllerBackupFile {
     content_hex: String,
 }
 
+impl std::fmt::Debug for ControllerBackupArchive {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControllerBackupArchive")
+            .field("format_version", &self.format_version)
+            .field("schema_version", &self.schema_version)
+            .field("file_count", &self.files.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ControllerBackupFile {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControllerBackupFile")
+            .field("size_bytes", &self.size_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ControllerBackupFile {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.content_hex.zeroize();
+    }
+}
+
 fn execute_controller_backup(data_dir: &Path, output: &Path) -> Result<(), CliError> {
+    let _lease = fleet_core::controller_data::ControllerDataLease::acquire(data_dir)?;
+    directory_exists_and_is_non_empty(&controller_dir(data_dir))?;
     ensure_controller_initialized_for_start(data_dir)?;
     let db_path = controller_db_path(data_dir);
     if !db_path.is_file() {
@@ -1801,16 +2259,11 @@ fn execute_controller_backup(data_dir: &Path, output: &Path) -> Result<(), CliEr
             db_path.display()
         )));
     }
-    ensure_no_sqlite_transient_files(&db_path)?;
-    let store = fleet_store::SqliteStore::open(&db_path)?;
-    let integrity = store.integrity_check()?;
-    if integrity != "ok" {
-        return Err(CliError::Http(format!(
-            "sqlite integrity check failed: {integrity}"
-        )));
-    }
-    let schema_version = store.current_schema_version()?.unwrap_or(0);
-    let archive = build_controller_backup_archive(data_dir, schema_version, integrity)?;
+    let snapshot = fleet_store::sqlite_snapshot::inspect_quiescent_sqlite_snapshot(&db_path)
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    let archive = build_controller_backup_archive(data_dir, snapshot.schema_version, "ok".into())?;
+    validate_backup_archive(&archive)?;
+    verify_backup_snapshot(&archive)?;
     write_backup_archive(output, &archive)?;
     println!("backup_archive={}", output.display());
     println!("format={}", archive.format);
@@ -1832,6 +2285,13 @@ fn execute_controller_restore(
     dry_run: bool,
     force: bool,
 ) -> Result<(), CliError> {
+    let lease = if dry_run {
+        None
+    } else {
+        Some(fleet_core::controller_data::ControllerDataLease::acquire(
+            data_dir,
+        )?)
+    };
     let archive = read_backup_archive(input)?;
     validate_backup_archive(&archive)?;
     if archive.schema_version > fleet_store::CURRENT_SCHEMA_VERSION {
@@ -1841,6 +2301,7 @@ fn execute_controller_restore(
             fleet_store::CURRENT_SCHEMA_VERSION
         )));
     }
+    verify_backup_snapshot(&archive)?;
     let target_controller_dir = controller_dir(data_dir);
     let existing_non_empty = directory_exists_and_is_non_empty(&target_controller_dir)?;
     if dry_run {
@@ -1859,21 +2320,40 @@ fn execute_controller_restore(
         )));
     }
 
-    let temp_root = restore_temp_dir(data_dir);
-    if temp_root.exists() {
-        fs::remove_dir_all(&temp_root)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".fleet-restore-");
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o700));
+    // Unique, owned, private and on the target filesystem. Never delete a guessed staging path.
+    let temporary = builder.tempdir_in(data_dir)?;
+    restore_archive_into_temp_dir(&archive, temporary.path())?;
+    let lease = lease
+        .as_ref()
+        .ok_or_else(|| CliError::Http("restore requires a local data lease".into()))?;
+    verify_restored_controller_dir(temporary.path(), lease)?;
+    sync_restore_tree(temporary.path())?;
+    replace_controller_dir(data_dir, temporary.path(), force)?;
+    // The exchange above is the commit point. A later sync/cleanup failure must never report
+    // the previous target as still installed or attempt an unguarded reverse exchange.
+    match finalize_controller_restore(data_dir, temporary) {
+        RestoreFinalization::Complete => {}
+        RestoreFinalization::DurabilityUnconfirmed => println!(
+            "{}",
+            format_warning_message(
+                "restore is installed, but directory durability could not be confirmed; private rollback staging was retained; keep the Controller stopped and inspect the backup before restarting"
+            )
+        ),
+        RestoreFinalization::CleanupPending => println!(
+            "{}",
+            format_warning_message(
+                "restore is installed; cleanup of its private old snapshot is pending"
+            )
+        ),
     }
-    fs::create_dir_all(&temp_root)?;
-    let restore_result = restore_archive_into_temp_dir(&archive, &temp_root)
-        .and_then(|()| verify_restored_controller_dir(&temp_root))
-        .and_then(|()| replace_controller_dir(data_dir, &temp_root, force));
-    if restore_result.is_err() {
-        let _ = fs::remove_dir_all(&temp_root);
-    }
-    restore_result?;
     println!("restore_dry_run=false");
     println!("restored_data_dir={}", data_dir.display());
-    println!("schema_version={}", archive.schema_version);
+    println!("schema_version={}", fleet_store::CURRENT_SCHEMA_VERSION);
+    println!("backup_schema_version={}", archive.schema_version);
     println!("file_count={}", archive.files.len());
     println!(
         "{}",
@@ -1923,13 +2403,12 @@ fn collect_controller_backup_files_from_dir(
             continue;
         }
         if !metadata.is_file() {
-            return Err(CliError::Http(format!(
-                "controller backup only supports regular files: {}",
-                path.display()
-            )));
+            return Err(CliError::Http(
+                "controller backup only supports regular files".into(),
+            ));
         }
         let relative_path = backup_relative_path(data_dir, &path)?;
-        let content = fs::read(&path)?;
+        let content = zeroize::Zeroizing::new(fs::read(&path)?);
         let sha256 = sha256_hex(&content);
         files.push(ControllerBackupFile {
             path: relative_path,
@@ -1942,20 +2421,14 @@ fn collect_controller_backup_files_from_dir(
 }
 
 fn backup_relative_path(data_dir: &Path, path: &Path) -> Result<String, CliError> {
-    let relative = path.strip_prefix(data_dir).map_err(|_| {
-        CliError::Http(format!(
-            "backup path is outside data dir: {}",
-            path.display()
-        ))
-    })?;
+    let relative = path
+        .strip_prefix(data_dir)
+        .map_err(|_| CliError::Http("backup path is outside data dir".into()))?;
     let parts = relative
         .components()
         .map(|component| match component {
             std::path::Component::Normal(value) => Ok(value.to_string_lossy().to_string()),
-            _ => Err(CliError::Http(format!(
-                "invalid backup path component: {}",
-                path.display()
-            ))),
+            _ => Err(CliError::Http("invalid backup path component".into())),
         })
         .collect::<Result<Vec<_>, CliError>>()?;
     Ok(parts.join("/"))
@@ -1967,31 +2440,35 @@ fn write_backup_archive(output: &Path, archive: &ControllerBackupArchive) -> Res
     {
         fs::create_dir_all(parent)?;
     }
-    let temp_output = output.with_extension(format!(
-        "{}.tmp",
-        output
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("backup")
-    ));
-    let body =
-        serde_json::to_vec_pretty(archive).map_err(|error| CliError::Http(error.to_string()))?;
-    fs::write(&temp_output, body)?;
-    fs::rename(&temp_output, output)?;
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let body = zeroize::Zeroizing::new(
+        serde_json::to_vec_pretty(archive)
+            .map_err(|_| CliError::Http("cannot encode controller backup".into()))?,
+    );
+    // tempfile creates a fresh 0600 file. No fixed .tmp name or pre-existing output is reused.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&body)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist_noclobber(output).map_err(|_| {
+        CliError::Http(
+            "cannot install backup; use a new output filename and check its directory".into(),
+        )
+    })?;
     Ok(())
 }
 
 fn read_backup_archive(input: &Path) -> Result<ControllerBackupArchive, CliError> {
-    let body = fs::read(input)?;
-    serde_json::from_slice(&body).map_err(|error| CliError::Http(error.to_string()))
+    let body = zeroize::Zeroizing::new(fs::read(input)?);
+    serde_json::from_slice(&body)
+        .map_err(|_| CliError::Http("invalid controller backup JSON".into()))
 }
 
 fn validate_backup_archive(archive: &ControllerBackupArchive) -> Result<(), CliError> {
     if archive.format != CONTROLLER_BACKUP_FORMAT {
-        return Err(CliError::Http(format!(
-            "unsupported backup format: {}",
-            archive.format
-        )));
+        return Err(CliError::Http("unsupported backup format".into()));
     }
     if archive.format_version != CONTROLLER_BACKUP_FORMAT_VERSION {
         return Err(CliError::Http(format!(
@@ -2004,21 +2481,28 @@ fn validate_backup_archive(archive: &ControllerBackupArchive) -> Result<(), CliE
             "backup archive contains no files".to_owned(),
         ));
     }
+    let mut paths = HashSet::new();
     for file in &archive.files {
         validate_backup_file_path(&file.path)?;
-        let content = hex_decode(&file.content_hex)?;
+        if !paths.insert(file.path.as_str())
+            || [
+                "controller/fleet.db-journal",
+                "controller/fleet.db-wal",
+                "controller/fleet.db-shm",
+            ]
+            .contains(&file.path.as_str())
+        {
+            return Err(CliError::Http(
+                "backup contains duplicate or transient file entries".into(),
+            ));
+        }
+        let content = zeroize::Zeroizing::new(hex_decode(&file.content_hex)?);
         if content.len() as u64 != file.size_bytes {
-            return Err(CliError::Http(format!(
-                "backup file size mismatch: {}",
-                file.path
-            )));
+            return Err(CliError::Http("backup file size mismatch".into()));
         }
         let actual = sha256_hex(&content);
         if actual != file.sha256 {
-            return Err(CliError::Http(format!(
-                "backup checksum mismatch for {}",
-                file.path
-            )));
+            return Err(CliError::Http("backup checksum mismatch".into()));
         }
     }
     if !archive
@@ -2037,13 +2521,53 @@ fn validate_backup_file_path(path: &str) -> Result<(), CliError> {
     if path.is_empty()
         || path.starts_with('/')
         || path.contains('\\')
+        || path.chars().any(char::is_control)
         || path
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
         || !path.starts_with("controller/")
     {
-        return Err(CliError::Http(format!("invalid backup file path: {path}")));
+        return Err(CliError::Http("invalid backup file path".into()));
     }
+    Ok(())
+}
+
+/// Validates the payload in private, automatically removed scratch. Never migrates a source
+/// or changes target state/epochs. The manifest's integrity label is not evidence by itself.
+fn verify_backup_snapshot(archive: &ControllerBackupArchive) -> Result<(), CliError> {
+    let content = |name: &str| -> Result<zeroize::Zeroizing<Vec<u8>>, CliError> {
+        let file = archive
+            .files
+            .iter()
+            .find(|file| file.path == name)
+            .ok_or_else(|| {
+                CliError::Http("backup is missing required controller identity or database".into())
+            })?;
+        Ok(zeroize::Zeroizing::new(hex_decode(&file.content_hex)?))
+    };
+    let mut scratch = tempfile::NamedTempFile::new()?;
+    scratch.write_all(&content("controller/fleet.db")?)?;
+    scratch.flush()?;
+    let inspected = fleet_store::sqlite_snapshot::inspect_quiescent_sqlite_snapshot(scratch.path())
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    if inspected.schema_version != archive.schema_version || archive.sqlite_integrity_check != "ok"
+    {
+        return Err(CliError::Http(
+            "backup database schema or integrity metadata does not match".into(),
+        ));
+    }
+    let public = content("controller/controller_public.key")?;
+    let private = content("controller/controller_private.key")?;
+    let public =
+        std::str::from_utf8(&public).map_err(|_| CliError::InvalidControllerSigningIdentity)?;
+    let private =
+        std::str::from_utf8(&private).map_err(|_| CliError::InvalidControllerSigningIdentity)?;
+    fleet_core::validate_signing_material_pair(
+        public.trim(),
+        private.trim(),
+        "fleet-backup-signing-validation",
+    )
+    .map_err(|_| CliError::InvalidControllerSigningIdentity)?;
     Ok(())
 }
 
@@ -2054,98 +2578,145 @@ fn restore_archive_into_temp_dir(
     for file in &archive.files {
         let path = temp_root.join(&file.path);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            let mut directory = fs::DirBuilder::new();
+            directory.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                directory.mode(0o700);
+            }
+            directory.create(parent)?;
         }
-        fs::write(&path, hex_decode(&file.content_hex)?)?;
-        set_restored_file_permissions(&path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options.open(&path)?;
+        let body = zeroize::Zeroizing::new(hex_decode(&file.content_hex)?);
+        output.write_all(&body)?;
+        output.sync_all()?;
     }
     Ok(())
 }
 
-fn set_restored_file_permissions(path: &Path) -> Result<(), CliError> {
-    #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
-
-fn verify_restored_controller_dir(temp_root: &Path) -> Result<(), CliError> {
+fn verify_restored_controller_dir(
+    temp_root: &Path,
+    lease: &fleet_core::controller_data::ControllerDataLease,
+) -> Result<(), CliError> {
     let db_path = temp_root.join("controller").join("fleet.db");
-    let store = fleet_store::SqliteStore::open(&db_path)?;
-    let integrity = store.integrity_check()?;
+    let mut store = fleet_store::SqliteStore::open(&db_path)
+        .map_err(|_| CliError::Http("restore candidate migration failed".into()))?;
+    let integrity = store
+        .integrity_check()
+        .map_err(|_| CliError::Http("restore candidate integrity check failed".into()))?;
     if integrity != "ok" {
-        return Err(CliError::Http(format!(
-            "restored sqlite integrity check failed: {integrity}"
-        )));
+        return Err(CliError::Http(
+            "restored sqlite integrity check failed".into(),
+        ));
     }
+    fleet_application::RotateControllerStoreEpoch::execute(&mut store)
+        .map_err(|_| CliError::Http("restore candidate delivery epoch rotation failed".into()))?;
+    admin_local::invalidate_restored_human_credentials(&mut store, lease)?;
     Ok(())
 }
 
+/// Caller holds the data lease and owns a fully synced candidate. Success is the commit point;
+/// the exchanged old target stays inside staging until the caller confirms durability/cleanup.
 fn replace_controller_dir(data_dir: &Path, temp_root: &Path, force: bool) -> Result<(), CliError> {
     let target_controller_dir = controller_dir(data_dir);
     let temp_controller_dir = temp_root.join("controller");
-    fs::create_dir_all(data_dir)?;
-    if target_controller_dir.exists() {
-        if directory_exists_and_is_non_empty(&target_controller_dir)? && !force {
-            return Err(CliError::Http(format!(
-                "refusing to overwrite existing controller data dir {}",
-                target_controller_dir.display()
-            )));
+    let target_exists = match fs::symlink_metadata(&target_controller_dir) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => {
+            return Err(CliError::Http(
+                "restore target must be a real controller directory".into(),
+            ));
         }
-        let old_controller_dir =
-            data_dir.join(format!(".controller-restore-old-{}", epoch_millis()));
-        if old_controller_dir.exists() {
-            fs::remove_dir_all(&old_controller_dir)?;
-        }
-        fs::rename(&target_controller_dir, &old_controller_dir)?;
-        match fs::rename(&temp_controller_dir, &target_controller_dir) {
-            Ok(()) => {
-                fs::remove_dir_all(old_controller_dir)?;
-            }
-            Err(error) => {
-                let _ = fs::rename(&old_controller_dir, &target_controller_dir);
-                return Err(CliError::Io(error));
-            }
-        }
-    } else {
-        fs::rename(&temp_controller_dir, &target_controller_dir)?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if target_exists && directory_exists_and_is_non_empty(&target_controller_dir)? && !force {
+        return Err(CliError::Http(format!(
+            "refusing to overwrite existing controller data dir {}",
+            target_controller_dir.display()
+        )));
     }
-    fs::remove_dir_all(temp_root)?;
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        let flags = if target_exists {
+            RenameFlags::EXCHANGE
+        } else {
+            RenameFlags::NOREPLACE
+        };
+        renameat_with(CWD, &temp_controller_dir, CWD, &target_controller_dir, flags)
+            .map_err(|_| CliError::Http("atomic restore installation failed; target was not replaced; filesystem must support atomic directory exchange/no-replace".into()))?;
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = temp_controller_dir;
+        return Err(CliError::Http(
+            "atomic controller restore is unsupported on this platform".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreFinalization {
+    Complete,
+    DurabilityUnconfirmed,
+    CleanupPending,
+}
+
+/// Installation has already committed. Retain rollback staging if parent-directory syncing
+/// fails, and distinguish cleanup failure from a failure to install the new target.
+fn finalize_controller_restore(
+    data_dir: &Path,
+    temporary: tempfile::TempDir,
+) -> RestoreFinalization {
+    if sync_directory(data_dir).is_err() {
+        let _retained = temporary.keep();
+        RestoreFinalization::DurabilityUnconfirmed
+    } else if temporary.close().is_err() {
+        RestoreFinalization::CleanupPending
+    } else {
+        RestoreFinalization::Complete
+    }
+}
+
+fn sync_restore_tree(path: &Path) -> Result<(), CliError> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_restore_tree(&entry.path())?;
+        } else {
+            fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    sync_directory(path)?;
     Ok(())
 }
 
 fn directory_exists_and_is_non_empty(path: &Path) -> Result<bool, CliError> {
-    if !path.exists() {
-        return Ok(false);
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(CliError::Http(
+                "restore target must be a real directory".into(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
     }
     Ok(fs::read_dir(path)?.next().transpose()?.is_some())
-}
-
-fn restore_temp_dir(data_dir: &Path) -> PathBuf {
-    let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
-    let name = data_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("fleet");
-    parent.join(format!(".{name}-restore-tmp-{}", epoch_millis()))
-}
-
-fn ensure_no_sqlite_transient_files(db_path: &Path) -> Result<(), CliError> {
-    for suffix in ["-wal", "-shm"] {
-        let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
-        if path.exists() {
-            return Err(CliError::Http(format!(
-                "refusing to backup SQLite database with transient file present: {}; stop the controller and retry",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn sha256_hex(content: &[u8]) -> String {
@@ -2169,10 +2740,10 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, CliError> {
         .as_bytes()
         .chunks_exact(2)
         .map(|pair| {
-            let text =
-                std::str::from_utf8(pair).map_err(|error| CliError::Http(error.to_string()))?;
+            let text = std::str::from_utf8(pair)
+                .map_err(|_| CliError::Http("invalid backup hex encoding".into()))?;
             u8::from_str_radix(text, 16)
-                .map_err(|_| CliError::Http(format!("invalid hex byte in backup content: {text}")))
+                .map_err(|_| CliError::Http("invalid hex byte in backup content".into()))
         })
         .collect()
 }
@@ -3481,7 +4052,8 @@ fn execute_demo(command: DemoCommand) -> Result<(), CliError> {
         None => free_loopback_port()?,
     };
     let data_dir = unique_demo_dir();
-    fs::create_dir_all(controller_dir(&data_dir))?;
+    let setup_lease = fleet_core::controller_data::ControllerDataLease::acquire(&data_dir)?;
+    admin_local::prepare_controller_dir(&data_dir)?;
     fs::create_dir_all(agent_dir(&data_dir))?;
 
     let store = fleet_store::SqliteStore::open(controller_db_path(&data_dir))?;
@@ -3497,6 +4069,8 @@ fn execute_demo(command: DemoCommand) -> Result<(), CliError> {
         1,
     )?;
     drop(store);
+
+    drop(setup_lease);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = shutdown.clone();
@@ -3529,12 +4103,11 @@ fn execute_demo(command: DemoCommand) -> Result<(), CliError> {
     let agent_config = enroll_demo_agent(&data_dir, &controller_url, &enroll_token)?;
     create_demo_command_job(port, &admin_token)?;
     run_agent_heartbeat_once(&agent_config, true)?;
-    let output = http_get(port, "/api/jobs/job-demo-1/output", Some(&admin_token))?;
-    if !output.contains("demo-ok") {
-        return Err(CliError::Http(format!(
-            "demo command output was not observed: {output}"
-        )));
-    }
+    let output = wait_for_demo_output(
+        || http_get(port, "/api/jobs/job-demo-1/output", Some(&admin_token)),
+        std::thread::sleep,
+        Duration::from_secs(5),
+    )?;
     let rendered_output = render_job_output_api_for_cli(&output)?;
 
     println!("demo controller: {controller_url}");
@@ -3554,6 +4127,26 @@ fn execute_demo(command: DemoCommand) -> Result<(), CliError> {
         print!("{line}");
     }
     Ok(())
+}
+
+fn wait_for_demo_output(
+    mut read: impl FnMut() -> Result<String, CliError>,
+    mut sleep: impl FnMut(Duration),
+    limit: Duration,
+) -> Result<String, CliError> {
+    let started = std::time::Instant::now();
+    loop {
+        let output = read()?;
+        if output.contains("demo-ok") {
+            return Ok(output);
+        }
+        if started.elapsed() >= limit {
+            return Err(CliError::Http(
+                "demo command output was not observed before deadline".to_owned(),
+            ));
+        }
+        sleep(Duration::from_millis(50).min(limit.saturating_sub(started.elapsed())));
+    }
 }
 
 fn enroll_demo_agent(
@@ -3672,7 +4265,8 @@ fn http_request(
     Ok(response)
 }
 
-fn http_request_url(
+fn http_request_url_with_client(
+    client: &reqwest::blocking::Client,
     url: &str,
     method: &str,
     path: &str,
@@ -3684,7 +4278,6 @@ fn http_request_url(
     let body = body.unwrap_or_default();
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|error| CliError::Http(error.to_string()))?;
-    let client = reqwest::blocking::Client::new();
     let mut request = client.request(method, endpoint.api_url(path));
     if let Some(token) = bearer_token {
         request = request.bearer_auth(token);
@@ -4482,6 +5075,7 @@ struct LocalAgentConfig {
     private_key: String,
     controller_fingerprint: String,
     replay_store_path: PathBuf,
+    delivery_journal_path: PathBuf,
     controller_trust_bundle_path: PathBuf,
     controller_trust_bundle: Option<fleet_domain::ControllerSigningTrustBundle>,
 }
@@ -4538,6 +5132,7 @@ fn read_agent_config(path: &Path) -> Result<LocalAgentConfig, CliError> {
         private_key,
         controller_fingerprint: value("controller_fingerprint")?,
         replay_store_path: agent_replay_store_path(path),
+        delivery_journal_path: agent_delivery_journal_path(path),
         controller_trust_bundle_path,
         controller_trust_bundle,
     })
@@ -4548,6 +5143,14 @@ fn agent_replay_store_path(config_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("task_nonces.log")
+}
+
+fn agent_delivery_journal_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("journal")
+        .join("reports.sqlite3")
 }
 
 fn agent_controller_trust_bundle_path(config_path: &Path) -> PathBuf {
@@ -4880,50 +5483,7 @@ fn run_agent_heartbeat_once(
     let (mut socket, _) =
         connect_agent_websocket(&ws_url, &endpoint, config.tls_ca_cert.as_deref())?;
     let correlation_id = prefixed_ulid("corr")?;
-
-    let hello = fleet_protocol::WireMessage::new(
-        prefixed_ulid("msg")?,
-        correlation_id.clone(),
-        Some(config.agent_id.clone()),
-        epoch_millis() as u64,
-        fleet_protocol::WirePayload::AgentHello {
-            agent_id: config.agent_id.clone(),
-            fingerprint: config.fingerprint.clone(),
-        },
-    );
-    socket
-        .send(Message::Text(
-            fleet_protocol::encode_message(&hello)
-                .map_err(|error| CliError::Http(error.to_string()))?,
-        ))
-        .map_err(|error| CliError::Http(error.to_string()))?;
-
-    let challenge = read_ws_message(&mut socket)?;
-    let fleet_protocol::WirePayload::AuthChallenge { nonce } = challenge.payload else {
-        return Err(CliError::Http("expected auth challenge".to_owned()));
-    };
-
-    let auth = fleet_protocol::WireMessage::new(
-        prefixed_ulid("msg")?,
-        correlation_id.clone(),
-        Some(config.agent_id.clone()),
-        epoch_millis() as u64,
-        fleet_protocol::WirePayload::AuthResponse {
-            nonce: nonce.clone(),
-            signature: fleet_core::sign_challenge(&config.private_key, &nonce)?,
-        },
-    );
-    socket
-        .send(Message::Text(
-            fleet_protocol::encode_message(&auth)
-                .map_err(|error| CliError::Http(error.to_string()))?,
-        ))
-        .map_err(|error| CliError::Http(error.to_string()))?;
-
-    let accepted = read_ws_message(&mut socket)?;
-    if !matches!(accepted.payload, fleet_protocol::WirePayload::AuthAccepted) {
-        return Err(CliError::Http("expected auth accepted".to_owned()));
-    }
+    let _delivery_identity = perform_agent_session_handshake(&mut socket, config, &correlation_id)?;
     set_agent_socket_read_timeout(&mut socket, Some(Duration::from_secs(10)))?;
 
     let heartbeat = fleet_protocol::WireMessage::new(
@@ -4983,12 +5543,26 @@ struct AgentTaskSessionState {
     runtime: Arc<AgentTaskRuntimeState>,
     replay_guard: Arc<Mutex<fleet_runner::NonceReplayGuard>>,
     controller_trust_bundle: Arc<Mutex<Option<fleet_domain::ControllerSigningTrustBundle>>>,
+    journal_client: Arc<Mutex<Option<fleet_agent::journal_worker::JournalClient>>>,
+    delivery_identity: Arc<Mutex<Option<ControllerDeliveryIdentity>>>,
 }
 
 struct AgentSessionRuntime {
     task_state: AgentTaskSessionState,
     connection: fleet_agent::AgentSessionSupervisor<()>,
     outbound_queue: AgentOutboundQueue,
+    journal_worker: Option<fleet_agent::journal_worker::JournalWorker>,
+    journal_namespace: Option<String>,
+}
+
+struct AgentTaskExecutionSession<'a> {
+    outbound_sender: &'a AgentOutboundQueue,
+    config: &'a LocalAgentConfig,
+    controller_public_key: &'a str,
+    correlation_id: &'a str,
+    task_state: &'a AgentTaskSessionState,
+    journal_client: &'a fleet_agent::journal_worker::JournalClient,
+    controller_namespace: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5076,6 +5650,8 @@ fn agent_task_session_state(config: &LocalAgentConfig) -> Result<AgentTaskSessio
         runtime: Arc::new(AgentTaskRuntimeState::default()),
         replay_guard: Arc::new(Mutex::new(agent_nonce_replay_guard(config)?)),
         controller_trust_bundle: Arc::new(Mutex::new(config.controller_trust_bundle.clone())),
+        journal_client: Arc::new(Mutex::new(None)),
+        delivery_identity: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -5086,7 +5662,112 @@ fn agent_session_runtime(config: &LocalAgentConfig) -> Result<AgentSessionRuntim
         outbound_queue: Arc::new(Mutex::new(fleet_agent::AgentSessionSupervisor::new(
             AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY,
         ))),
+        journal_worker: None,
+        journal_namespace: None,
     })
+}
+
+fn ensure_agent_journal_worker(
+    runtime: &mut AgentSessionRuntime,
+    config: &LocalAgentConfig,
+    delivery_identity: &ControllerDeliveryIdentity,
+) -> Result<fleet_agent::journal_worker::JournalClient, CliError> {
+    if let Some(bound_namespace) = runtime.journal_namespace.as_deref() {
+        if bound_namespace != delivery_identity.namespace {
+            return Err(CliError::Http(
+                "agent journal belongs to a different controller identity".to_owned(),
+            ));
+        }
+    } else {
+        ensure_agent_journal_directory(&config.delivery_journal_path)?;
+        let repository = fleet_store::agent_journal::SqliteAgentJournal::open(
+            &config.delivery_journal_path,
+            &delivery_identity.namespace,
+            &config.agent_id,
+        )
+        .map_err(|error| CliError::Http(error.to_string()))?;
+        let capacity = fleet_domain::delivery::JournalCapacity::new(
+            fleet_domain::delivery::JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            fleet_domain::delivery::JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .map_err(|error| CliError::Http(error.to_string()))?;
+        let limits = fleet_agent::journal_worker::JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .map_err(|error| CliError::Http(error.to_string()))?;
+        let worker =
+            fleet_agent::journal_worker::JournalWorker::spawn(repository, capacity, limits)
+                .map_err(|error| CliError::Http(error.to_string()))?;
+        runtime.journal_namespace = Some(delivery_identity.namespace.clone());
+        runtime.journal_worker = Some(worker);
+    }
+
+    let client = runtime
+        .journal_worker
+        .as_ref()
+        .ok_or_else(|| CliError::Http("agent journal worker is unavailable".to_owned()))?
+        .client();
+    if !runtime.task_state.busy.load(Ordering::SeqCst) {
+        recover_interrupted_agent_execution(&client)?;
+    }
+    *runtime
+        .task_state
+        .journal_client
+        .lock()
+        .map_err(|_| CliError::Http("agent journal client lock poisoned".to_owned()))? =
+        Some(client.clone());
+    *runtime
+        .task_state
+        .delivery_identity
+        .lock()
+        .map_err(|_| CliError::Http("agent delivery identity lock poisoned".to_owned()))? =
+        Some(delivery_identity.clone());
+    Ok(client)
+}
+
+fn ensure_agent_journal_directory(path: &Path) -> Result<(), CliError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CliError::Http("agent journal path has no parent".to_owned()))?;
+    let agent_directory = parent
+        .parent()
+        .ok_or_else(|| CliError::Http("agent journal path has no owner directory".to_owned()))?;
+    fs::create_dir_all(agent_directory)?;
+    let owner_metadata = fs::symlink_metadata(agent_directory)?;
+    if owner_metadata.file_type().is_symlink() || !owner_metadata.is_dir() {
+        return Err(CliError::Http(
+            "agent journal owner path is not a directory".to_owned(),
+        ));
+    }
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(CliError::Http(
+                    "agent journal path is not a directory".to_owned(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(CliError::Io(error)),
+            }
+        }
+        Err(error) => return Err(CliError::Io(error)),
+    }
+    Ok(())
 }
 
 fn agent_controller_signing_trust_bundle(
@@ -5164,7 +5845,10 @@ fn run_agent_session_connected_once(
     set_agent_socket_read_timeout(&mut socket, Some(AGENT_SESSION_READ_POLL_INTERVAL))?;
     let correlation_id = prefixed_ulid("corr")?;
 
-    perform_agent_session_handshake(&mut socket, config, &correlation_id)?;
+    let delivery_identity = perform_agent_session_handshake(&mut socket, config, &correlation_id)?;
+    let journal_client = ensure_agent_journal_worker(runtime, config, &delivery_identity)?;
+    let mut report_delivery =
+        AgentJournalReportDelivery::new(journal_client, delivery_identity.clone());
     runtime.connection.mark_authenticated().map_err(|_| {
         CliError::Http("invalid agent session authentication transition".to_owned())
     })?;
@@ -5186,17 +5870,32 @@ fn run_agent_session_connected_once(
     };
 
     loop {
+        report_delivery.drive(&mut socket, config, &correlation_id)?;
         flush_agent_outbound_queue(&mut socket, &runtime.outbound_queue)?;
 
         match read_agent_session_message(&mut socket)? {
-            AgentSessionInbound::Message(message) => handle_agent_session_message(
-                *message,
-                config,
-                controller_signing_public_key(&identity),
-                &correlation_id,
-                &runtime.outbound_queue,
-                &runtime.task_state,
-            )?,
+            AgentSessionInbound::Message(message) => {
+                let message = *message;
+                if let fleet_protocol::WirePayload::ReportReceipt(receipt) = &message.payload {
+                    report_delivery.handle_receipt(
+                        &message,
+                        receipt,
+                        config,
+                        controller_signing_public_key(&identity),
+                        &correlation_id,
+                        &runtime.task_state,
+                    )?;
+                } else {
+                    handle_agent_session_message(
+                        message,
+                        config,
+                        controller_signing_public_key(&identity),
+                        &correlation_id,
+                        &runtime.outbound_queue,
+                        &runtime.task_state,
+                    )?;
+                }
+            }
             AgentSessionInbound::Idle => {}
             AgentSessionInbound::Closed => return Ok(AgentSessionEnd::ControllerClosed),
         }
@@ -5228,6 +5927,7 @@ fn run_agent_session_connected_once(
             last_log = now;
         }
         flush_agent_outbound_queue(&mut socket, &runtime.outbound_queue)?;
+        report_delivery.drive(&mut socket, config, &correlation_id)?;
     }
 }
 
@@ -5268,7 +5968,7 @@ fn perform_agent_session_handshake(
     socket: &mut AgentWebSocket,
     config: &LocalAgentConfig,
     correlation_id: &str,
-) -> Result<(), CliError> {
+) -> Result<ControllerDeliveryIdentity, CliError> {
     send_wire_message_to_socket(
         socket,
         &fleet_protocol::WireMessage::new(
@@ -5303,10 +6003,46 @@ fn perform_agent_session_handshake(
     )?;
 
     let accepted = read_ws_message(socket)?;
-    if !matches!(accepted.payload, fleet_protocol::WirePayload::AuthAccepted) {
-        return Err(CliError::Http("expected auth accepted".to_owned()));
+    controller_delivery_identity_from_auth_accepted(accepted, &config.agent_id, correlation_id)
+}
+
+fn controller_delivery_identity_from_auth_accepted(
+    message: fleet_protocol::WireMessage,
+    expected_agent_id: &str,
+    expected_correlation_id: &str,
+) -> Result<ControllerDeliveryIdentity, CliError> {
+    if message.agent_id.as_deref() != Some(expected_agent_id)
+        || message.correlation_id.0 != expected_correlation_id
+    {
+        return Err(CliError::Http(
+            "auth accepted session identity mismatch".to_owned(),
+        ));
     }
-    Ok(())
+    let fleet_protocol::WirePayload::AuthAccepted {
+        controller_namespace,
+        store_epoch,
+    } = message.payload
+    else {
+        return Err(CliError::Http("expected auth accepted".to_owned()));
+    };
+    if !controller_delivery_identity_component_is_valid(&controller_namespace)
+        || !controller_delivery_identity_component_is_valid(&store_epoch)
+    {
+        return Err(CliError::Http(
+            "controller delivery identity is invalid".to_owned(),
+        ));
+    }
+    Ok(ControllerDeliveryIdentity {
+        namespace: controller_namespace,
+        store_epoch,
+    })
+}
+
+fn controller_delivery_identity_component_is_valid(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn enqueue_initial_agent_session_messages(
@@ -5503,37 +6239,75 @@ fn handle_agent_session_message(
         _ => return Ok(()),
     };
     if task_state.busy.swap(true, Ordering::SeqCst) {
-        enqueue_wire_message(
-            outbound_sender,
-            agent_task_rejected_message(
-                config,
-                correlation_id,
-                &envelope.job_id,
-                &envelope.task_id,
-                fleet_protocol::TaskRejectionReasonCode::AgentBusy,
-                "agent is busy",
-            )?,
+        let journal_client = task_state
+            .journal_client
+            .lock()
+            .map_err(|_| CliError::Http("agent journal client lock poisoned".to_owned()))?
+            .clone()
+            .ok_or_else(|| CliError::Http("agent journal client is unavailable".to_owned()))?;
+        let delivery_identity = task_state
+            .delivery_identity
+            .lock()
+            .map_err(|_| CliError::Http("agent delivery identity lock poisoned".to_owned()))?
+            .clone()
+            .ok_or_else(|| CliError::Http("agent delivery identity is unavailable".to_owned()))?;
+        persist_agent_task_rejected_report_with_journal(
+            &journal_client,
+            &delivery_identity.namespace,
+            config,
+            &envelope.job_id,
+            &envelope.task_id,
+            fleet_protocol::TaskRejectionReasonCode::AgentBusy,
+            "agent is busy",
         )?;
         return Ok(());
     }
-    task_state.runtime.start_task(&envelope.task_id)?;
+    let worker_context = (|| {
+        let journal_client = task_state
+            .journal_client
+            .lock()
+            .map_err(|_| CliError::Http("agent journal client lock poisoned".to_owned()))?
+            .clone()
+            .ok_or_else(|| CliError::Http("agent journal client is unavailable".to_owned()))?;
+        let delivery_identity = task_state
+            .delivery_identity
+            .lock()
+            .map_err(|_| CliError::Http("agent delivery identity lock poisoned".to_owned()))?
+            .clone()
+            .ok_or_else(|| CliError::Http("agent delivery identity is unavailable".to_owned()))?;
+        Ok::<_, CliError>((journal_client, delivery_identity))
+    })();
+    let (journal_client, delivery_identity) = match worker_context {
+        Ok(context) => context,
+        Err(error) => {
+            task_state.busy.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    if let Err(error) = task_state.runtime.start_task(&envelope.task_id) {
+        task_state.busy.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
 
     let worker_config = config.clone();
     let worker_public_key = controller_public_key.to_owned();
     let worker_correlation_id = correlation_id.to_owned();
     let worker_sender = outbound_sender.clone();
     let worker_task_state = task_state.clone();
+    let worker_journal_client = journal_client.clone();
+    let worker_delivery_namespace = delivery_identity.namespace.clone();
     let worker_task_id = envelope.task_id.clone();
     thread::spawn(move || {
-        if let Err(error) = handle_task_assignment_with_queue(
-            &worker_sender,
-            &worker_config,
-            &worker_public_key,
-            &worker_correlation_id,
-            envelope,
-            task,
-            &worker_task_state,
-        ) {
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &worker_sender,
+            config: &worker_config,
+            controller_public_key: &worker_public_key,
+            correlation_id: &worker_correlation_id,
+            task_state: &worker_task_state,
+            journal_client: &worker_journal_client,
+            controller_namespace: &worker_delivery_namespace,
+        };
+        if let Err(error) = handle_task_assignment_with_queue(&session, envelope, task) {
             let _ = enqueue_wire_message(
                 &worker_sender,
                 agent_security_event_message(
@@ -6489,112 +7263,139 @@ fn read_and_handle_task_assignment(
 }
 
 fn handle_task_assignment_with_queue(
-    outbound_sender: &AgentOutboundQueue,
-    config: &LocalAgentConfig,
-    controller_public_key: &str,
-    correlation_id: &str,
+    session: &AgentTaskExecutionSession<'_>,
     envelope: fleet_protocol::SignedTaskEnvelopeWire,
     task: fleet_protocol::TaskWire,
-    task_state: &AgentTaskSessionState,
 ) -> Result<(), CliError> {
     let envelope = task_envelope_from_wire(envelope)?;
     let verification = verify_agent_task_envelope_once_with_session_trust(
         &envelope,
-        config,
-        controller_public_key,
-        task_state,
+        session.config,
+        session.controller_public_key,
+        session.task_state,
         SystemTime::now(),
     )?;
     if let Err(error) = verification {
-        send_agent_task_rejected_queue(
-            outbound_sender,
-            config,
-            correlation_id,
+        persist_agent_task_rejected_report(
+            session,
             &envelope,
             task_rejection_reason_from_runner_error(&error),
             &error.to_string(),
         )?;
         return Ok(());
     }
-    if task_state.runtime.should_cancel(envelope.task_id.as_str()) {
-        send_agent_task_result_queue(
-            outbound_sender,
-            config,
-            correlation_id,
-            &envelope,
+    recover_interrupted_agent_execution(session.journal_client)?;
+    if session
+        .task_state
+        .runtime
+        .should_cancel(envelope.task_id.as_str())
+    {
+        let canceled = AgentTaskResultReport::new(
             -1,
             fleet_protocol::TaskResultStatus::Canceled,
             "operator requested cancel",
+        );
+        persist_no_artifact_final_result_report(
+            session.journal_client,
+            session.controller_namespace,
+            session.config,
+            &envelope,
+            canceled,
         )?;
         return Ok(());
     }
-    send_agent_task_ack_queue(outbound_sender, config, correlation_id, &envelope)?;
-
     match task {
         fleet_protocol::TaskWire::Command(command) => {
-            run_signed_command_task_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                &envelope,
-                command,
-                task_state.runtime.as_ref(),
-            )?;
+            run_signed_command_task_queue(session, &envelope, command)?;
         }
         fleet_protocol::TaskWire::DriftCheck(task) => {
-            run_signed_drift_check_task_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                &envelope,
-                task,
-            )?;
+            persist_agent_task_ack_report(session, &envelope)?;
+            run_signed_drift_check_task_queue(session, &envelope, task)?;
         }
         fleet_protocol::TaskWire::RunbookExecution(task) => {
-            run_signed_runbook_task_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                &envelope,
-                task,
-            )?;
+            run_signed_runbook_task_queue(session, &envelope, task)?;
         }
     }
     Ok(())
 }
 
 fn run_signed_command_task_queue(
-    outbound_sender: &AgentOutboundQueue,
-    config: &LocalAgentConfig,
-    correlation_id: &str,
+    session: &AgentTaskExecutionSession<'_>,
     envelope: &fleet_domain::TaskEnvelope,
     command: fleet_protocol::CommandTaskWire,
-    task_runtime: &AgentTaskRuntimeState,
 ) -> Result<(), CliError> {
+    use fleet_application::delivery::ExecutionAdmission;
+
+    let execution =
+        agent_task_execution_record(session.controller_namespace, session.config, envelope)?;
+    let admission = session
+        .journal_client
+        .admit(&execution)
+        .map_err(|error| CliError::Http(error.to_string()))?
+        .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    if admission == ExecutionAdmission::AlreadyRecorded {
+        // The existing execution record owns its durable final report. A new
+        // rejection could terminalize a still-dispatched Assignment ahead of
+        // that result, so replay the original reports without adding another event.
+        return Ok(());
+    }
+    let final_report_key = &execution.snapshot().final_report_key;
+    session
+        .journal_client
+        .start(final_report_key)
+        .map_err(|error| CliError::Http(error.to_string()))?
+        .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    persist_agent_task_ack_report(session, envelope)?;
     let mut spec = fleet_runner::CommandSpec::new(
         command.program,
         command.args,
         Duration::from_millis(command.timeout_ms),
     );
     spec.max_output_bytes = command.max_output_bytes;
-    send_agent_task_started_queue(outbound_sender, config, correlation_id, envelope)?;
+    persist_agent_task_started_report(session, envelope)?;
     let mut streamed_any = false;
+    let mut stdout_chunks = 0u64;
+    let mut stderr_chunks = 0u64;
+    let mut output_journal_error = None;
     let task_id = envelope.task_id.as_str().to_owned();
     let result = fleet_runner::run_command_streaming_with_cancel(
         spec,
-        || task_runtime.should_cancel(&task_id),
+        || session.task_state.runtime.should_cancel(&task_id),
         |chunk| {
+            let stream = chunk.stream;
+            if let Err(error) = persist_task_output_report(
+                session.journal_client,
+                session.controller_namespace,
+                session.config,
+                envelope,
+                chunk,
+            ) {
+                let message = error.to_string();
+                output_journal_error = Some(error);
+                return Err(fleet_runner::RunnerError::Stream(message));
+            }
             streamed_any = true;
-            send_agent_output_chunk_queue(outbound_sender, config, correlation_id, envelope, chunk)
-                .map_err(|error| fleet_runner::RunnerError::Stream(error.to_string()))
+            match stream {
+                fleet_runner::CommandOutputStream::Stdout => stdout_chunks += 1,
+                fleet_runner::CommandOutputStream::Stderr => stderr_chunks += 1,
+            }
+            Ok(())
         },
     );
+    if let Some(error) = output_journal_error {
+        // A timed-out wait does not prove that a journal write failed; it may
+        // still commit. Without a confirmed count, never append a contradictory final.
+        return Err(error);
+    }
+    let capture_truncated = result.is_err();
     let (output, result_status, reason) = command_execution_result(result);
     if !streamed_any && output.exit_code != 0 && !output.stderr.is_empty() {
-        send_agent_output_chunk_queue(
-            outbound_sender,
-            config,
-            correlation_id,
+        persist_task_output_report(
+            session.journal_client,
+            session.controller_namespace,
+            session.config,
             envelope,
             fleet_runner::CommandOutputChunk {
                 stream: fleet_runner::CommandOutputStream::Stderr,
@@ -6602,15 +7403,26 @@ fn run_signed_command_task_queue(
                 data: output.stderr.clone(),
             },
         )?;
+        stderr_chunks = 1;
     }
-    send_agent_task_result_queue(
-        outbound_sender,
-        config,
-        correlation_id,
+    let truncated = capture_truncated || output.truncated;
+    let status = if truncated && result_status == fleet_protocol::TaskResultStatus::Succeeded {
+        fleet_protocol::TaskResultStatus::Failed
+    } else {
+        result_status
+    };
+    persist_no_artifact_final_result_report(
+        session.journal_client,
+        session.controller_namespace,
+        session.config,
         envelope,
-        output.exit_code,
-        result_status,
-        &reason,
+        AgentTaskResultReport::new(output.exit_code, status, &reason).with_output_summary(
+            fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks,
+                stderr_chunks,
+                truncated,
+            },
+        ),
     )?;
     Ok(())
 }
@@ -6670,66 +7482,99 @@ fn command_execution_result(
 }
 
 fn run_signed_drift_check_task_queue(
-    outbound_sender: &AgentOutboundQueue,
-    config: &LocalAgentConfig,
-    correlation_id: &str,
+    session: &AgentTaskExecutionSession<'_>,
     envelope: &fleet_domain::TaskEnvelope,
     task: fleet_protocol::DriftCheckTaskWire,
 ) -> Result<(), CliError> {
+    let config = session.config;
     let policy = match fleet_domain::parse_policy_document(&task.policy_document) {
         Ok(policy) => policy,
         Err(error) => {
-            send_agent_output_chunk_queue(
-                outbound_sender,
+            persist_no_artifact_final_result_report(
+                session.journal_client,
+                session.controller_namespace,
                 config,
-                correlation_id,
                 envelope,
-                fleet_runner::CommandOutputChunk {
-                    stream: fleet_runner::CommandOutputStream::Stderr,
-                    sequence: 0,
-                    data: format!("invalid drift policy: {error}"),
-                },
-            )?;
-            send_agent_task_result_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                envelope,
-                -1,
-                fleet_protocol::TaskResultStatus::Failed,
-                &error.to_string(),
+                AgentTaskResultReport::new(
+                    -1,
+                    fleet_protocol::TaskResultStatus::Failed,
+                    &format!("invalid drift policy: {error}"),
+                ),
             )?;
             return Ok(());
         }
     };
-    send_agent_task_started_queue(outbound_sender, config, correlation_id, envelope)?;
+    persist_agent_task_started_report(session, envelope)?;
     let report = fleet_runner::evaluate_policy_drift(&policy, &fleet_runner::LocalDriftProbe);
-    enqueue_wire_message(
-        outbound_sender,
-        fleet_protocol::WireMessage::new(
-            prefixed_ulid("msg")?,
-            correlation_id.to_owned(),
-            Some(config.agent_id.clone()),
-            epoch_millis() as u64,
-            drift_report_payload_for_envelope(
-                &config.agent_id,
-                envelope,
-                drift_status_to_cli(&report.status).to_owned(),
-                report.expected,
-                report.actual,
-            ),
-        ),
-    )?;
-    send_agent_task_result_queue(
-        outbound_sender,
+    persist_agent_drift_evidence_report(
+        session.journal_client,
+        session.controller_namespace,
         config,
-        correlation_id,
         envelope,
-        0,
-        fleet_protocol::TaskResultStatus::Succeeded,
-        "",
+        &fleet_protocol::delivery_v2::V2DriftEvidenceReportBody {
+            status: drift_status_to_wire(&report.status),
+            expected: report.expected,
+            actual: report.actual,
+        },
+    )?;
+    persist_no_artifact_final_result_report(
+        session.journal_client,
+        session.controller_namespace,
+        config,
+        envelope,
+        AgentTaskResultReport::new(0, fleet_protocol::TaskResultStatus::Succeeded, ""),
     )?;
     Ok(())
+}
+
+fn persist_agent_drift_evidence_report(
+    journal: &fleet_agent::journal_worker::JournalClient,
+    controller_namespace: &str,
+    config: &LocalAgentConfig,
+    envelope: &fleet_domain::TaskEnvelope,
+    body: &fleet_protocol::delivery_v2::V2DriftEvidenceReportBody,
+) -> Result<(), CliError> {
+    use fleet_application::delivery::JournalReport;
+    use fleet_domain::delivery::ReportClass;
+
+    let key = lifecycle_report_key(
+        controller_namespace,
+        config,
+        envelope.job_id.as_str(),
+        envelope.task_id.as_str(),
+        "drift-evidence",
+    )?;
+    let encoded_body = serde_json::to_vec(body)
+        .map_err(|_| CliError::Http("failed to encode drift evidence report".to_owned()))?;
+    if encoded_body.len() > fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES {
+        return Err(CliError::Http(
+            "drift evidence report exceeds protocol limit".to_owned(),
+        ));
+    }
+    let report = JournalReport::new(key, ReportClass::DriftEvidence, encoded_body)
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    journal
+        .append(&report)
+        .map_err(|error| CliError::Http(error.to_string()))?
+        .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    Ok(())
+}
+
+fn drift_status_to_wire(
+    status: &fleet_domain::DriftStatus,
+) -> fleet_protocol::delivery_v2::V2DriftStatusWire {
+    match status {
+        fleet_domain::DriftStatus::Compliant => {
+            fleet_protocol::delivery_v2::V2DriftStatusWire::Compliant
+        }
+        fleet_domain::DriftStatus::Drifted => {
+            fleet_protocol::delivery_v2::V2DriftStatusWire::Drifted
+        }
+        fleet_domain::DriftStatus::Unknown => {
+            fleet_protocol::delivery_v2::V2DriftStatusWire::Unknown
+        }
+    }
 }
 
 fn drift_report_payload_for_envelope(
@@ -6750,34 +7595,47 @@ fn drift_report_payload_for_envelope(
 }
 
 fn run_signed_runbook_task_queue(
-    outbound_sender: &AgentOutboundQueue,
-    config: &LocalAgentConfig,
-    correlation_id: &str,
+    session: &AgentTaskExecutionSession<'_>,
     envelope: &fleet_domain::TaskEnvelope,
     task: fleet_protocol::RunbookExecutionTaskWire,
 ) -> Result<(), CliError> {
+    run_signed_runbook_task_queue_with_executor(session, envelope, task, |plan, options| {
+        fleet_runner::execute_runbook_execution_plan_with_hooks(
+            plan,
+            options,
+            runbook_command_runner,
+            fleet_runner::copy_file_atomic,
+            fleet_runner::check_tcp_port,
+            fleet_runner::check_local_process,
+            collect_runbook_snapshot,
+        )
+    })
+}
+
+fn run_signed_runbook_task_queue_with_executor<E>(
+    session: &AgentTaskExecutionSession<'_>,
+    envelope: &fleet_domain::TaskEnvelope,
+    task: fleet_protocol::RunbookExecutionTaskWire,
+    execute: E,
+) -> Result<(), CliError>
+where
+    E: FnOnce(
+        &fleet_runner::RunbookExecutionPlan,
+        fleet_runner::RunbookExecutionOptions,
+    ) -> Result<fleet_runner::RunbookExecutionReport, fleet_runner::RunnerError>,
+{
+    let config = session.config;
     let runbook = match fleet_domain::parse_runbook_document(&task.runbook_document) {
         Ok(runbook) => runbook,
         Err(error) => {
-            send_agent_output_chunk_queue(
-                outbound_sender,
-                config,
-                correlation_id,
+            let reason = error.to_string();
+            persist_agent_task_ack_report(session, envelope)?;
+            persist_runbook_failure_with_output(
+                session,
                 envelope,
-                fleet_runner::CommandOutputChunk {
-                    stream: fleet_runner::CommandOutputStream::Stderr,
-                    sequence: 0,
-                    data: format!("invalid runbook: {error}"),
-                },
-            )?;
-            send_agent_task_result_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                envelope,
-                -1,
-                fleet_protocol::TaskResultStatus::Failed,
-                &error.to_string(),
+                &reason,
+                format!("invalid runbook: {reason}"),
+                false,
             )?;
             return Ok(());
         }
@@ -6785,26 +7643,8 @@ fn run_signed_runbook_task_queue(
     let package_manager = match local_runbook_package_manager(&runbook) {
         Ok(package_manager) => package_manager,
         Err(error) => {
-            send_agent_output_chunk_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                envelope,
-                fleet_runner::CommandOutputChunk {
-                    stream: fleet_runner::CommandOutputStream::Stderr,
-                    sequence: 0,
-                    data: error.to_owned(),
-                },
-            )?;
-            send_agent_task_result_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                envelope,
-                -1,
-                fleet_protocol::TaskResultStatus::Failed,
-                error,
-            )?;
+            persist_agent_task_ack_report(session, envelope)?;
+            persist_runbook_failure_with_output(session, envelope, error, error.to_owned(), false)?;
             return Ok(());
         }
     };
@@ -6816,31 +7656,42 @@ fn run_signed_runbook_task_queue(
     ) {
         Ok(plan) => plan,
         Err(error) => {
-            send_agent_output_chunk_queue(
-                outbound_sender,
-                config,
-                correlation_id,
+            let reason = error.to_string();
+            persist_agent_task_ack_report(session, envelope)?;
+            persist_runbook_failure_with_output(
+                session,
                 envelope,
-                fleet_runner::CommandOutputChunk {
-                    stream: fleet_runner::CommandOutputStream::Stderr,
-                    sequence: 0,
-                    data: format!("invalid runbook primitive: {error}"),
-                },
-            )?;
-            send_agent_task_result_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                envelope,
-                -1,
-                fleet_protocol::TaskResultStatus::Failed,
-                &error.to_string(),
+                &reason,
+                format!("invalid runbook primitive: {reason}"),
+                false,
             )?;
             return Ok(());
         }
     };
-    send_agent_task_started_queue(outbound_sender, config, correlation_id, envelope)?;
-    let report = match fleet_runner::execute_runbook_execution_plan_with_hooks(
+    if !runbook_execution_plan_has_artifact_results(&plan) {
+        use fleet_application::delivery::ExecutionAdmission;
+
+        let execution =
+            agent_task_execution_record(session.controller_namespace, config, envelope)?;
+        let admission = session
+            .journal_client
+            .admit(&execution)
+            .map_err(|error| CliError::Http(error.to_string()))?
+            .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+            .map_err(|error| CliError::Http(error.to_string()))?;
+        if admission == ExecutionAdmission::AlreadyRecorded {
+            return Ok(());
+        }
+        session
+            .journal_client
+            .start(&execution.snapshot().final_report_key)
+            .map_err(|error| CliError::Http(error.to_string()))?
+            .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+            .map_err(|error| CliError::Http(error.to_string()))?;
+    }
+    persist_agent_task_ack_report(session, envelope)?;
+    persist_agent_task_started_report(session, envelope)?;
+    let report = match execute(
         &plan,
         fleet_runner::RunbookExecutionOptions {
             confirmed_high_risk: task.confirmed_high_risk,
@@ -6849,40 +7700,16 @@ fn run_signed_runbook_task_queue(
             command_timeout: Duration::from_millis(task.timeout_ms),
             ..fleet_runner::RunbookExecutionOptions::default()
         },
-        runbook_command_runner,
-        fleet_runner::copy_file_atomic,
-        fleet_runner::check_tcp_port,
-        fleet_runner::check_local_process,
-        collect_runbook_snapshot,
     ) {
         Ok(report) => report,
         Err(error) => {
-            send_agent_output_chunk_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                envelope,
-                fleet_runner::CommandOutputChunk {
-                    stream: fleet_runner::CommandOutputStream::Stderr,
-                    sequence: 0,
-                    data: error.to_string(),
-                },
-            )?;
-            send_agent_task_result_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                envelope,
-                -1,
-                fleet_protocol::TaskResultStatus::Failed,
-                &error.to_string(),
-            )?;
+            let reason = error.to_string();
+            persist_runbook_failure_with_output(session, envelope, &reason, reason.clone(), true)?;
             return Ok(());
         }
     };
-    let mut sequence = 0;
     let mut artifacts = Vec::new();
-    for outcome in report.outcomes {
+    for outcome in &report.outcomes {
         if let Some(artifact) = &outcome.artifact {
             artifacts.push(fleet_protocol::TaskResultArtifactWire {
                 artifact_id: prefixed_ulid("artifact")?,
@@ -6894,62 +7721,228 @@ fn run_signed_runbook_task_queue(
                 content_bytes: artifact.content_bytes.clone(),
             });
         }
-        send_agent_output_chunk_queue(
-            outbound_sender,
-            config,
-            correlation_id,
-            envelope,
-            fleet_runner::CommandOutputChunk {
-                stream: fleet_runner::CommandOutputStream::Stdout,
-                sequence,
-                data: format!(
-                    "runbook_step={} changed={:?} exit_code={:?} {}",
-                    outcome.id, outcome.changed, outcome.exit_code, outcome.audit_metadata
-                ),
-            },
-        )?;
-        sequence += 1;
+    }
+    let (exit_code, status) = runbook_task_result_summary(&report);
+    let final_report = AgentTaskResultReport::with_artifacts(exit_code, status, "", artifacts);
+    let has_artifacts = !final_report.artifacts.is_empty();
+    let mut stdout_sequence = 0;
+    let mut stderr_sequence = 0;
+    let mut stdout_chunks = 0;
+    let mut stderr_chunks = 0;
+    for outcome in report.outcomes {
+        let summary_chunk = fleet_runner::CommandOutputChunk {
+            stream: fleet_runner::CommandOutputStream::Stdout,
+            sequence: stdout_sequence,
+            data: format!(
+                "runbook_step={} changed={:?} exit_code={:?} {}",
+                outcome.id, outcome.changed, outcome.exit_code, outcome.audit_metadata
+            ),
+        };
+        send_or_persist_runbook_output_chunk(session, envelope, summary_chunk, has_artifacts)?;
+        stdout_sequence += 1;
+        stdout_chunks += 1;
         if !outcome.stdout.is_empty() {
-            send_agent_output_chunk_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                envelope,
-                fleet_runner::CommandOutputChunk {
-                    stream: fleet_runner::CommandOutputStream::Stdout,
-                    sequence,
-                    data: outcome.stdout,
-                },
-            )?;
-            sequence += 1;
+            let chunk = fleet_runner::CommandOutputChunk {
+                stream: fleet_runner::CommandOutputStream::Stdout,
+                sequence: stdout_sequence,
+                data: outcome.stdout,
+            };
+            send_or_persist_runbook_output_chunk(session, envelope, chunk, has_artifacts)?;
+            stdout_sequence += 1;
+            stdout_chunks += 1;
         }
         if !outcome.stderr.is_empty() {
-            send_agent_output_chunk_queue(
-                outbound_sender,
-                config,
-                correlation_id,
-                envelope,
-                fleet_runner::CommandOutputChunk {
-                    stream: fleet_runner::CommandOutputStream::Stderr,
-                    sequence,
-                    data: outcome.stderr,
-                },
-            )?;
-            sequence += 1;
+            let chunk = fleet_runner::CommandOutputChunk {
+                stream: fleet_runner::CommandOutputStream::Stderr,
+                sequence: stderr_sequence,
+                data: outcome.stderr,
+            };
+            send_or_persist_runbook_output_chunk(session, envelope, chunk, has_artifacts)?;
+            stderr_sequence += 1;
+            stderr_chunks += 1;
         }
     }
-    send_agent_task_result_queue_report(
-        outbound_sender,
-        config,
-        correlation_id,
+    if has_artifacts {
+        send_ephemeral_artifact_final_result_report(
+            session,
+            envelope,
+            final_report.with_output_summary(fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks,
+                stderr_chunks,
+                truncated: false,
+            }),
+        )?;
+    } else {
+        persist_no_artifact_final_result_report(
+            session.journal_client,
+            session.controller_namespace,
+            session.config,
+            envelope,
+            final_report.with_output_summary(fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks,
+                stderr_chunks,
+                truncated: false,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn runbook_execution_plan_has_artifact_results(plan: &fleet_runner::RunbookExecutionPlan) -> bool {
+    plan.steps.iter().any(|step| {
+        matches!(
+            &step.action,
+            fleet_runner::RunbookExecutionAction::FileCopy(spec)
+                if spec.artifact_retention_class.is_some()
+        )
+    })
+}
+
+fn runbook_task_result_summary(
+    report: &fleet_runner::RunbookExecutionReport,
+) -> (i32, fleet_protocol::TaskResultStatus) {
+    match report.aggregate_status() {
+        fleet_runner::PrimitiveResultStatus::Success
+        | fleet_runner::PrimitiveResultStatus::Changed
+        | fleet_runner::PrimitiveResultStatus::Skipped => {
+            (0, fleet_protocol::TaskResultStatus::Succeeded)
+        }
+        fleet_runner::PrimitiveResultStatus::Failed
+        | fleet_runner::PrimitiveResultStatus::Rejected => (
+            report
+                .outcomes
+                .iter()
+                .find(|outcome| {
+                    matches!(
+                        outcome.status,
+                        fleet_runner::PrimitiveResultStatus::Failed
+                            | fleet_runner::PrimitiveResultStatus::Rejected
+                    )
+                })
+                .and_then(|outcome| outcome.exit_code)
+                .filter(|exit_code| *exit_code != 0)
+                .unwrap_or(-1),
+            fleet_protocol::TaskResultStatus::Failed,
+        ),
+        fleet_runner::PrimitiveResultStatus::Canceled => {
+            (-1, fleet_protocol::TaskResultStatus::Canceled)
+        }
+    }
+}
+
+fn persist_runbook_failure_with_output(
+    session: &AgentTaskExecutionSession<'_>,
+    envelope: &fleet_domain::TaskEnvelope,
+    reason: &str,
+    output: String,
+    truncated: bool,
+) -> Result<(), CliError> {
+    persist_task_output_report(
+        session.journal_client,
+        session.controller_namespace,
+        session.config,
         envelope,
-        AgentTaskResultReport::with_artifacts(
-            0,
-            fleet_protocol::TaskResultStatus::Succeeded,
-            "",
-            artifacts,
+        fleet_runner::CommandOutputChunk {
+            stream: fleet_runner::CommandOutputStream::Stderr,
+            sequence: 0,
+            data: output,
+        },
+    )?;
+    persist_no_artifact_final_result_report(
+        session.journal_client,
+        session.controller_namespace,
+        session.config,
+        envelope,
+        AgentTaskResultReport::new(-1, fleet_protocol::TaskResultStatus::Failed, reason)
+            .with_output_summary(fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 0,
+                stderr_chunks: 1,
+                truncated,
+            }),
+    )?;
+    Ok(())
+}
+
+fn send_or_persist_runbook_output_chunk(
+    session: &AgentTaskExecutionSession<'_>,
+    envelope: &fleet_domain::TaskEnvelope,
+    chunk: fleet_runner::CommandOutputChunk,
+    ephemeral_artifact_path: bool,
+) -> Result<(), CliError> {
+    if ephemeral_artifact_path {
+        send_agent_output_chunk_queue(
+            session.outbound_sender,
+            session.config,
+            session.correlation_id,
+            envelope,
+            chunk,
+        )
+    } else {
+        persist_task_output_report(
+            session.journal_client,
+            session.controller_namespace,
+            session.config,
+            envelope,
+            chunk,
+        )?;
+        Ok(())
+    }
+}
+
+fn send_ephemeral_artifact_final_result_report(
+    session: &AgentTaskExecutionSession<'_>,
+    envelope: &fleet_domain::TaskEnvelope,
+    report: AgentTaskResultReport,
+) -> Result<(), CliError> {
+    use fleet_domain::delivery::ReportClass;
+
+    if report.artifacts.is_empty() {
+        return Err(CliError::Http(
+            "artifact final result requires at least one artifact".to_owned(),
+        ));
+    }
+    let key = lifecycle_report_key(
+        session.controller_namespace,
+        session.config,
+        envelope.job_id.as_str(),
+        envelope.task_id.as_str(),
+        "final-result",
+    )?;
+    let body = serde_json::to_vec(&report)
+        .map_err(|_| CliError::Http("failed to encode artifact final result".to_owned()))?;
+    let report =
+        fleet_protocol::delivery_v2::V2TaskReportWire::new(&key, ReportClass::FinalResult, &body)
+            .map_err(|error| CliError::Http(error.to_string()))?;
+    enqueue_wire_message(
+        session.outbound_sender,
+        fleet_protocol::WireMessage::new(
+            prefixed_ulid("msg")?,
+            session.correlation_id.to_owned(),
+            Some(session.config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::TaskReport(report),
         ),
     )?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn send_or_persist_runbook_final_result(
+    session: &AgentTaskExecutionSession<'_>,
+    envelope: &fleet_domain::TaskEnvelope,
+    report: AgentTaskResultReport,
+) -> Result<(), CliError> {
+    if report.artifacts.is_empty() {
+        persist_no_artifact_final_result_report(
+            session.journal_client,
+            session.controller_namespace,
+            session.config,
+            envelope,
+            report,
+        )?;
+    } else {
+        send_ephemeral_artifact_final_result_report(session, envelope, report)?;
+    }
     Ok(())
 }
 
@@ -7370,18 +8363,6 @@ fn send_agent_task_ack(
     )
 }
 
-fn send_agent_task_ack_queue(
-    outbound_sender: &AgentOutboundQueue,
-    config: &LocalAgentConfig,
-    correlation_id: &str,
-    envelope: &fleet_domain::TaskEnvelope,
-) -> Result<(), CliError> {
-    enqueue_wire_message(
-        outbound_sender,
-        agent_task_ack_message(config, correlation_id, envelope)?,
-    )
-}
-
 fn send_agent_task_started(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     config: &LocalAgentConfig,
@@ -7391,18 +8372,6 @@ fn send_agent_task_started(
     send_wire_message_to_socket(
         socket,
         &agent_task_started_message(config, correlation_id, envelope)?,
-    )
-}
-
-fn send_agent_task_started_queue(
-    outbound_sender: &AgentOutboundQueue,
-    config: &LocalAgentConfig,
-    correlation_id: &str,
-    envelope: &fleet_domain::TaskEnvelope,
-) -> Result<(), CliError> {
-    enqueue_wire_message(
-        outbound_sender,
-        agent_task_started_message(config, correlation_id, envelope)?,
     )
 }
 
@@ -7427,24 +8396,47 @@ fn send_agent_task_rejected(
     )
 }
 
-fn send_agent_task_rejected_queue(
-    outbound_sender: &AgentOutboundQueue,
-    config: &LocalAgentConfig,
-    correlation_id: &str,
+fn persist_agent_task_rejected_report(
+    session: &AgentTaskExecutionSession<'_>,
     envelope: &fleet_domain::TaskEnvelope,
     reason_code: fleet_protocol::TaskRejectionReasonCode,
     reason: &str,
 ) -> Result<(), CliError> {
-    enqueue_wire_message(
-        outbound_sender,
-        agent_task_rejected_message(
-            config,
-            correlation_id,
-            envelope.job_id.as_str(),
-            envelope.task_id.as_str(),
+    persist_agent_task_rejected_report_with_journal(
+        session.journal_client,
+        session.controller_namespace,
+        session.config,
+        envelope.job_id.as_str(),
+        envelope.task_id.as_str(),
+        reason_code,
+        reason,
+    )
+}
+
+fn persist_agent_task_rejected_report_with_journal(
+    journal: &fleet_agent::journal_worker::JournalClient,
+    controller_namespace: &str,
+    config: &LocalAgentConfig,
+    job_id: &str,
+    task_id: &str,
+    reason_code: fleet_protocol::TaskRejectionReasonCode,
+    reason: &str,
+) -> Result<(), CliError> {
+    let key = lifecycle_report_key(
+        controller_namespace,
+        config,
+        job_id,
+        task_id,
+        "task-rejected",
+    )?;
+    persist_agent_task_lifecycle_report_with_journal(
+        journal,
+        key,
+        fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskRejected {
             reason_code,
-            reason,
-        )?,
+            reason: fleet_core::redact_secret(reason),
+        },
+        "durable task rejection",
     )
 }
 
@@ -7539,11 +8531,13 @@ fn task_rejection_reason_from_runner_error(
     }
 }
 
+#[derive(Serialize)]
 struct AgentTaskResultReport {
     exit_code: i32,
     status: fleet_protocol::TaskResultStatus,
     reason: String,
     artifacts: Vec<fleet_protocol::TaskResultArtifactWire>,
+    output: fleet_protocol::delivery_v2::V2OutputSummary,
 }
 
 impl AgentTaskResultReport {
@@ -7562,7 +8556,17 @@ impl AgentTaskResultReport {
             status,
             reason: reason.to_owned(),
             artifacts,
+            output: fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: 0,
+                stderr_chunks: 0,
+                truncated: false,
+            },
         }
+    }
+
+    fn with_output_summary(mut self, output: fleet_protocol::delivery_v2::V2OutputSummary) -> Self {
+        self.output = output;
+        self
     }
 }
 
@@ -7614,24 +8618,7 @@ fn send_agent_task_result_report(
     Ok(())
 }
 
-fn send_agent_task_result_queue(
-    outbound_sender: &AgentOutboundQueue,
-    config: &LocalAgentConfig,
-    correlation_id: &str,
-    envelope: &fleet_domain::TaskEnvelope,
-    exit_code: i32,
-    status: fleet_protocol::TaskResultStatus,
-    reason: &str,
-) -> Result<(), CliError> {
-    send_agent_task_result_queue_report(
-        outbound_sender,
-        config,
-        correlation_id,
-        envelope,
-        AgentTaskResultReport::new(exit_code, status, reason),
-    )
-}
-
+#[cfg(test)]
 fn send_agent_task_result_queue_report(
     outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
@@ -7709,6 +8696,596 @@ fn send_agent_output_chunk_queue(
             },
         ),
     )
+}
+
+fn agent_task_execution_record(
+    controller_namespace: &str,
+    config: &LocalAgentConfig,
+    envelope: &fleet_domain::TaskEnvelope,
+) -> Result<fleet_domain::delivery::ExecutionRecord, CliError> {
+    use fleet_domain::delivery::{ExecutionPhase, ExecutionRecord, ExecutionSnapshot, ReportKey};
+
+    let signature = envelope
+        .signature
+        .as_ref()
+        .ok_or_else(|| CliError::Http("signed task envelope is required".to_owned()))?;
+    let final_report_key = ReportKey::new(
+        controller_namespace,
+        &config.agent_id,
+        envelope.job_id.as_str(),
+        envelope.task_id.as_str(),
+        "final-result",
+    )
+    .map_err(|error| CliError::Http(error.to_string()))?;
+    let issued_at_ms = system_time_to_millis(envelope.issued_at).to_be_bytes();
+    let expires_at_ms = system_time_to_millis(envelope.expires_at.as_system_time()).to_be_bytes();
+    let nonce = envelope.nonce.as_str().as_bytes();
+    let nonce_digest = execution_record_digest(b"fleet:agent-execution-nonce:v1", &[nonce]);
+    let envelope_digest = execution_record_digest(
+        b"fleet:agent-execution-envelope:v1",
+        &[
+            envelope.job_id.as_str().as_bytes(),
+            envelope.task_id.as_str().as_bytes(),
+            envelope.target_agent_id.as_str().as_bytes(),
+            &issued_at_ms,
+            &expires_at_ms,
+            nonce,
+            envelope.payload_hash.as_bytes(),
+            signature.as_str().as_bytes(),
+        ],
+    );
+    let admitted_at_ms = epoch_millis()
+        .try_into()
+        .map_err(|_| CliError::Http("invalid journal admission timestamp".to_owned()))?;
+    ExecutionRecord::restore(ExecutionSnapshot {
+        final_report_key,
+        nonce_digest,
+        envelope_digest,
+        phase: ExecutionPhase::Admitted,
+        admitted_at_ms,
+        final_max_bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+        stdout_chunks: 0,
+        stderr_chunks: 0,
+    })
+    .map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn execution_record_digest(
+    domain: &[u8],
+    fields: &[&[u8]],
+) -> fleet_domain::delivery::ReportDigest {
+    let mut digest = Sha256::new();
+    digest.update((domain.len() as u64).to_be_bytes());
+    digest.update(domain);
+    for field in fields {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    fleet_domain::delivery::ReportDigest(digest.finalize().into())
+}
+
+#[derive(Serialize)]
+struct AgentTaskOutputReportBody {
+    stream: fleet_protocol::OutputStream,
+    sequence: u64,
+    data: String,
+}
+
+fn persist_task_output_report(
+    journal: &fleet_agent::journal_worker::JournalClient,
+    controller_namespace: &str,
+    config: &LocalAgentConfig,
+    envelope: &fleet_domain::TaskEnvelope,
+    chunk: fleet_runner::CommandOutputChunk,
+) -> Result<fleet_application::delivery::AppendReportOutcome, CliError> {
+    use fleet_application::delivery::JournalReport;
+    use fleet_domain::delivery::{ReportClass, ReportKey};
+
+    let (stream, stream_name) = match chunk.stream {
+        fleet_runner::CommandOutputStream::Stdout => {
+            (fleet_protocol::OutputStream::Stdout, "stdout")
+        }
+        fleet_runner::CommandOutputStream::Stderr => {
+            (fleet_protocol::OutputStream::Stderr, "stderr")
+        }
+    };
+    let report_id = format!("output-{stream_name}-{:020}", chunk.sequence);
+    let key = ReportKey::new(
+        controller_namespace,
+        &config.agent_id,
+        envelope.job_id.as_str(),
+        envelope.task_id.as_str(),
+        &report_id,
+    )
+    .map_err(|error| CliError::Http(error.to_string()))?;
+    let body = serde_json::to_vec(&AgentTaskOutputReportBody {
+        stream,
+        sequence: chunk.sequence,
+        data: chunk.data,
+    })
+    .map_err(|_| CliError::Http("failed to encode task output report".to_owned()))?;
+    if body.len() > fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES {
+        return Err(CliError::Http(
+            "task output report exceeds protocol limit".to_owned(),
+        ));
+    }
+    let report = JournalReport::new(key, ReportClass::Output, body)
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    journal
+        .append(&report)
+        .map_err(|error| CliError::Http(error.to_string()))?
+        .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+        .map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn persist_no_artifact_final_result_report(
+    journal: &fleet_agent::journal_worker::JournalClient,
+    controller_namespace: &str,
+    config: &LocalAgentConfig,
+    envelope: &fleet_domain::TaskEnvelope,
+    report: AgentTaskResultReport,
+) -> Result<fleet_application::delivery::AppendReportOutcome, CliError> {
+    use fleet_domain::delivery::ReportKey;
+
+    let key = ReportKey::new(
+        controller_namespace,
+        &config.agent_id,
+        envelope.job_id.as_str(),
+        envelope.task_id.as_str(),
+        "final-result",
+    )
+    .map_err(|error| CliError::Http(error.to_string()))?;
+    persist_no_artifact_final_result_report_with_key(journal, key, report)
+}
+
+fn persist_agent_task_ack_report(
+    session: &AgentTaskExecutionSession<'_>,
+    envelope: &fleet_domain::TaskEnvelope,
+) -> Result<(), CliError> {
+    persist_agent_task_lifecycle_report(
+        session,
+        envelope,
+        "task-ack",
+        fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskAck {},
+        "durable task acknowledgement",
+    )
+}
+
+fn persist_agent_task_started_report(
+    session: &AgentTaskExecutionSession<'_>,
+    envelope: &fleet_domain::TaskEnvelope,
+) -> Result<(), CliError> {
+    persist_agent_task_lifecycle_report(
+        session,
+        envelope,
+        "task-started",
+        fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskStarted {},
+        "durable task started event",
+    )
+}
+
+fn persist_agent_task_lifecycle_report(
+    session: &AgentTaskExecutionSession<'_>,
+    envelope: &fleet_domain::TaskEnvelope,
+    report_id: &str,
+    body: fleet_protocol::delivery_v2::V2TaskLifecycleReportBody,
+    description: &str,
+) -> Result<(), CliError> {
+    let key = lifecycle_report_key(
+        session.controller_namespace,
+        session.config,
+        envelope.job_id.as_str(),
+        envelope.task_id.as_str(),
+        report_id,
+    )?;
+    persist_agent_task_lifecycle_report_with_journal(session.journal_client, key, body, description)
+}
+
+fn lifecycle_report_key(
+    controller_namespace: &str,
+    config: &LocalAgentConfig,
+    job_id: &str,
+    task_id: &str,
+    report_id: &str,
+) -> Result<fleet_domain::delivery::ReportKey, CliError> {
+    fleet_domain::delivery::ReportKey::new(
+        controller_namespace,
+        &config.agent_id,
+        job_id,
+        task_id,
+        report_id,
+    )
+    .map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn persist_agent_task_lifecycle_report_with_journal(
+    journal: &fleet_agent::journal_worker::JournalClient,
+    key: fleet_domain::delivery::ReportKey,
+    body: fleet_protocol::delivery_v2::V2TaskLifecycleReportBody,
+    description: &str,
+) -> Result<(), CliError> {
+    use fleet_application::delivery::JournalReport;
+    use fleet_domain::delivery::ReportClass;
+
+    let encoded_body = serde_json::to_vec(&body)
+        .map_err(|_| CliError::Http(format!("failed to encode {description}")))?;
+    if encoded_body.len() > fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES {
+        return Err(CliError::Http(format!(
+            "{description} exceeds protocol limit"
+        )));
+    }
+    let report = JournalReport::new(key, ReportClass::Lifecycle, encoded_body)
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    journal
+        .append(&report)
+        .map_err(|error| CliError::Http(error.to_string()))?
+        .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    Ok(())
+}
+
+fn persist_no_artifact_final_result_report_with_key(
+    journal: &fleet_agent::journal_worker::JournalClient,
+    key: fleet_domain::delivery::ReportKey,
+    report: AgentTaskResultReport,
+) -> Result<fleet_application::delivery::AppendReportOutcome, CliError> {
+    use fleet_application::delivery::JournalReport;
+    use fleet_domain::delivery::ReportClass;
+
+    if !report.artifacts.is_empty() {
+        return Err(CliError::Http(
+            "durable final result cannot contain artifacts".to_owned(),
+        ));
+    }
+    let body = serde_json::to_vec(&report)
+        .map_err(|_| CliError::Http("failed to encode durable final result".to_owned()))?;
+    if body.len() > fleet_protocol::delivery_v2::MAX_REPORT_BODY_BYTES {
+        return Err(CliError::Http(
+            "durable final result exceeds protocol limit".to_owned(),
+        ));
+    }
+    let report = JournalReport::new(key, ReportClass::FinalResult, body)
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    journal
+        .append(&report)
+        .map_err(|error| CliError::Http(error.to_string()))?
+        .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+        .map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn recover_interrupted_agent_execution(
+    journal: &fleet_agent::journal_worker::JournalClient,
+) -> Result<(), CliError> {
+    let record = journal
+        .interrupted()
+        .map_err(|error| CliError::Http(error.to_string()))?
+        .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    let Some(record) = record else {
+        return Ok(());
+    };
+    let interruption = record
+        .interrupted_after_owner_exit()
+        .ok_or_else(|| CliError::Http("journal execution is not interrupted".to_owned()))?;
+    let reason = interruption.reason_code();
+    persist_no_artifact_final_result_report_with_key(
+        journal,
+        record.snapshot().final_report_key.clone(),
+        AgentTaskResultReport::new(-1, fleet_protocol::TaskResultStatus::Failed, reason)
+            .with_output_summary(fleet_protocol::delivery_v2::V2OutputSummary {
+                stdout_chunks: record.snapshot().stdout_chunks,
+                stderr_chunks: record.snapshot().stderr_chunks,
+                truncated: matches!(
+                    interruption,
+                    fleet_domain::delivery::InterruptedExecution::OutcomeUnknown
+                ),
+            }),
+    )?;
+    Ok(())
+}
+
+struct AgentPendingJournalReport {
+    report: fleet_application::delivery::PendingReport,
+    attempts: u32,
+    retry_at: Instant,
+}
+
+struct AgentJournalReportDelivery {
+    client: fleet_agent::journal_worker::JournalClient,
+    identity: ControllerDeliveryIdentity,
+    pending: HashMap<fleet_domain::delivery::ReportKey, AgentPendingJournalReport>,
+    pending_scan: Option<
+        fleet_agent::journal_worker::JournalTicket<Vec<fleet_application::delivery::PendingReport>>,
+    >,
+    acknowledgement_tickets: HashMap<
+        fleet_domain::delivery::ReportKey,
+        fleet_agent::journal_worker::JournalTicket<bool>,
+    >,
+    acknowledged_during_pending_scan: HashSet<fleet_domain::delivery::ReportKey>,
+    next_scan_at: Instant,
+}
+
+impl AgentJournalReportDelivery {
+    fn new(
+        client: fleet_agent::journal_worker::JournalClient,
+        identity: ControllerDeliveryIdentity,
+    ) -> Self {
+        Self {
+            client,
+            identity,
+            pending: HashMap::new(),
+            pending_scan: None,
+            acknowledgement_tickets: HashMap::new(),
+            acknowledged_during_pending_scan: HashSet::new(),
+            next_scan_at: Instant::now(),
+        }
+    }
+
+    fn drive(
+        &mut self,
+        socket: &mut AgentWebSocket,
+        config: &LocalAgentConfig,
+        correlation_id: &str,
+    ) -> Result<(), CliError> {
+        self.poll_acknowledgements()?;
+        self.poll_pending_scan()?;
+        self.submit_pending_scan_if_due()?;
+        self.poll_pending_scan()?;
+
+        let now = Instant::now();
+        let mut due = self
+            .pending
+            .iter()
+            .filter(|(_, report)| report.retry_at <= now)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        due.sort_by(|left, right| {
+            let left_report = &self
+                .pending
+                .get(left)
+                .expect("due report exists in the delivery map")
+                .report
+                .report;
+            let right_report = &self
+                .pending
+                .get(right)
+                .expect("due report exists in the delivery map")
+                .report
+                .report;
+            compare_agent_report_delivery_order(left_report, right_report)
+        });
+        due.truncate(AGENT_REPORT_SENDS_PER_TICK);
+        for key in due {
+            let pending = self
+                .pending
+                .get(&key)
+                .ok_or_else(|| CliError::Http("agent report delivery state changed".to_owned()))?;
+            let message =
+                agent_journal_report_wire_message(&pending.report, config, correlation_id)?;
+            send_wire_message_to_socket(socket, &message)?;
+            if let Some(pending) = self.pending.get_mut(&key) {
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.retry_at = now + agent_report_retry_delay(pending.attempts);
+            }
+        }
+        Ok(())
+    }
+
+    fn submit_pending_scan_if_due(&mut self) -> Result<(), CliError> {
+        if self.pending_scan.is_some()
+            || !self.acknowledgement_tickets.is_empty()
+            || self.pending.len() >= AGENT_REPORT_BATCH_SIZE as usize
+            || Instant::now() < self.next_scan_at
+        {
+            return Ok(());
+        }
+        match self
+            .client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+        {
+            Ok(ticket) => {
+                self.pending_scan = Some(ticket);
+                self.next_scan_at = Instant::now() + AGENT_REPORT_SCAN_INTERVAL;
+            }
+            Err(fleet_agent::journal_worker::JournalWorkerError::Busy) => {
+                self.next_scan_at = Instant::now() + Duration::from_millis(50);
+            }
+            Err(error) => return Err(CliError::Http(error.to_string())),
+        }
+        Ok(())
+    }
+
+    fn poll_pending_scan(&mut self) -> Result<(), CliError> {
+        let completed = match self.pending_scan.as_mut() {
+            Some(ticket) => ticket
+                .poll()
+                .map_err(|error| CliError::Http(error.to_string()))?,
+            None => None,
+        };
+        if let Some(reports) = completed {
+            self.pending_scan = None;
+            let now = Instant::now();
+            for report in reports {
+                if !matches!(
+                    report.report.class,
+                    fleet_domain::delivery::ReportClass::Output
+                        | fleet_domain::delivery::ReportClass::Lifecycle
+                        | fleet_domain::delivery::ReportClass::DriftEvidence
+                        | fleet_domain::delivery::ReportClass::FinalResult
+                ) {
+                    return Err(CliError::Http(
+                        "agent journal contains an unsupported report class".to_owned(),
+                    ));
+                }
+                let key = report.report.key.clone();
+                if !agent_report_scan_result_is_current(
+                    &key,
+                    &self.acknowledged_during_pending_scan,
+                ) {
+                    continue;
+                }
+                self.pending
+                    .entry(key)
+                    .or_insert(AgentPendingJournalReport {
+                        report,
+                        attempts: 0,
+                        retry_at: now,
+                    });
+            }
+            self.acknowledged_during_pending_scan.clear();
+        }
+        Ok(())
+    }
+
+    fn handle_receipt(
+        &mut self,
+        message: &fleet_protocol::WireMessage,
+        receipt: &fleet_protocol::receipt::SignedReportReceiptWire,
+        config: &LocalAgentConfig,
+        controller_public_key: &str,
+        correlation_id: &str,
+        task_state: &AgentTaskSessionState,
+    ) -> Result<(), CliError> {
+        if message.agent_id.as_deref() != Some(config.agent_id.as_str())
+            || message.correlation_id.0 != correlation_id
+        {
+            return Err(CliError::Http(
+                "report receipt session identity mismatch".to_owned(),
+            ));
+        }
+        let statement = &receipt.statement;
+        let key = fleet_domain::delivery::ReportKey::new(
+            &statement.controller_namespace,
+            &statement.agent_id,
+            &statement.job_id,
+            &statement.task_id,
+            &statement.report_id,
+        )
+        .map_err(|error| CliError::Http(error.to_string()))?;
+        if self.acknowledgement_tickets.contains_key(&key) {
+            return Ok(());
+        }
+        let Some(local) = self.pending.get(&key).map(|state| &state.report) else {
+            return Ok(());
+        };
+        let trust =
+            agent_controller_signing_trust_bundle(task_state, config, controller_public_key)?;
+        let candidate = fleet_agent::receipt_verifier::verify_stored_receipt(
+            receipt,
+            local,
+            &self.identity.namespace,
+            &self.identity.store_epoch,
+            &trust,
+            SystemTime::now(),
+        )
+        .map_err(|error| CliError::Http(error.to_string()))?;
+        match self.client.acknowledge(&candidate.key, candidate.digest) {
+            Ok(ticket) => {
+                self.acknowledgement_tickets.insert(candidate.key, ticket);
+            }
+            Err(fleet_agent::journal_worker::JournalWorkerError::Busy) => {}
+            Err(error) => return Err(CliError::Http(error.to_string())),
+        }
+        Ok(())
+    }
+
+    fn poll_acknowledgements(&mut self) -> Result<(), CliError> {
+        let keys = self
+            .acknowledgement_tickets
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let outcome = self
+                .acknowledgement_tickets
+                .get_mut(&key)
+                .ok_or_else(|| {
+                    CliError::Http("agent report acknowledgement disappeared".to_owned())
+                })?
+                .poll()
+                .map_err(|error| CliError::Http(error.to_string()))?;
+            let Some(removed) = outcome else {
+                continue;
+            };
+            self.acknowledgement_tickets.remove(&key);
+            if !removed {
+                return Err(CliError::Http(
+                    "agent report disappeared before receipt cleanup".to_owned(),
+                ));
+            }
+            if self.pending_scan.is_some() {
+                self.acknowledged_during_pending_scan.insert(key.clone());
+            }
+            self.pending.remove(&key);
+            self.next_scan_at = Instant::now();
+        }
+        Ok(())
+    }
+}
+
+fn agent_report_scan_result_is_current(
+    key: &fleet_domain::delivery::ReportKey,
+    acknowledged_during_scan: &HashSet<fleet_domain::delivery::ReportKey>,
+) -> bool {
+    !acknowledged_during_scan.contains(key)
+}
+
+fn agent_report_retry_delay(attempts: u32) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(5);
+    let multiplier = 1_u32 << exponent;
+    AGENT_REPORT_RETRY_BASE
+        .saturating_mul(multiplier)
+        .min(AGENT_REPORT_RETRY_MAX)
+}
+
+fn compare_agent_report_delivery_order(
+    left: &fleet_application::delivery::JournalReport,
+    right: &fleet_application::delivery::JournalReport,
+) -> std::cmp::Ordering {
+    let class_rank = |class| match class {
+        fleet_domain::delivery::ReportClass::Lifecycle => 0_u8,
+        fleet_domain::delivery::ReportClass::DriftEvidence => 1,
+        fleet_domain::delivery::ReportClass::Output => 2,
+        fleet_domain::delivery::ReportClass::FinalResult => 3,
+    };
+    class_rank(left.class)
+        .cmp(&class_rank(right.class))
+        .then_with(|| lifecycle_report_rank(left).cmp(&lifecycle_report_rank(right)))
+        .then_with(|| left.key.parts().cmp(&right.key.parts()))
+}
+
+fn lifecycle_report_rank(report: &fleet_application::delivery::JournalReport) -> u8 {
+    if report.class != fleet_domain::delivery::ReportClass::Lifecycle {
+        return 0;
+    }
+    match serde_json::from_slice::<fleet_protocol::delivery_v2::V2TaskLifecycleReportBody>(
+        report.body(),
+    ) {
+        Ok(fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskAck {}) => 0,
+        Ok(fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskStarted {}) => 1,
+        Ok(fleet_protocol::delivery_v2::V2TaskLifecycleReportBody::TaskRejected { .. }) => 2,
+        Err(_) => 3,
+    }
+}
+
+fn agent_journal_report_wire_message(
+    pending: &fleet_application::delivery::PendingReport,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    let report = fleet_protocol::delivery_v2::V2TaskReportWire::new(
+        &pending.report.key,
+        pending.report.class,
+        pending.report.body(),
+    )
+    .map_err(|error| CliError::Http(error.to_string()))?;
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::TaskReport(report),
+    ))
 }
 
 fn send_agent_security_event_queue(
@@ -7817,6 +9394,98 @@ fn system_time_to_millis(value: SystemTime) -> u64 {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn authenticated_session_requires_valid_controller_delivery_identity() {
+        let accepted = fleet_protocol::WireMessage::new(
+            "msg-accepted",
+            "corr-accepted",
+            Some("agent-1".to_owned()),
+            1,
+            fleet_protocol::WirePayload::AuthAccepted {
+                controller_namespace: "a".repeat(64),
+                store_epoch: "b".repeat(64),
+            },
+        );
+
+        assert_eq!(
+            controller_delivery_identity_from_auth_accepted(accepted, "agent-1", "corr-accepted",)
+                .unwrap(),
+            ControllerDeliveryIdentity {
+                namespace: "a".repeat(64),
+                store_epoch: "b".repeat(64),
+            }
+        );
+
+        for (controller_namespace, store_epoch) in [
+            ("short".to_owned(), "b".repeat(64)),
+            ("A".repeat(64), "b".repeat(64)),
+            ("g".repeat(64), "b".repeat(64)),
+            ("a".repeat(64), "".to_owned()),
+        ] {
+            let message = fleet_protocol::WireMessage::new(
+                "msg-invalid-accepted",
+                "corr-invalid-accepted",
+                Some("agent-1".to_owned()),
+                1,
+                fleet_protocol::WirePayload::AuthAccepted {
+                    controller_namespace,
+                    store_epoch,
+                },
+            );
+            assert!(matches!(
+                controller_delivery_identity_from_auth_accepted(
+                    message,
+                    "agent-1",
+                    "corr-invalid-accepted",
+                ),
+                Err(CliError::Http(message)) if message == "controller delivery identity is invalid"
+            ));
+        }
+
+        let wrong_payload = fleet_protocol::WireMessage::new(
+            "msg-wrong-payload",
+            "corr-wrong-payload",
+            Some("agent-1".to_owned()),
+            1,
+            fleet_protocol::WirePayload::Heartbeat {
+                agent_id: "agent-1".to_owned(),
+                status: "online".to_owned(),
+            },
+        );
+        assert!(matches!(
+            controller_delivery_identity_from_auth_accepted(
+                wrong_payload,
+                "agent-1",
+                "corr-wrong-payload",
+            ),
+            Err(CliError::Http(message)) if message == "expected auth accepted"
+        ));
+
+        for (message_agent_id, message_correlation_id) in [
+            ("agent-2", "corr-accepted"),
+            ("agent-1", "corr-other-session"),
+        ] {
+            let mismatched_session = fleet_protocol::WireMessage::new(
+                "msg-mismatched-session",
+                message_correlation_id,
+                Some(message_agent_id.to_owned()),
+                1,
+                fleet_protocol::WirePayload::AuthAccepted {
+                    controller_namespace: "a".repeat(64),
+                    store_epoch: "b".repeat(64),
+                },
+            );
+            assert!(matches!(
+                controller_delivery_identity_from_auth_accepted(
+                    mismatched_session,
+                    "agent-1",
+                    "corr-accepted"
+                ),
+                Err(CliError::Http(message)) if message == "auth accepted session identity mismatch"
+            ));
+        }
+    }
 
     fn test_outbound_queue(capacity: usize) -> AgentOutboundQueue {
         Arc::new(Mutex::new(fleet_agent::AgentSessionSupervisor::new(
@@ -8620,7 +10289,7 @@ steps:
             panic!("expected login command");
         };
         assert_eq!(command.controller_url, "https://fleet.example.com");
-        assert_eq!(command.admin_token, "admin-secret");
+        assert_eq!(command.admin_token.as_deref(), Some("admin-secret"));
         assert_eq!(
             command.profile_path,
             PathBuf::from(DEFAULT_CLI_PROFILE_PATH)
@@ -9471,6 +11140,7 @@ steps:
         let profile = CliProfile {
             controller_url: "https://fleet.example.com".to_owned(),
             admin_token: "admin-secret".to_owned(),
+            tls_ca_cert: None,
         };
 
         save_cli_profile(&path, &profile).unwrap();
@@ -9511,6 +11181,7 @@ steps:
             &CliProfile {
                 controller_url: "https://profile.example.com".to_owned(),
                 admin_token: "profile-token".to_owned(),
+                tls_ca_cert: None,
             },
         )
         .unwrap();
@@ -9585,6 +11256,7 @@ steps:
             &CliProfile {
                 controller_url: format!("http://127.0.0.1:{port}"),
                 admin_token: "profile-token".to_owned(),
+                tls_ca_cert: None,
             },
         )
         .unwrap();
@@ -9625,11 +11297,11 @@ steps:
     fn api_error_rendering_distinguishes_common_statuses() {
         assert_eq!(
             render_http_status_error(401),
-            "unauthorized: admin token is missing or invalid"
+            "unauthorized: credential is missing, invalid, expired or revoked; create a personal token in Settings > My account and run fleet login again"
         );
         assert_eq!(
             render_http_status_error(403),
-            "forbidden: admin token lacks required permission"
+            "forbidden: your account lacks the required permission"
         );
         assert_eq!(
             render_http_status_error(404),
@@ -9957,6 +11629,7 @@ steps:
 
     #[test]
     fn controller_backup_restore_roundtrip_restores_database_and_keys() {
+        use fleet_application::admin_identity::AdminIdentityRead;
         let data_dir = initialized_controller_backup_fixture("restore-roundtrip-source");
         let output = unique_test_dir("restore-roundtrip-output").join("controller-backup.json");
         let restore_dir = unique_test_dir("restore-roundtrip-target");
@@ -9999,17 +11672,54 @@ steps:
                 )
                 .unwrap();
         }
+        let source_delivery_identity = {
+            let source_store =
+                fleet_store::SqliteStore::open(controller_db_path(&data_dir)).unwrap();
+            fleet_application::ControllerDeliveryIdentityRepository::controller_delivery_identity(
+                &source_store,
+            )
+            .unwrap()
+        };
+        let before_auth = fleet_store::SqliteStore::open(controller_db_path(&data_dir))
+            .unwrap()
+            .auth_state()
+            .unwrap();
+        assert!(
+            fleet_store::SqliteStore::open(controller_db_path(&data_dir))
+                .unwrap()
+                .verify_admin_token_hash("backup-admin-hash")
+                .unwrap()
+        );
         execute_controller_backup(&data_dir, &output).unwrap();
 
         execute_controller_restore(&restore_dir, &output, false, false).unwrap();
 
         let restored_store =
             fleet_store::SqliteStore::open(controller_db_path(&restore_dir)).unwrap();
+        let restored_delivery_identity =
+            fleet_application::ControllerDeliveryIdentityRepository::controller_delivery_identity(
+                &restored_store,
+            )
+            .unwrap();
+        assert_eq!(
+            restored_delivery_identity.namespace,
+            source_delivery_identity.namespace
+        );
+        assert_ne!(
+            restored_delivery_identity.store_epoch,
+            source_delivery_identity.store_epoch
+        );
         assert!(
-            restored_store
+            !restored_store
                 .verify_admin_token_hash("backup-admin-hash")
                 .unwrap()
         );
+        let restored_auth = restored_store.auth_state().unwrap();
+        assert_eq!(
+            restored_auth.mode,
+            fleet_domain::AdminAuthMode::LocalSetupRequired
+        );
+        assert_ne!(restored_auth.epoch, before_auth.epoch);
         assert!(
             controller_dir(&restore_dir)
                 .join("controller_private.key")
@@ -10072,6 +11782,7 @@ steps:
         execute_controller_backup(&data_dir, &output).unwrap();
         let mut archive = read_backup_archive(&output).unwrap();
         archive.schema_version = fleet_store::CURRENT_SCHEMA_VERSION + 1;
+        fs::remove_file(&output).unwrap(); // Replace only this owned, intentionally mutated fixture.
         write_backup_archive(&output, &archive).unwrap();
 
         let result = execute_controller_restore(&restore_dir, &output, true, false);
@@ -10101,6 +11812,7 @@ steps:
         db.content_hex = hex_encode(corrupt);
         db.size_bytes = corrupt.len() as u64;
         db.sha256 = sha256_hex(corrupt);
+        fs::remove_file(&output).unwrap(); // Replace only this owned, intentionally mutated fixture.
         write_backup_archive(&output, &archive).unwrap();
 
         let result = execute_controller_restore(&restore_dir, &output, false, false);
@@ -10949,6 +12661,87 @@ steps:
     }
 
     #[test]
+    fn agent_report_retry_delay_is_bounded_exponential() {
+        assert_eq!(agent_report_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(agent_report_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(agent_report_retry_delay(3), Duration::from_secs(4));
+        assert_eq!(agent_report_retry_delay(6), Duration::from_secs(30));
+        assert_eq!(agent_report_retry_delay(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn agent_report_delivery_orders_task_ack_started_then_rejected_before_final_result() {
+        use fleet_application::delivery::JournalReport;
+        use fleet_domain::delivery::{ReportClass, ReportKey};
+
+        let lifecycle = JournalReport::new(
+            ReportKey::new("controller", "agent", "job", "task", "task-ack").unwrap(),
+            ReportClass::Lifecycle,
+            br#"{"event":"task_ack"}"#.to_vec(),
+        )
+        .unwrap();
+        let final_result = JournalReport::new(
+            ReportKey::new("controller", "agent", "job", "task", "final-result").unwrap(),
+            ReportClass::FinalResult,
+            br#"{"status":"failed"}"#.to_vec(),
+        )
+        .unwrap();
+        let task_started = JournalReport::new(
+            ReportKey::new("controller", "agent", "job", "task", "task-started").unwrap(),
+            ReportClass::Lifecycle,
+            br#"{"event":"task_started"}"#.to_vec(),
+        )
+        .unwrap();
+        let task_rejected = JournalReport::new(
+            ReportKey::new("controller", "agent", "job", "task", "task-rejected").unwrap(),
+            ReportClass::Lifecycle,
+            br#"{"event":"task_rejected","reason_code":"local_policy","reason":"blocked"}"#
+                .to_vec(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            compare_agent_report_delivery_order(&lifecycle, &final_result),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_agent_report_delivery_order(&lifecycle, &task_started),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_agent_report_delivery_order(&task_started, &final_result),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_agent_report_delivery_order(&task_started, &task_rejected),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_agent_report_delivery_order(&task_rejected, &final_result),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn agent_report_scan_does_not_resurrect_a_receipt_acknowledged_row() {
+        use fleet_domain::delivery::ReportKey;
+
+        let acknowledged =
+            ReportKey::new("controller", "agent", "job", "task", "task-ack").unwrap();
+        let stale_scan_snapshot = HashSet::from([acknowledged.clone()]);
+        let unrelated = ReportKey::new("controller", "agent", "job", "other", "task-ack").unwrap();
+
+        assert!(!agent_report_scan_result_is_current(
+            &acknowledged,
+            &stale_scan_snapshot
+        ));
+        assert!(agent_report_scan_result_is_current(
+            &unrelated,
+            &stale_scan_snapshot
+        ));
+    }
+
+    #[test]
     fn agent_log_upload_due_respects_disable_and_interval() {
         let enabled = AgentLogUploadOptions {
             enabled: true,
@@ -11451,6 +13244,2938 @@ steps:
         assert!(queue.lock().unwrap().pending_report().is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn command_output_is_committed_to_agent_journal_with_stable_exact_report_identity() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_application::delivery::AppendReportOutcome;
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "a".repeat(64);
+        let root = unique_test_dir("command-output-journal");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: 4096,
+                bytes: 64 * 1024 * 1024,
+            },
+            JournalUsage {
+                reports: 4,
+                bytes: 4 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(16, 64 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        let repository = SqliteAgentJournal::open(&path, &namespace, "agent-web-01").unwrap();
+        let worker = JournalWorker::spawn(repository, capacity, limits).unwrap();
+        let client = worker.client();
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let chunk = fleet_runner::CommandOutputChunk {
+            stream: fleet_runner::CommandOutputStream::Stdout,
+            sequence: 7,
+            data: "hello output".to_owned(),
+        };
+
+        let inserted =
+            persist_task_output_report(&client, &namespace, &config, &envelope, chunk.clone())
+                .unwrap();
+        assert_eq!(inserted, AppendReportOutcome::Inserted);
+        let pending = client
+            .pending(16, 8 * 1024 * 1024)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].report.key.parts(),
+            [
+                namespace.as_str(),
+                "agent-web-01",
+                "job-queue",
+                "task-queue",
+                "output-stdout-00000000000000000007",
+            ]
+        );
+        assert_eq!(
+            pending[0].report.body(),
+            br#"{"stream":"stdout","sequence":7,"data":"hello output"}"#
+        );
+
+        let duplicate =
+            persist_task_output_report(&client, &namespace, &config, &envelope, chunk).unwrap();
+        assert_eq!(duplicate, AppendReportOutcome::Duplicate);
+        assert_eq!(
+            client
+                .pending(16, 8 * 1024 * 1024)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap()
+                .len(),
+            1
+        );
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_journal_failure_never_commits_a_final_summary() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "a".repeat(64);
+        let root = unique_test_dir("command-output-journal-failure");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: 3,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: 1,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let journal = worker.client();
+        let outbound = test_outbound_queue(4);
+        let task_state = test_task_session_state();
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: "unused-in-this-test",
+            correlation_id: "corr-output-journal-failure",
+            task_state: &task_state,
+            journal_client: &journal,
+            controller_namespace: &namespace,
+        };
+
+        assert!(
+            run_signed_command_task_queue(
+                &session,
+                &envelope,
+                fleet_protocol::CommandTaskWire {
+                    program: "sh".to_owned(),
+                    args: vec!["-c".to_owned(), "printf output".to_owned()],
+                    timeout_ms: 5_000,
+                    max_output_bytes: 1024,
+                },
+            )
+            .is_err()
+        );
+        let pending = journal
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            pending
+                .iter()
+                .any(|entry| entry.report.key.parts()[4] == "task-ack")
+        );
+        assert!(
+            pending
+                .iter()
+                .any(|entry| entry.report.key.parts()[4] == "task-started")
+        );
+        assert!(
+            !pending
+                .iter()
+                .any(|entry| entry.report.class == ReportClass::FinalResult)
+        );
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_command_final_result_replays_after_reopen_and_exact_receipt_cleans_it() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_application::delivery::PendingReport;
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass};
+        use fleet_protocol::receipt::{
+            ReportDispositionWire, ReportReceiptStatementWire, SignedReportReceiptWire,
+        };
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "a".repeat(64);
+        let store_epoch = "b".repeat(64);
+        let root = unique_test_dir("command-final-result-reconnect-replay");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let first_client = worker.client();
+        let outbound = test_outbound_queue(8);
+        let task_state = test_task_session_state();
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: "unused-in-this-test",
+            correlation_id: "corr-command-final",
+            task_state: &task_state,
+            journal_client: &first_client,
+            controller_namespace: &namespace,
+        };
+
+        run_signed_command_task_queue(
+            &session,
+            &envelope,
+            fleet_protocol::CommandTaskWire {
+                program: "sh".to_owned(),
+                args: vec!["-c".to_owned(), "printf out; printf err >&2".to_owned()],
+                timeout_ms: 5_000,
+                max_output_bytes: 1024,
+            },
+        )
+        .unwrap();
+        assert!(outbound.lock().unwrap().pending_report().is_none());
+        let first_pending = first_client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(first_pending.len(), 5);
+        let ack = first_pending
+            .iter()
+            .find(|entry| entry.report.key.parts()[4] == "task-ack")
+            .expect("task acknowledgement is journaled");
+        assert_eq!(ack.report.key.parts()[4], "task-ack");
+        let started = first_pending
+            .iter()
+            .find(|entry| entry.report.key.parts()[4] == "task-started")
+            .expect("TaskStarted is journaled");
+        assert_eq!(started.report.body(), br#"{"event":"task_started"}"#);
+        let final_report = first_pending
+            .iter()
+            .find(|entry| entry.report.class == ReportClass::FinalResult)
+            .expect("final result remains journaled");
+        assert_eq!(
+            final_report.report.key.parts(),
+            [
+                namespace.as_str(),
+                config.agent_id.as_str(),
+                "job-queue",
+                "task-queue",
+                "final-result",
+            ]
+        );
+        let final_body: serde_json::Value =
+            serde_json::from_slice(final_report.report.body()).unwrap();
+        assert_eq!(final_body["output"]["stdout_chunks"], 1);
+        assert_eq!(final_body["output"]["stderr_chunks"], 1);
+        assert_eq!(final_body["output"]["truncated"], false);
+        let output_reports: Vec<_> = first_pending
+            .iter()
+            .filter(|entry| entry.report.class == ReportClass::Output)
+            .collect();
+        assert_eq!(output_reports.len(), 2);
+        for output in output_reports {
+            let body: serde_json::Value = serde_json::from_slice(output.report.body()).unwrap();
+            assert_eq!(body["sequence"], 0);
+        }
+        let old_session_message =
+            agent_journal_report_wire_message(final_report, &config, "corr-before-reconnect")
+                .unwrap();
+        drop(first_pending);
+        drop(first_client);
+        worker.shutdown().unwrap();
+
+        let reopened_worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let client = reopened_worker.client();
+        let pending = client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 5);
+        assert!(
+            pending
+                .iter()
+                .any(|entry| entry.report.key.parts()[4] == "task-ack")
+        );
+        assert!(
+            pending
+                .iter()
+                .any(|entry| entry.report.key.parts()[4] == "task-started")
+        );
+        let pending: PendingReport = pending
+            .iter()
+            .find(|entry| entry.report.class == ReportClass::FinalResult)
+            .expect("final result survives reopen")
+            .clone();
+        let key = pending.report.key.clone();
+        let new_session_message =
+            agent_journal_report_wire_message(&pending, &config, "corr-after-reconnect").unwrap();
+        assert_ne!(
+            old_session_message.message_id,
+            new_session_message.message_id
+        );
+        let fleet_protocol::WirePayload::TaskReport(old_report) = old_session_message.payload
+        else {
+            panic!("expected v2 task report before reconnect");
+        };
+        let fleet_protocol::WirePayload::TaskReport(new_report) = new_session_message.payload
+        else {
+            panic!("expected v2 task report after reconnect");
+        };
+        assert_eq!(old_report, new_report);
+        assert_eq!(
+            new_report.class,
+            fleet_protocol::delivery_v2::V2ReportClassWire::FinalResult
+        );
+
+        let mut delivery = AgentJournalReportDelivery::new(
+            client.clone(),
+            ControllerDeliveryIdentity {
+                namespace: namespace.clone(),
+                store_epoch: store_epoch.clone(),
+            },
+        );
+        delivery.pending_scan = Some(
+            client
+                .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                .unwrap(),
+        );
+        let scan_deadline = Instant::now() + Duration::from_secs(5);
+        while delivery.pending_scan.is_some() && Instant::now() < scan_deadline {
+            delivery.poll_pending_scan().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(delivery.pending.contains_key(&key));
+
+        let keys = fleet_core::generate_agent_key_pair().unwrap();
+        let mut config = config;
+        config.controller_fingerprint = keys.fingerprint.clone();
+        let [_, agent_id, job_id, task_id, report_id] = pending.report.key.parts();
+        let digest_hex = pending
+            .digest
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let statement = ReportReceiptStatementWire {
+            controller_namespace: namespace,
+            store_epoch,
+            agent_id: agent_id.to_owned(),
+            job_id: job_id.to_owned(),
+            task_id: task_id.to_owned(),
+            report_id: report_id.to_owned(),
+            digest_hex,
+            signed_at_ms: epoch_millis() as u64,
+            disposition: ReportDispositionWire::Stored,
+            signing_key_fingerprint: keys.fingerprint.clone(),
+        };
+        let signature_hex = fleet_core::sign_challenge(
+            &keys.private_key_hex,
+            &statement.signing_preimage().unwrap(),
+        )
+        .unwrap();
+        let receipt = SignedReportReceiptWire {
+            statement,
+            signature_hex,
+        };
+        let receipt_message = fleet_protocol::WireMessage::new(
+            "msg-final-receipt",
+            "corr-after-reconnect",
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::ReportReceipt(receipt.clone()),
+        );
+        delivery
+            .handle_receipt(
+                &receipt_message,
+                &receipt,
+                &config,
+                &keys.public_key_hex,
+                "corr-after-reconnect",
+                &task_state,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivery.pending.contains_key(&key) && Instant::now() < deadline {
+            delivery.poll_acknowledgements().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!delivery.pending.contains_key(&key));
+        let remaining = client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(remaining.len(), 4);
+        assert!(
+            remaining
+                .iter()
+                .any(|entry| entry.report.key.parts()[4] == "task-ack")
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|entry| entry.report.key.parts()[4] == "task-started")
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|entry| entry.report.class == ReportClass::Output)
+                .count(),
+            2
+        );
+        reopened_worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_no_artifact_runbook_executor_observes_durable_start_intent() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{ExecutionPhase, JournalCapacity, JournalUsage};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "a".repeat(64);
+        let root = unique_test_dir("runbook-execution-start-intent");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let client = worker.client();
+        let outbound = test_outbound_queue(8);
+        let task_state = test_task_session_state();
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: "unused-in-this-test",
+            correlation_id: "corr-runbook-start-intent",
+            task_state: &task_state,
+            journal_client: &client,
+            controller_namespace: &namespace,
+        };
+        let observed_phase = Arc::new(Mutex::new(None));
+        let observed_phase_by_executor = observed_phase.clone();
+        let executor_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor_calls_by_executor = executor_calls.clone();
+        let executor_journal = client.clone();
+        let runbook_task = || {
+            fleet_protocol::RunbookExecutionTaskWire {
+            runbook_document: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: local-facts\nselector: role=web\nsteps:\n  - id: facts\n    facts.collect:\n      scope: local".to_owned(),
+            timeout_ms: 5_000,
+            confirmed_high_risk: false,
+        }
+        };
+
+        let result = run_signed_runbook_task_queue_with_executor(
+            &session,
+            &envelope,
+            runbook_task(),
+            move |_, _| {
+                executor_calls_by_executor.fetch_add(1, Ordering::SeqCst);
+                let record = executor_journal
+                    .interrupted()
+                    .unwrap()
+                    .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                    .unwrap();
+                *observed_phase_by_executor.lock().unwrap() =
+                    record.map(|record| record.snapshot().phase);
+                Ok(fleet_runner::RunbookExecutionReport {
+                    runbook_name: "local-facts".to_owned(),
+                    outcomes: Vec::new(),
+                })
+            },
+        );
+        let duplicate_executor_calls = executor_calls.clone();
+        let duplicate_result = run_signed_runbook_task_queue_with_executor(
+            &session,
+            &envelope,
+            runbook_task(),
+            move |_, _| {
+                duplicate_executor_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fleet_runner::RunbookExecutionReport {
+                    runbook_name: "local-facts".to_owned(),
+                    outcomes: Vec::new(),
+                })
+            },
+        );
+        let interrupted_after_completion = client
+            .interrupted()
+            .unwrap()
+            .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+            .unwrap();
+        let pending = client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+            .unwrap();
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+
+        result.unwrap();
+        duplicate_result.unwrap();
+        assert_eq!(executor_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *observed_phase.lock().unwrap(),
+            Some(ExecutionPhase::StartIntent),
+            "Runbook execution must not enter its executor before StartIntent is durable"
+        );
+        assert!(pending.iter().any(|entry| {
+            entry.report.key.parts()[4] == "task-started"
+                && entry.report.body() == br#"{"event":"task_started"}"#
+        }));
+        assert!(pending.iter().any(|entry| {
+            entry.report.key.parts()[4] == "task-ack"
+                && entry.report.body() == br#"{"event":"task_ack"}"#
+        }));
+        let ack_position = pending
+            .iter()
+            .position(|entry| entry.report.key.parts()[4] == "task-ack")
+            .unwrap();
+        let started_position = pending
+            .iter()
+            .position(|entry| entry.report.key.parts()[4] == "task-started")
+            .unwrap();
+        assert!(ack_position < started_position);
+        assert!(interrupted_after_completion.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runbook_execution_admission_failure_prevents_ack_and_file_side_effect() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "b".repeat(64);
+        let root = unique_test_dir("runbook-admission-fail-closed");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let destination = root.join("runbook-side-effect.conf");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(16, AGENT_JOURNAL_MAX_BYTES, 1).unwrap();
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let client = worker.client();
+        let outbound = test_outbound_queue(8);
+        let task_state = test_task_session_state();
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: "unused-in-this-test",
+            correlation_id: "corr-runbook-admission-failure",
+            task_state: &task_state,
+            journal_client: &client,
+            controller_namespace: &namespace,
+        };
+        let runbook_document = format!(
+            "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nmetadata:\n  name: write-config\nspec:\n  targets:\n    selector: role=web\n  tasks:\n    - id: config\n      file.copy:\n        dest: {}\n        content: marker\n",
+            destination.display()
+        );
+
+        let result = run_signed_runbook_task_queue(
+            &session,
+            &envelope,
+            fleet_protocol::RunbookExecutionTaskWire {
+                runbook_document,
+                timeout_ms: 5_000,
+                confirmed_high_risk: true,
+            },
+        );
+        let side_effect_exists = destination.exists();
+        drop(client);
+        worker.shutdown().unwrap();
+
+        let reopen_limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let reopened = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            reopen_limits,
+        )
+        .unwrap();
+        let reopened_client = reopened.client();
+        let pending = reopened_client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+            .unwrap();
+        reopened.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+
+        assert!(
+            result.is_err(),
+            "admission exceeds the journal request limit"
+        );
+        assert!(
+            !side_effect_exists,
+            "file.copy must not run before admission"
+        );
+        assert!(
+            pending.is_empty(),
+            "failed admission must not report TaskAck"
+        );
+        assert!(TestOutboundReceiver(outbound).try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_runbook_no_artifact_final_result_is_journaled_and_replays_after_reopen() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass};
+        use fleet_protocol::receipt::{
+            ReportDispositionWire, ReportReceiptStatementWire, SignedReportReceiptWire,
+        };
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "a".repeat(64);
+        let root = unique_test_dir("runbook-final-result-reconnect-replay");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let mut config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let client = worker.client();
+        let outbound = test_outbound_queue(8);
+        let task_state = test_task_session_state();
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: "unused-in-this-test",
+            correlation_id: "corr-runbook-final",
+            task_state: &task_state,
+            journal_client: &client,
+            controller_namespace: &namespace,
+        };
+
+        run_signed_runbook_task_queue(
+            &session,
+            &envelope,
+            fleet_protocol::RunbookExecutionTaskWire {
+                runbook_document: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: local-facts\nselector: role=web\nsteps:\n  - id: facts\n    facts.collect:\n      scope: local".to_owned(),
+                timeout_ms: 5_000,
+                confirmed_high_risk: false,
+            },
+        )
+        .unwrap();
+
+        let mut queued = outbound.lock().unwrap();
+        let mut output_chunks = 0;
+        while let Some(message) = queued.remove_pending_report() {
+            match message.payload {
+                fleet_protocol::WirePayload::OutputChunk { .. } => output_chunks += 1,
+                fleet_protocol::WirePayload::TaskStarted { .. } => {
+                    panic!("persistent TaskStarted must use the journal report path")
+                }
+                fleet_protocol::WirePayload::TaskResult { .. } => {
+                    panic!("no-artifact Runbook result must use the durable report path")
+                }
+                payload => panic!("unexpected Runbook event: {payload:?}"),
+            }
+        }
+        assert_eq!(
+            output_chunks, 0,
+            "durable Runbook output must not use the ephemeral queue"
+        );
+        drop(queued);
+
+        let pending = client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        let output_reports = pending
+            .iter()
+            .filter(|entry| entry.report.class == ReportClass::Output)
+            .collect::<Vec<_>>();
+        assert!(
+            !output_reports.is_empty(),
+            "no-artifact Runbook output chunks must be journaled"
+        );
+        let output_report_count = output_reports.len();
+        let mut stdout_sequences = Vec::new();
+        let mut stderr_sequences = Vec::new();
+        for entry in &output_reports {
+            let body: serde_json::Value = serde_json::from_slice(entry.report.body()).unwrap();
+            let sequence = body["sequence"].as_u64().unwrap();
+            match body["stream"].as_str().unwrap() {
+                "stdout" => stdout_sequences.push(sequence),
+                "stderr" => stderr_sequences.push(sequence),
+                stream => panic!("unexpected Runbook output stream: {stream}"),
+            }
+        }
+        assert_eq!(
+            stdout_sequences,
+            (0..stdout_sequences.len() as u64).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            stderr_sequences,
+            (0..stderr_sequences.len() as u64).collect::<Vec<_>>()
+        );
+        let started = pending
+            .iter()
+            .find(|entry| entry.report.key.parts()[4] == "task-started")
+            .expect("TaskStarted is retained in the journal");
+        assert_eq!(started.report.class, ReportClass::Lifecycle);
+        assert_eq!(started.report.body(), br#"{"event":"task_started"}"#);
+        let started_key = started.report.key.clone();
+        let final_report = pending
+            .iter()
+            .find(|entry| entry.report.class == ReportClass::FinalResult)
+            .expect("Runbook final result is retained in the journal");
+        assert_eq!(
+            final_report.report.key.parts(),
+            [
+                namespace.as_str(),
+                config.agent_id.as_str(),
+                "job-queue",
+                "task-queue",
+                "final-result",
+            ]
+        );
+        let body: serde_json::Value = serde_json::from_slice(final_report.report.body()).unwrap();
+        assert_eq!(body["exit_code"], 0);
+        assert_eq!(body["status"], "succeeded");
+        assert_eq!(body["reason"], "");
+        assert_eq!(body["artifacts"], serde_json::json!([]));
+        assert_eq!(
+            body["output"]["stdout_chunks"].as_u64(),
+            Some(output_report_count as u64)
+        );
+        assert_eq!(body["output"]["stderr_chunks"], 0);
+        assert_eq!(body["output"]["truncated"], false);
+        let first_body = final_report.report.body().to_vec();
+        drop(pending);
+        drop(client);
+        worker.shutdown().unwrap();
+
+        let reopened = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let reopened_client = reopened.client();
+        let replay = reopened_client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(replay.len(), output_report_count + 3);
+        let replayed_started = replay
+            .iter()
+            .find(|entry| entry.report.key.parts()[4] == "task-started")
+            .expect("TaskStarted replays after journal reopen");
+        assert_eq!(
+            replayed_started.report.body(),
+            br#"{"event":"task_started"}"#
+        );
+        assert_eq!(replayed_started.report.key, started_key);
+        let pending_report = replay
+            .iter()
+            .find(|entry| entry.report.class == ReportClass::FinalResult)
+            .expect("final result replays after journal reopen")
+            .clone();
+        assert_eq!(pending_report.report.body(), first_body);
+        let key = pending_report.report.key.clone();
+        let digest_hex = pending_report
+            .digest
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        drop(replay);
+
+        let mut delivery = AgentJournalReportDelivery::new(
+            reopened_client.clone(),
+            ControllerDeliveryIdentity {
+                namespace: namespace.clone(),
+                store_epoch: "b".repeat(64),
+            },
+        );
+        delivery.pending_scan = Some(
+            reopened_client
+                .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                .unwrap(),
+        );
+        let scan_deadline = Instant::now() + Duration::from_secs(5);
+        while delivery.pending_scan.is_some() && Instant::now() < scan_deadline {
+            delivery.poll_pending_scan().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(delivery.pending.contains_key(&key));
+        assert!(delivery.pending.contains_key(&started_key));
+
+        let keys = fleet_core::generate_agent_key_pair().unwrap();
+        config.controller_fingerprint = keys.fingerprint.clone();
+        let [_, agent_id, job_id, task_id, report_id] = pending_report.report.key.parts();
+        let statement = ReportReceiptStatementWire {
+            controller_namespace: namespace.clone(),
+            store_epoch: "b".repeat(64),
+            agent_id: agent_id.to_owned(),
+            job_id: job_id.to_owned(),
+            task_id: task_id.to_owned(),
+            report_id: report_id.to_owned(),
+            digest_hex,
+            signed_at_ms: epoch_millis() as u64,
+            disposition: ReportDispositionWire::Stored,
+            signing_key_fingerprint: keys.fingerprint.clone(),
+        };
+        let receipt = SignedReportReceiptWire {
+            signature_hex: fleet_core::sign_challenge(
+                &keys.private_key_hex,
+                &statement.signing_preimage().unwrap(),
+            )
+            .unwrap(),
+            statement,
+        };
+        let receipt_message = fleet_protocol::WireMessage::new(
+            "msg-runbook-final-receipt",
+            "corr-runbook-reconnected",
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::ReportReceipt(receipt.clone()),
+        );
+        delivery
+            .handle_receipt(
+                &receipt_message,
+                &receipt,
+                &config,
+                &keys.public_key_hex,
+                "corr-runbook-reconnected",
+                &task_state,
+            )
+            .unwrap();
+        let ack_deadline = Instant::now() + Duration::from_secs(5);
+        while delivery.pending.contains_key(&key) && Instant::now() < ack_deadline {
+            delivery.poll_acknowledgements().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!delivery.pending.contains_key(&key));
+        let remaining = reopened_client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(remaining.len(), output_report_count + 2);
+        assert!(
+            remaining
+                .iter()
+                .any(|entry| entry.report.key.parts()[4] == "task-started")
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|entry| entry.report.class == ReportClass::Output)
+                .count(),
+            output_report_count
+        );
+
+        let artifact = fleet_protocol::TaskResultArtifactWire {
+            artifact_id: "artifact-runbook".to_owned(),
+            step_id: "template:config".to_owned(),
+            destination: "/etc/example.conf".to_owned(),
+            checksum_sha256: "c".repeat(64),
+            size_bytes: 3,
+            retention_class: "rendered_template".to_owned(),
+            content_bytes: Some(b"cfg".to_vec()),
+        };
+        let reopened_session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: &keys.public_key_hex,
+            correlation_id: "corr-runbook-artifact",
+            task_state: &task_state,
+            journal_client: &reopened_client,
+            controller_namespace: &namespace,
+        };
+        send_or_persist_runbook_final_result(
+            &reopened_session,
+            &envelope,
+            AgentTaskResultReport::with_artifacts(
+                0,
+                fleet_protocol::TaskResultStatus::Succeeded,
+                "",
+                vec![artifact.clone()],
+            ),
+        )
+        .unwrap();
+        let artifact_result = outbound.lock().unwrap().remove_pending_report().unwrap();
+        let fleet_protocol::WirePayload::TaskReport(artifact_result) = artifact_result.payload
+        else {
+            panic!("artifact-producing Runbook must use the v2 final-result report");
+        };
+        assert_eq!(
+            artifact_result.class,
+            fleet_protocol::delivery_v2::V2ReportClassWire::FinalResult
+        );
+        let report_body = artifact_result.body_bytes().unwrap();
+        let report_body: fleet_protocol::delivery_v2::V2FinalResultReportBody =
+            serde_json::from_slice(&report_body).unwrap();
+        assert_eq!(report_body.artifacts, vec![artifact]);
+        let remaining = reopened_client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(remaining.len(), output_report_count + 2);
+        assert!(
+            remaining
+                .iter()
+                .any(|entry| entry.report.key.parts()[4] == "task-started")
+        );
+        reopened.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_runbook_final_result_is_journaled_even_when_output_queue_is_full() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "f".repeat(64);
+        let root = unique_test_dir("runbook-final-output-queue-full");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let client = worker.client();
+        let outbound = test_outbound_queue(0);
+        let task_state = test_task_session_state();
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: "unused-in-this-test",
+            correlation_id: "corr-runbook-output-full",
+            task_state: &task_state,
+            journal_client: &client,
+            controller_namespace: &namespace,
+        };
+
+        assert!(
+            run_signed_runbook_task_queue(
+                &session,
+                &envelope,
+                fleet_protocol::RunbookExecutionTaskWire {
+                    runbook_document: "apiVersion: [invalid".to_owned(),
+                    timeout_ms: 5_000,
+                    confirmed_high_risk: false,
+                },
+            )
+            .is_ok(),
+            "durable Runbook output must not depend on ephemeral queue capacity"
+        );
+        let pending = client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 3);
+        let output = pending
+            .iter()
+            .find(|entry| entry.report.class == ReportClass::Output)
+            .expect("Runbook failure output is journaled");
+        assert!(output.report.key.parts()[4].starts_with("output-stderr-"));
+        let final_report = pending
+            .iter()
+            .find(|entry| entry.report.class == ReportClass::FinalResult)
+            .expect("Runbook failure final is journaled after output");
+        let body: serde_json::Value = serde_json::from_slice(final_report.report.body()).unwrap();
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["output"]["stderr_chunks"], 1);
+        assert_eq!(body["output"]["truncated"], false);
+        drop(pending);
+        drop(client);
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runbook_final_status_reflects_failed_or_canceled_step_outcomes() {
+        let outcome = |status, exit_code| fleet_runner::RunbookStepOutcome {
+            id: "step".to_owned(),
+            status,
+            changed: None,
+            message: "step outcome".to_owned(),
+            diff: None,
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            duration_ms: 1,
+            exit_code,
+            stdout: String::new(),
+            stderr: String::new(),
+            audit_metadata: "primitive=test".to_owned(),
+            artifact: None,
+        };
+        let failed = fleet_runner::RunbookExecutionReport {
+            runbook_name: "failure".to_owned(),
+            outcomes: vec![outcome(
+                fleet_runner::PrimitiveResultStatus::Failed,
+                Some(7),
+            )],
+        };
+        assert_eq!(
+            runbook_task_result_summary(&failed),
+            (7, fleet_protocol::TaskResultStatus::Failed)
+        );
+        let canceled = fleet_runner::RunbookExecutionReport {
+            runbook_name: "canceled".to_owned(),
+            outcomes: vec![outcome(fleet_runner::PrimitiveResultStatus::Canceled, None)],
+        };
+        assert_eq!(
+            runbook_task_result_summary(&canceled),
+            (-1, fleet_protocol::TaskResultStatus::Canceled)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_command_commits_start_intent_before_child_and_completes_record_with_result() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{ExecutionPhase, JournalCapacity, JournalUsage};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "e".repeat(64);
+        let root = unique_test_dir("command-execution-intent");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let keys = fleet_core::generate_agent_key_pair().unwrap();
+        let mut config = test_agent_config();
+        config.controller_fingerprint = keys.fingerprint.clone();
+        let now = SystemTime::now();
+        let issued_at = now - Duration::from_secs(1);
+        let expires_at = now + Duration::from_secs(60);
+        let envelope = signed_test_task_envelope(
+            &config.agent_id,
+            "nonce-command-start-intent",
+            "payload-command-start-intent",
+            &keys.private_key_hex,
+            issued_at,
+            expires_at,
+        );
+        let wire_envelope = fleet_protocol::SignedTaskEnvelopeWire {
+            job_id: envelope.job_id.as_str().to_owned(),
+            task_id: envelope.task_id.as_str().to_owned(),
+            target_agent_id: envelope.target_agent_id.as_str().to_owned(),
+            issued_at_ms: issued_at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            expires_at_ms: expires_at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            nonce: envelope.nonce.as_str().to_owned(),
+            payload_hash: envelope.payload_hash.clone(),
+            signature: envelope.signature.as_ref().unwrap().as_str().to_owned(),
+        };
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let journal = worker.client();
+        let outbound = test_outbound_queue(4);
+        let task_state = test_task_session_state();
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: &keys.public_key_hex,
+            correlation_id: "corr-command-execution-intent",
+            task_state: &task_state,
+            journal_client: &journal,
+            controller_namespace: &namespace,
+        };
+
+        std::thread::scope(|scope| {
+            let execution = scope.spawn(|| {
+                handle_task_assignment_with_queue(
+                    &session,
+                    wire_envelope,
+                    fleet_protocol::TaskWire::Command(fleet_protocol::CommandTaskWire {
+                        program: "sleep".to_owned(),
+                        args: vec!["2".to_owned()],
+                        timeout_ms: 5_000,
+                        max_output_bytes: 1024,
+                    }),
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let record = loop {
+                if let Some(record) = journal
+                    .interrupted()
+                    .unwrap()
+                    .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                    .unwrap()
+                    .filter(|record| record.snapshot().phase == ExecutionPhase::StartIntent)
+                {
+                    break record;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Command did not persist StartIntent"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            assert_eq!(record.snapshot().phase, ExecutionPhase::StartIntent);
+            let pending_deadline = Instant::now() + Duration::from_secs(1);
+            let pending = loop {
+                let pending = journal
+                    .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                    .unwrap()
+                    .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                    .unwrap();
+                if pending
+                    .iter()
+                    .any(|entry| entry.report.key.parts()[4] == "task-started")
+                {
+                    break pending;
+                }
+                assert!(
+                    Instant::now() < pending_deadline,
+                    "Command did not persist TaskStarted before execution"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            assert!(pending.iter().any(|entry| {
+                entry.report.key.parts()[4] == "task-started"
+                    && entry.report.body() == br#"{"event":"task_started"}"#
+            }));
+            assert!(pending.iter().all(|entry| {
+                entry.report.class != fleet_domain::delivery::ReportClass::FinalResult
+            }));
+            assert!(TestOutboundReceiver(outbound.clone()).try_recv().is_err());
+            execution.join().unwrap().unwrap();
+        });
+
+        assert!(
+            journal
+                .interrupted()
+                .unwrap()
+                .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                .unwrap()
+                .is_none()
+        );
+        let pending = journal
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+            .unwrap();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(
+            pending[0].report.class,
+            fleet_domain::delivery::ReportClass::Lifecycle
+        );
+        assert_eq!(pending[0].report.key.parts()[4], "task-ack");
+        let ack_body: serde_json::Value = serde_json::from_slice(pending[0].report.body()).unwrap();
+        assert_eq!(ack_body["event"], "task_ack");
+        assert_eq!(pending[1].report.key.parts()[4], "task-started");
+        assert_eq!(
+            pending[2].report.class,
+            fleet_domain::delivery::ReportClass::FinalResult
+        );
+        let ack_report = pending[0].clone();
+        let ack_key = ack_report.report.key.clone();
+        let ack_digest_hex = ack_report
+            .digest
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let started_report = pending
+            .iter()
+            .find(|entry| entry.report.key.parts()[4] == "task-started")
+            .expect("TaskStarted remains journaled")
+            .clone();
+        assert_eq!(
+            started_report.report.class,
+            fleet_domain::delivery::ReportClass::Lifecycle
+        );
+        assert_eq!(started_report.report.body(), br#"{"event":"task_started"}"#);
+        let started_key = started_report.report.key.clone();
+        let started_digest_hex = started_report
+            .digest
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        drop(pending);
+        worker.shutdown().unwrap();
+
+        let reopened = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let reopened_client = reopened.client();
+        let mut delivery = AgentJournalReportDelivery::new(
+            reopened_client.clone(),
+            ControllerDeliveryIdentity {
+                namespace: namespace.clone(),
+                store_epoch: "d".repeat(64),
+            },
+        );
+        delivery.pending_scan = Some(
+            reopened_client
+                .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                .unwrap(),
+        );
+        let scan_deadline = Instant::now() + Duration::from_secs(5);
+        while delivery.pending_scan.is_some() && Instant::now() < scan_deadline {
+            delivery.poll_pending_scan().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(delivery.pending.contains_key(&ack_key));
+        assert!(delivery.pending.contains_key(&started_key));
+
+        let receipt_keys = fleet_core::generate_agent_key_pair().unwrap();
+        config.controller_fingerprint = receipt_keys.fingerprint.clone();
+        let [_, agent_id, job_id, task_id, report_id] = ack_report.report.key.parts();
+        let statement = fleet_protocol::receipt::ReportReceiptStatementWire {
+            controller_namespace: namespace.clone(),
+            store_epoch: "d".repeat(64),
+            agent_id: agent_id.to_owned(),
+            job_id: job_id.to_owned(),
+            task_id: task_id.to_owned(),
+            report_id: report_id.to_owned(),
+            digest_hex: ack_digest_hex,
+            signed_at_ms: epoch_millis() as u64,
+            disposition: fleet_protocol::receipt::ReportDispositionWire::Stored,
+            signing_key_fingerprint: receipt_keys.fingerprint.clone(),
+        };
+        let receipt = fleet_protocol::receipt::SignedReportReceiptWire {
+            signature_hex: fleet_core::sign_challenge(
+                &receipt_keys.private_key_hex,
+                &statement.signing_preimage().unwrap(),
+            )
+            .unwrap(),
+            statement,
+        };
+        let receipt_message = fleet_protocol::WireMessage::new(
+            "msg-task-ack-receipt",
+            "corr-task-ack-receipt",
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::ReportReceipt(receipt.clone()),
+        );
+        delivery
+            .handle_receipt(
+                &receipt_message,
+                &receipt,
+                &config,
+                &receipt_keys.public_key_hex,
+                "corr-task-ack-receipt",
+                &task_state,
+            )
+            .unwrap();
+        let ack_deadline = Instant::now() + Duration::from_secs(5);
+        while delivery.pending.contains_key(&ack_key) && Instant::now() < ack_deadline {
+            delivery.poll_acknowledgements().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!delivery.pending.contains_key(&ack_key));
+        let [_, agent_id, job_id, task_id, report_id] = started_report.report.key.parts();
+        let statement = fleet_protocol::receipt::ReportReceiptStatementWire {
+            controller_namespace: namespace.clone(),
+            store_epoch: "d".repeat(64),
+            agent_id: agent_id.to_owned(),
+            job_id: job_id.to_owned(),
+            task_id: task_id.to_owned(),
+            report_id: report_id.to_owned(),
+            digest_hex: started_digest_hex,
+            signed_at_ms: epoch_millis() as u64,
+            disposition: fleet_protocol::receipt::ReportDispositionWire::Stored,
+            signing_key_fingerprint: receipt_keys.fingerprint.clone(),
+        };
+        let started_receipt = fleet_protocol::receipt::SignedReportReceiptWire {
+            signature_hex: fleet_core::sign_challenge(
+                &receipt_keys.private_key_hex,
+                &statement.signing_preimage().unwrap(),
+            )
+            .unwrap(),
+            statement,
+        };
+        let started_receipt_message = fleet_protocol::WireMessage::new(
+            "msg-task-started-receipt",
+            "corr-task-started-receipt",
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::ReportReceipt(started_receipt.clone()),
+        );
+        delivery
+            .handle_receipt(
+                &started_receipt_message,
+                &started_receipt,
+                &config,
+                &receipt_keys.public_key_hex,
+                "corr-task-started-receipt",
+                &task_state,
+            )
+            .unwrap();
+        let started_deadline = Instant::now() + Duration::from_secs(5);
+        while delivery.pending.contains_key(&started_key) && Instant::now() < started_deadline {
+            delivery.poll_acknowledgements().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!delivery.pending.contains_key(&started_key));
+        let remaining = reopened_client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].report.class,
+            fleet_domain::delivery::ReportClass::FinalResult
+        );
+        reopened.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_admission_failure_prevents_task_ack_and_command_side_effect() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "7".repeat(64);
+        let root = unique_test_dir("command-admission-fail-closed");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(16, 1024, 1).unwrap();
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, "agent-web-01").unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let journal = worker.client();
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let outbound = test_outbound_queue(4);
+        let task_state = test_task_session_state();
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: "unused-in-this-test",
+            correlation_id: "corr-command-admission-failure",
+            task_state: &task_state,
+            journal_client: &journal,
+            controller_namespace: &namespace,
+        };
+        let marker = root.join("command-ran");
+
+        assert!(
+            run_signed_command_task_queue(
+                &session,
+                &envelope,
+                fleet_protocol::CommandTaskWire {
+                    program: "touch".to_owned(),
+                    args: vec![marker.to_string_lossy().into_owned()],
+                    timeout_ms: 1_000,
+                    max_output_bytes: 1024,
+                },
+            )
+            .is_err()
+        );
+        assert!(!marker.exists());
+        assert!(TestOutboundReceiver(outbound).try_recv().is_err());
+        drop(journal);
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_agent_process_converts_interrupted_admission_and_start_to_typed_final_reports() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{ExecutionPhase, JournalCapacity, JournalUsage, ReportClass};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = unique_test_dir("agent-execution-restart-recovery");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let namespace = "f".repeat(64);
+        let identity = ControllerDeliveryIdentity {
+            namespace: namespace.clone(),
+            store_epoch: "1".repeat(64),
+        };
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+
+        for (phase, expected_reason, expected_stdout_chunks, expected_truncated) in [
+            (
+                ExecutionPhase::Admitted,
+                "agent_interrupted_before_start",
+                0,
+                false,
+            ),
+            (
+                ExecutionPhase::StartIntent,
+                "execution_outcome_unknown",
+                1,
+                true,
+            ),
+        ] {
+            let phase_name = match phase {
+                ExecutionPhase::Admitted => "admitted",
+                ExecutionPhase::StartIntent => "started",
+                ExecutionPhase::ResultCommitted => unreachable!(),
+            };
+            let phase_root = root.join(phase_name);
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&phase_root)
+                .unwrap();
+            let path = phase_root.join("journal.sqlite3");
+            let config = test_agent_config();
+            let envelope = test_task_envelope(&config.agent_id);
+            let execution = agent_task_execution_record(&namespace, &config, &envelope).unwrap();
+            let final_key = execution.snapshot().final_report_key.clone();
+            let old_worker = JournalWorker::spawn(
+                SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+                capacity,
+                limits,
+            )
+            .unwrap();
+            let old_client = old_worker.client();
+            assert_eq!(
+                old_client
+                    .admit(&execution)
+                    .unwrap()
+                    .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                    .unwrap(),
+                fleet_application::delivery::ExecutionAdmission::New
+            );
+            if phase == ExecutionPhase::StartIntent {
+                old_client
+                    .start(&final_key)
+                    .unwrap()
+                    .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                    .unwrap();
+                persist_task_output_report(
+                    &old_client,
+                    &namespace,
+                    &config,
+                    &envelope,
+                    fleet_runner::CommandOutputChunk {
+                        stream: fleet_runner::CommandOutputStream::Stdout,
+                        sequence: 0,
+                        data: "already acknowledged before simulated crash".to_owned(),
+                    },
+                )
+                .unwrap();
+                let output = old_client
+                    .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                    .unwrap()
+                    .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.report.class == ReportClass::Output)
+                    .unwrap();
+                old_client
+                    .acknowledge(&output.report.key, output.digest)
+                    .unwrap()
+                    .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                    .unwrap();
+            }
+            drop(old_client);
+            old_worker.shutdown().unwrap();
+
+            let mut config = config;
+            config.delivery_journal_path = path;
+            let mut runtime = AgentSessionRuntime {
+                task_state: test_task_session_state(),
+                connection: fleet_agent::AgentSessionSupervisor::new(0),
+                outbound_queue: test_outbound_queue(8),
+                journal_worker: None,
+                journal_namespace: None,
+            };
+            let journal = ensure_agent_journal_worker(&mut runtime, &config, &identity).unwrap();
+            let pending = journal
+                .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                .unwrap()
+                .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].report.key, final_key);
+            assert_eq!(pending[0].report.class, ReportClass::FinalResult);
+            let body: serde_json::Value = serde_json::from_slice(pending[0].report.body()).unwrap();
+            assert_eq!(body["exit_code"], -1);
+            assert_eq!(body["status"], "failed");
+            assert_eq!(body["reason"], expected_reason);
+            assert_eq!(body["output"]["stdout_chunks"], expected_stdout_chunks);
+            assert_eq!(body["output"]["stderr_chunks"], 0);
+            assert_eq!(body["output"]["truncated"], expected_truncated);
+            assert!(
+                journal
+                    .interrupted()
+                    .unwrap()
+                    .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                    .unwrap()
+                    .is_none()
+            );
+            runtime.journal_worker.take().unwrap().shutdown().unwrap();
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_process_reconnect_skips_live_owner_then_reconciles_after_owner_ends() {
+        use fleet_domain::delivery::ExecutionPhase;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = unique_test_dir("agent-live-execution-reconnect");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let namespace = "9".repeat(64);
+        let identity = ControllerDeliveryIdentity {
+            namespace: namespace.clone(),
+            store_epoch: "8".repeat(64),
+        };
+        let mut config = test_agent_config();
+        config.delivery_journal_path = root.join("journal.sqlite3");
+        let mut runtime = AgentSessionRuntime {
+            task_state: test_task_session_state(),
+            connection: fleet_agent::AgentSessionSupervisor::new(0),
+            outbound_queue: test_outbound_queue(8),
+            journal_worker: None,
+            journal_namespace: None,
+        };
+        let journal = ensure_agent_journal_worker(&mut runtime, &config, &identity).unwrap();
+        let envelope = test_task_envelope(&config.agent_id);
+        let execution = agent_task_execution_record(&namespace, &config, &envelope).unwrap();
+        let final_key = execution.snapshot().final_report_key.clone();
+        runtime
+            .task_state
+            .runtime
+            .start_task(envelope.task_id.as_str())
+            .unwrap();
+        runtime.task_state.busy.store(true, Ordering::SeqCst);
+        assert_eq!(
+            journal
+                .admit(&execution)
+                .unwrap()
+                .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                .unwrap(),
+            fleet_application::delivery::ExecutionAdmission::New
+        );
+        journal
+            .start(&final_key)
+            .unwrap()
+            .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+            .unwrap();
+
+        let reconnected = ensure_agent_journal_worker(&mut runtime, &config, &identity).unwrap();
+        let record = reconnected
+            .interrupted()
+            .unwrap()
+            .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+            .unwrap()
+            .expect("the still-live task remains marked as active");
+        assert_eq!(record.snapshot().phase, ExecutionPhase::StartIntent);
+        assert_eq!(
+            reconnected
+                .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                .unwrap()
+                .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                .unwrap()
+                .len(),
+            0
+        );
+        drop(reconnected);
+        runtime
+            .task_state
+            .runtime
+            .finish_task(envelope.task_id.as_str());
+        runtime.task_state.busy.store(false, Ordering::SeqCst);
+        let after_owner_exit =
+            ensure_agent_journal_worker(&mut runtime, &config, &identity).unwrap();
+        let recovered = after_owner_exit
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(recovered[0].report.body()).unwrap();
+        assert_eq!(body["reason"], "execution_outcome_unknown");
+        assert!(
+            after_owner_exit
+                .interrupted()
+                .unwrap()
+                .wait(AGENT_JOURNAL_COMMIT_TIMEOUT)
+                .unwrap()
+                .is_none()
+        );
+        drop(after_owner_exit);
+        drop(journal);
+        runtime.journal_worker.take().unwrap().shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canceled_before_start_command_final_result_is_journaled_without_legacy_event() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "c".repeat(64);
+        let root = unique_test_dir("command-canceled-before-start");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let keys = fleet_core::generate_agent_key_pair().unwrap();
+        let mut config = test_agent_config();
+        config.controller_fingerprint = keys.fingerprint.clone();
+        let now = SystemTime::now();
+        let issued_at = now - Duration::from_secs(1);
+        let expires_at = now + Duration::from_secs(60);
+        let envelope = signed_test_task_envelope(
+            &config.agent_id,
+            "nonce-canceled-before-start",
+            "payload-canceled-before-start",
+            &keys.private_key_hex,
+            issued_at,
+            expires_at,
+        );
+        let wire_envelope = fleet_protocol::SignedTaskEnvelopeWire {
+            job_id: envelope.job_id.as_str().to_owned(),
+            task_id: envelope.task_id.as_str().to_owned(),
+            target_agent_id: envelope.target_agent_id.as_str().to_owned(),
+            issued_at_ms: issued_at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            expires_at_ms: expires_at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            nonce: envelope.nonce.as_str().to_owned(),
+            payload_hash: envelope.payload_hash.clone(),
+            signature: envelope.signature.as_ref().unwrap().as_str().to_owned(),
+        };
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let journal = worker.client();
+        let outbound = test_outbound_queue(4);
+        let task_state = test_task_session_state();
+        task_state
+            .runtime
+            .start_task(envelope.task_id.as_str())
+            .unwrap();
+        assert!(
+            task_state
+                .runtime
+                .request_cancel(envelope.task_id.as_str())
+                .unwrap()
+        );
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: &keys.public_key_hex,
+            correlation_id: "corr-canceled-before-start",
+            task_state: &task_state,
+            journal_client: &journal,
+            controller_namespace: &namespace,
+        };
+
+        handle_task_assignment_with_queue(
+            &session,
+            wire_envelope,
+            fleet_protocol::TaskWire::Command(fleet_protocol::CommandTaskWire {
+                program: "must-not-run".to_owned(),
+                args: Vec::new(),
+                timeout_ms: 1_000,
+                max_output_bytes: 1024,
+            }),
+        )
+        .unwrap();
+
+        assert!(TestOutboundReceiver(outbound.clone()).try_recv().is_err());
+        let pending = journal
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].report.class, ReportClass::FinalResult);
+        assert_eq!(pending[0].report.key.parts()[4], "final-result");
+        assert_eq!(
+            pending[0].report.body(),
+            br#"{"exit_code":-1,"status":"canceled","reason":"operator requested cancel","artifacts":[],"output":{"stdout_chunks":0,"stderr_chunks":0,"truncated":false}}"#
+        );
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canceled_before_start_runbook_final_result_is_journaled_without_legacy_event() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "g".repeat(64);
+        let root = unique_test_dir("runbook-canceled-before-start");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let keys = fleet_core::generate_agent_key_pair().unwrap();
+        let mut config = test_agent_config();
+        config.controller_fingerprint = keys.fingerprint.clone();
+        let now = SystemTime::now();
+        let issued_at = now - Duration::from_secs(1);
+        let expires_at = now + Duration::from_secs(60);
+        let envelope = signed_test_task_envelope(
+            &config.agent_id,
+            "nonce-runbook-canceled-before-start",
+            "payload-runbook-canceled-before-start",
+            &keys.private_key_hex,
+            issued_at,
+            expires_at,
+        );
+        let wire_envelope = fleet_protocol::SignedTaskEnvelopeWire {
+            job_id: envelope.job_id.as_str().to_owned(),
+            task_id: envelope.task_id.as_str().to_owned(),
+            target_agent_id: envelope.target_agent_id.as_str().to_owned(),
+            issued_at_ms: issued_at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            expires_at_ms: expires_at.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            nonce: envelope.nonce.as_str().to_owned(),
+            payload_hash: envelope.payload_hash.clone(),
+            signature: envelope.signature.as_ref().unwrap().as_str().to_owned(),
+        };
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let journal = worker.client();
+        let outbound = test_outbound_queue(4);
+        let task_state = test_task_session_state();
+        task_state
+            .runtime
+            .start_task(envelope.task_id.as_str())
+            .unwrap();
+        assert!(
+            task_state
+                .runtime
+                .request_cancel(envelope.task_id.as_str())
+                .unwrap()
+        );
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: &keys.public_key_hex,
+            correlation_id: "corr-runbook-canceled-before-start",
+            task_state: &task_state,
+            journal_client: &journal,
+            controller_namespace: &namespace,
+        };
+
+        handle_task_assignment_with_queue(
+            &session,
+            wire_envelope,
+            fleet_protocol::TaskWire::RunbookExecution(fleet_protocol::RunbookExecutionTaskWire {
+                runbook_document: "apiVersion: [invalid".to_owned(),
+                timeout_ms: 1_000,
+                confirmed_high_risk: false,
+            }),
+        )
+        .unwrap();
+
+        assert!(TestOutboundReceiver(outbound.clone()).try_recv().is_err());
+        let pending = journal
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].report.class, ReportClass::FinalResult);
+        assert_eq!(
+            pending[0].report.body(),
+            br#"{"exit_code":-1,"status":"canceled","reason":"operator requested cancel","artifacts":[],"output":{"stdout_chunks":0,"stderr_chunks":0,"truncated":false}}"#
+        );
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_persistent_command_journals_final_result_instead_of_legacy_event() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "d".repeat(64);
+        let root = unique_test_dir("command-timeout-final-result");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let journal = worker.client();
+        let outbound = test_outbound_queue(4);
+        let task_state = test_task_session_state();
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &outbound,
+            config: &config,
+            controller_public_key: "unused-in-this-test",
+            correlation_id: "corr-timeout-final-result",
+            task_state: &task_state,
+            journal_client: &journal,
+            controller_namespace: &namespace,
+        };
+
+        run_signed_command_task_queue(
+            &session,
+            &envelope,
+            fleet_protocol::CommandTaskWire {
+                program: "sleep".to_owned(),
+                args: vec!["2".to_owned()],
+                timeout_ms: 25,
+                max_output_bytes: 1024,
+            },
+        )
+        .unwrap();
+
+        let receiver = TestOutboundReceiver(outbound);
+        assert!(receiver.try_recv().is_err());
+        let pending = journal
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|entry| entry.report.key.parts()[4] == "task-ack")
+        );
+        assert!(pending.iter().any(|entry| {
+            entry.report.key.parts()[4] == "task-started"
+                && entry.report.body() == br#"{"event":"task_started"}"#
+        }));
+        let final_result = pending
+            .iter()
+            .find(|entry| entry.report.class == ReportClass::FinalResult)
+            .expect("timed-out command result is committed to the journal");
+        let body: serde_json::Value = serde_json::from_slice(final_result.report.body()).unwrap();
+        assert_eq!(body["exit_code"], -1);
+        assert_eq!(body["status"], "timed_out");
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_command_output_replays_after_reopen_and_stale_restore_epoch_receipt_cannot_clean_it()
+     {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_application::delivery::PendingReport;
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage};
+        use fleet_protocol::receipt::{
+            ReportDispositionWire, ReportReceiptStatementWire, SignedReportReceiptWire,
+        };
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let namespace = "a".repeat(64);
+        let store_epoch = "b".repeat(64);
+        let restored_store_epoch = "c".repeat(64);
+        let root = unique_test_dir("command-output-reconnect-replay");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let first_client = worker.client();
+        persist_task_output_report(
+            &first_client,
+            &namespace,
+            &config,
+            &envelope,
+            fleet_runner::CommandOutputChunk {
+                stream: fleet_runner::CommandOutputStream::Stdout,
+                sequence: 0,
+                data: "durable across disconnect".to_owned(),
+            },
+        )
+        .unwrap();
+        let first_pending = first_client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(first_pending.len(), 1);
+        let old_session_message =
+            agent_journal_report_wire_message(&first_pending[0], &config, "corr-before-reconnect")
+                .unwrap();
+        drop(first_pending);
+        drop(first_client);
+        worker.shutdown().unwrap();
+
+        let mut config = config;
+        let reopened_worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let client = reopened_worker.client();
+        let pending = client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        let new_session_message =
+            agent_journal_report_wire_message(&pending[0], &config, "corr-after-reconnect")
+                .unwrap();
+        assert_eq!(
+            old_session_message.correlation_id.0,
+            "corr-before-reconnect"
+        );
+        assert_eq!(new_session_message.correlation_id.0, "corr-after-reconnect");
+        assert_ne!(
+            old_session_message.message_id,
+            new_session_message.message_id
+        );
+        let fleet_protocol::WirePayload::TaskReport(old_report) = old_session_message.payload
+        else {
+            panic!("expected v2 task report");
+        };
+        let fleet_protocol::WirePayload::TaskReport(new_report) = new_session_message.payload
+        else {
+            panic!("expected v2 task report");
+        };
+        assert_eq!(old_report, new_report);
+        assert_eq!(
+            new_report.body_bytes().unwrap(),
+            br#"{"stream":"stdout","sequence":0,"data":"durable across disconnect"}"#
+        );
+
+        let pending: PendingReport = pending[0].clone();
+        let key = pending.report.key.clone();
+        let mut delivery = AgentJournalReportDelivery::new(
+            client.clone(),
+            ControllerDeliveryIdentity {
+                namespace: namespace.clone(),
+                store_epoch: restored_store_epoch.clone(),
+            },
+        );
+        delivery.pending.insert(
+            key.clone(),
+            AgentPendingJournalReport {
+                report: pending.clone(),
+                attempts: 1,
+                retry_at: Instant::now() + Duration::from_secs(30),
+            },
+        );
+
+        let keys = fleet_core::generate_agent_key_pair().unwrap();
+        config.controller_fingerprint = keys.fingerprint.clone();
+        let [_, agent_id, job_id, task_id, report_id] = pending.report.key.parts();
+        let digest_hex = pending
+            .digest
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let stale_statement = ReportReceiptStatementWire {
+            controller_namespace: namespace.clone(),
+            store_epoch: store_epoch.clone(),
+            agent_id: agent_id.to_owned(),
+            job_id: job_id.to_owned(),
+            task_id: task_id.to_owned(),
+            report_id: report_id.to_owned(),
+            digest_hex,
+            signed_at_ms: epoch_millis() as u64,
+            disposition: ReportDispositionWire::Stored,
+            signing_key_fingerprint: keys.fingerprint.clone(),
+        };
+        let stale_signature_hex = fleet_core::sign_challenge(
+            &keys.private_key_hex,
+            &stale_statement.signing_preimage().unwrap(),
+        )
+        .unwrap();
+        let stale_receipt = SignedReportReceiptWire {
+            statement: stale_statement,
+            signature_hex: stale_signature_hex,
+        };
+        let task_state = test_task_session_state();
+
+        let stale_message = fleet_protocol::WireMessage::new(
+            "msg-stale-restore-receipt",
+            "corr-after-reconnect",
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::ReportReceipt(stale_receipt.clone()),
+        );
+        assert!(
+            delivery
+                .handle_receipt(
+                    &stale_message,
+                    &stale_receipt,
+                    &config,
+                    &keys.public_key_hex,
+                    "corr-after-reconnect",
+                    &task_state,
+                )
+                .is_err(),
+            "a receipt from the pre-restore epoch cannot authorize local cleanup"
+        );
+        assert!(delivery.pending.contains_key(&key));
+        assert_eq!(
+            client
+                .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap()
+                .len(),
+            1,
+            "the exact report remains durable for replay in the restored epoch"
+        );
+
+        let statement = ReportReceiptStatementWire {
+            controller_namespace: namespace,
+            store_epoch: restored_store_epoch,
+            agent_id: agent_id.to_owned(),
+            job_id: job_id.to_owned(),
+            task_id: task_id.to_owned(),
+            report_id: report_id.to_owned(),
+            digest_hex: pending
+                .digest
+                .0
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            signed_at_ms: epoch_millis() as u64,
+            disposition: ReportDispositionWire::Stored,
+            signing_key_fingerprint: keys.fingerprint.clone(),
+        };
+        let signature_hex = fleet_core::sign_challenge(
+            &keys.private_key_hex,
+            &statement.signing_preimage().unwrap(),
+        )
+        .unwrap();
+        let receipt = SignedReportReceiptWire {
+            statement,
+            signature_hex,
+        };
+
+        let wrong_correlation = fleet_protocol::WireMessage::new(
+            "msg-wrong-correlation",
+            "corr-not-current",
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::ReportReceipt(receipt.clone()),
+        );
+        assert!(
+            delivery
+                .handle_receipt(
+                    &wrong_correlation,
+                    &receipt,
+                    &config,
+                    &keys.public_key_hex,
+                    "corr-after-reconnect",
+                    &task_state,
+                )
+                .is_err()
+        );
+
+        let mut forged = receipt.clone();
+        forged.signature_hex = "0".repeat(128);
+        let forged_message = fleet_protocol::WireMessage::new(
+            "msg-forged-receipt",
+            "corr-after-reconnect",
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::ReportReceipt(forged.clone()),
+        );
+        assert!(
+            delivery
+                .handle_receipt(
+                    &forged_message,
+                    &forged,
+                    &config,
+                    &keys.public_key_hex,
+                    "corr-after-reconnect",
+                    &task_state,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            client
+                .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let valid_message = fleet_protocol::WireMessage::new(
+            "msg-valid-receipt",
+            "corr-after-reconnect",
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::ReportReceipt(receipt.clone()),
+        );
+        delivery
+            .handle_receipt(
+                &valid_message,
+                &receipt,
+                &config,
+                &keys.public_key_hex,
+                "corr-after-reconnect",
+                &task_state,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivery.pending.contains_key(&key) && Instant::now() < deadline {
+            delivery.poll_acknowledgements().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!delivery.pending.contains_key(&key));
+        assert!(
+            client
+                .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap()
+                .is_empty()
+        );
+        reopened_worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_journal_worker_commits_reopens_and_confirms_real_sqlite_reports() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_application::delivery::JournalReport;
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass, ReportKey};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = unique_test_dir("journal-worker-integration");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: 4096,
+                bytes: 64 * 1024 * 1024,
+            },
+            JournalUsage {
+                reports: 4,
+                bytes: 4 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(16, 64 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        let report = JournalReport::new(
+            ReportKey::new(
+                "controller-fixture",
+                "agent-fixture",
+                "job-fixture",
+                "task-fixture",
+                "report-fixture",
+            )
+            .unwrap(),
+            ReportClass::Output,
+            vec![b'x'; 4096],
+        )
+        .unwrap();
+        let repository =
+            SqliteAgentJournal::open(&path, "controller-fixture", "agent-fixture").unwrap();
+        let worker = JournalWorker::spawn(repository, capacity, limits).unwrap();
+        worker
+            .client()
+            .append(&report)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        worker.shutdown().unwrap();
+
+        let repository =
+            SqliteAgentJournal::open(&path, "controller-fixture", "agent-fixture").unwrap();
+        let worker = JournalWorker::spawn(repository, capacity, limits).unwrap();
+        let client = worker.client();
+        let pending = client
+            .pending(16, 1024 * 1024)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].report, report);
+        assert!(
+            client
+                .acknowledge(&report.key, pending[0].digest)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap()
+        );
+        assert!(
+            client
+                .pending(16, 1024 * 1024)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap()
+                .is_empty()
+        );
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_drift_evidence_report_is_journaled_and_replays_exactly_after_reopen() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass};
+        use fleet_protocol::delivery_v2::{V2DriftEvidenceReportBody, V2DriftStatusWire};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = unique_test_dir("drift-evidence-journal-reopen");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let namespace = "a".repeat(64);
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let body = V2DriftEvidenceReportBody {
+            status: V2DriftStatusWire::Drifted,
+            expected: "nginx=running".to_owned(),
+            actual: "nginx=stopped".to_owned(),
+        };
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let client = worker.client();
+        persist_agent_drift_evidence_report(&client, &namespace, &config, &envelope, &body)
+            .unwrap();
+        let first_pending = client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(first_pending.len(), 1);
+        let first = &first_pending[0];
+        assert_eq!(first.report.class, ReportClass::DriftEvidence);
+        assert_eq!(first.report.key.parts()[4], "drift-evidence");
+        assert_eq!(
+            first.report.body(),
+            br#"{"status":"drifted","expected":"nginx=running","actual":"nginx=stopped"}"#
+        );
+        let before_reopen =
+            agent_journal_report_wire_message(&first_pending[0], &config, "before").unwrap();
+        worker.shutdown().unwrap();
+
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let pending = worker
+            .client()
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending, first_pending);
+        let after_reopen =
+            agent_journal_report_wire_message(&pending[0], &config, "after").unwrap();
+        assert_ne!(before_reopen.message_id, after_reopen.message_id);
+        let fleet_protocol::WirePayload::TaskReport(before) = before_reopen.payload else {
+            panic!("expected durable task report before reopen");
+        };
+        let fleet_protocol::WirePayload::TaskReport(after) = after_reopen.payload else {
+            panic!("expected durable task report after reopen");
+        };
+        assert_eq!(before, after);
+        assert_eq!(
+            after.class,
+            fleet_protocol::delivery_v2::V2ReportClassWire::DriftEvidence
+        );
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_drift_check_terminal_result_is_journaled_and_replays_after_reopen() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass};
+        use fleet_protocol::delivery_v2::V2FinalResultReportBody;
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = unique_test_dir("drift-final-result-journal-reopen");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let path = root.join("journal.sqlite3");
+        let namespace = "c".repeat(64);
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let policy_document = r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: nginx-running
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+"#;
+        let worker = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let journal = worker.client();
+        let sender = test_outbound_queue(8);
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &sender,
+            config: &config,
+            controller_public_key: "controller-public-key",
+            correlation_id: "corr-drift-final",
+            task_state: &test_task_session_state(),
+            journal_client: &journal,
+            controller_namespace: &namespace,
+        };
+        persist_agent_task_ack_report(&session, &envelope).unwrap();
+        run_signed_drift_check_task_queue(
+            &session,
+            &envelope,
+            fleet_protocol::DriftCheckTaskWire {
+                policy_document: policy_document.to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert!(TestOutboundReceiver(sender).try_recv().is_err());
+        let first_pending = journal
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        let final_result = first_pending
+            .iter()
+            .find(|entry| entry.report.class == ReportClass::FinalResult)
+            .expect("terminal DriftCheck result is durable");
+        assert_eq!(final_result.report.key.parts()[4], "final-result");
+        let parsed: V2FinalResultReportBody =
+            serde_json::from_slice(final_result.report.body()).unwrap();
+        assert_eq!(parsed.status, fleet_protocol::TaskResultStatus::Succeeded);
+        assert_eq!(parsed.output.stdout_chunks, 0);
+        assert_eq!(parsed.output.stderr_chunks, 0);
+        assert!(!parsed.output.truncated);
+        let first_wire =
+            agent_journal_report_wire_message(final_result, &config, "before").unwrap();
+        worker.shutdown().unwrap();
+
+        let reopened = JournalWorker::spawn(
+            SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap(),
+            capacity,
+            limits,
+        )
+        .unwrap();
+        let replayed = reopened
+            .client()
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(replayed, first_pending);
+        let replayed_final = replayed
+            .iter()
+            .find(|entry| entry.report.class == ReportClass::FinalResult)
+            .unwrap();
+        let replayed_wire =
+            agent_journal_report_wire_message(replayed_final, &config, "after").unwrap();
+        let fleet_protocol::WirePayload::TaskReport(first_wire_report) = first_wire.payload else {
+            panic!("expected v2 final-result report");
+        };
+        let fleet_protocol::WirePayload::TaskReport(replayed_wire_report) = replayed_wire.payload
+        else {
+            panic!("expected replayed v2 final-result report");
+        };
+        assert_eq!(first_wire_report, replayed_wire_report);
+        assert_eq!(
+            replayed_wire_report.class,
+            fleet_protocol::delivery_v2::V2ReportClassWire::FinalResult
+        );
+        let reopened_client = reopened.client();
+        let mut invalid_envelope = envelope.clone();
+        invalid_envelope.job_id = fleet_domain::JobId::new("job-drift-invalid").unwrap();
+        invalid_envelope.task_id = fleet_domain::TaskId::new("task-drift-invalid").unwrap();
+        let invalid_sender = test_outbound_queue(4);
+        let invalid_task_state = test_task_session_state();
+        let invalid_session = AgentTaskExecutionSession {
+            outbound_sender: &invalid_sender,
+            config: &config,
+            controller_public_key: "controller-public-key",
+            correlation_id: "corr-drift-invalid",
+            task_state: &invalid_task_state,
+            journal_client: &reopened_client,
+            controller_namespace: &namespace,
+        };
+        persist_agent_task_ack_report(&invalid_session, &invalid_envelope).unwrap();
+        run_signed_drift_check_task_queue(
+            &invalid_session,
+            &invalid_envelope,
+            fleet_protocol::DriftCheckTaskWire {
+                policy_document: "kind: invalid-policy".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(TestOutboundReceiver(invalid_sender).try_recv().is_err());
+        let after_invalid = reopened_client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        let failed_result = after_invalid
+            .iter()
+            .find(|entry| {
+                entry.report.key.parts()[1..4]
+                    == [
+                        config.agent_id.as_str(),
+                        "job-drift-invalid",
+                        "task-drift-invalid",
+                    ]
+                    && entry.report.class == ReportClass::FinalResult
+            })
+            .expect("invalid DriftCheck policy also has a durable final result");
+        let failed_body: V2FinalResultReportBody =
+            serde_json::from_slice(failed_result.report.body()).unwrap();
+        assert_eq!(failed_body.status, fleet_protocol::TaskResultStatus::Failed);
+        assert_eq!(failed_body.output.stdout_chunks, 0);
+        assert_eq!(failed_body.output.stderr_chunks, 0);
+        reopened.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual seven-sample durable journal/worker baseline"]
+    fn durable_output_delivery_baseline() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_application::delivery::JournalReport;
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage, ReportClass, ReportKey};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = unique_test_dir("durable-output-baseline");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: 4096,
+                bytes: 64 * 1024 * 1024,
+            },
+            JournalUsage {
+                reports: 4,
+                bytes: 4 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(16, 64 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        let body = "x".repeat(4096);
+        for sample in 0..7 {
+            let path = root.join(format!("sample-{sample}.sqlite3"));
+            let worker = JournalWorker::spawn(
+                SqliteAgentJournal::open(&path, "controller-baseline", "agent-1").unwrap(),
+                capacity,
+                limits,
+            )
+            .unwrap();
+            let client = worker.client();
+            let mut tickets = Vec::new();
+            let mut wire_bytes = 0;
+            let started = std::time::Instant::now();
+            for sequence in 0..256 {
+                let message_id = format!("msg-output-{sequence}");
+                let message = fleet_protocol::WireMessage::new(
+                    message_id.clone(),
+                    "corr-baseline",
+                    Some("agent-1".to_owned()),
+                    1,
+                    fleet_protocol::WirePayload::OutputChunk {
+                        job_id: "job-baseline".to_owned(),
+                        task_id: "task-baseline".to_owned(),
+                        stream: fleet_protocol::OutputStream::Stdout,
+                        sequence,
+                        data: body.clone(),
+                    },
+                );
+                let encoded = fleet_protocol::encode_message(&message)
+                    .unwrap()
+                    .into_bytes();
+                wire_bytes += encoded.len();
+                let report = JournalReport::new(
+                    ReportKey::new(
+                        "controller-baseline",
+                        "agent-1",
+                        "job-baseline",
+                        "task-baseline",
+                        &message_id,
+                    )
+                    .unwrap(),
+                    ReportClass::Output,
+                    encoded,
+                )
+                .unwrap();
+                tickets.push(client.append(&report).unwrap());
+                if tickets.len() == 16 {
+                    for ticket in tickets.drain(..) {
+                        ticket.wait(Duration::from_secs(5)).unwrap();
+                    }
+                }
+            }
+            let commit_us = started.elapsed().as_micros();
+            assert!(tickets.is_empty());
+            worker.shutdown().unwrap();
+            let reopened = std::time::Instant::now();
+            let worker = JournalWorker::spawn(
+                SqliteAgentJournal::open(&path, "controller-baseline", "agent-1").unwrap(),
+                capacity,
+                limits,
+            )
+            .unwrap();
+            let client = worker.client();
+            let pending = client
+                .pending(256, 8 * 1024 * 1024)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            let reopen_replay_us = reopened.elapsed().as_micros();
+            assert_eq!(pending.len(), 256);
+            assert_eq!(
+                pending
+                    .iter()
+                    .map(|report| report.report.body().len())
+                    .sum::<usize>(),
+                wire_bytes
+            );
+            let started = std::time::Instant::now();
+            let mut acknowledgements = Vec::new();
+            for report in &pending {
+                acknowledgements.push(
+                    client
+                        .acknowledge(&report.report.key, report.digest)
+                        .unwrap(),
+                );
+                if acknowledgements.len() == 16 {
+                    for ticket in acknowledgements.drain(..) {
+                        assert!(ticket.wait(Duration::from_secs(5)).unwrap());
+                    }
+                }
+            }
+            let ack_us = started.elapsed().as_micros();
+            assert!(
+                client
+                    .pending(1, 8 * 1024 * 1024)
+                    .unwrap()
+                    .wait(Duration::from_secs(5))
+                    .unwrap()
+                    .is_empty()
+            );
+            worker.shutdown().unwrap();
+            println!(
+                "durable_journal_baseline sample={sample} frames=256 payload_bytes=1048576 wire_bytes={wire_bytes} worker_requests=16 commit_us={commit_us} reopen_replay_us={reopen_replay_us} ack_us={ack_us}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual seven-sample legacy queue/serialization baseline"]
+    fn legacy_output_delivery_baseline() {
+        let body = "x".repeat(4096);
+        for sample in 0..7 {
+            let queue = test_outbound_queue(32);
+            let mut frames = 0;
+            let mut wire_bytes = 0;
+            let started = std::time::Instant::now();
+            for sequence in 0..256 {
+                enqueue_wire_message(
+                    &queue,
+                    fleet_protocol::WireMessage::new(
+                        format!("msg-output-{sequence}"),
+                        "corr-baseline",
+                        Some("agent-1".to_owned()),
+                        1,
+                        fleet_protocol::WirePayload::OutputChunk {
+                            job_id: "job-baseline".to_owned(),
+                            task_id: "task-baseline".to_owned(),
+                            stream: fleet_protocol::OutputStream::Stdout,
+                            sequence,
+                            data: body.clone(),
+                        },
+                    ),
+                )
+                .unwrap();
+                if sequence % 32 == 31 {
+                    flush_agent_outbound_queue_with(&queue, |message| {
+                        wire_bytes += fleet_protocol::encode_message(message).unwrap().len();
+                        frames += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+            }
+            let elapsed_us = started.elapsed().as_micros();
+            assert_eq!(frames, 256);
+            assert!(wire_bytes > 1024 * 1024);
+            assert!(queue.lock().unwrap().pending_report().is_none());
+            println!(
+                "legacy_queue_baseline sample={sample} frames={frames} payload_bytes=1048576 wire_bytes={wire_bytes} capacity=32 elapsed_us={elapsed_us}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_successful_outbound_write_removes_result_without_storage_receipt() {
+        let queue = test_outbound_queue(1);
+        let result = fleet_protocol::WireMessage::new(
+            "msg-result-before-receipt",
+            "corr-result",
+            Some("agent-1".to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskResult {
+                job_id: "job-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                exit_code: 0,
+                status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                reason: String::new(),
+                artifacts: Vec::new(),
+            },
+        );
+        enqueue_wire_message(&queue, result.clone()).unwrap();
+
+        // A local socket handoff is the only success signal on the legacy path.
+        let mut handed_off = Vec::new();
+        flush_agent_outbound_queue_with(&queue, |message| {
+            handed_off.push(message.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(handed_off, vec![result]);
+        assert!(queue.lock().unwrap().pending_report().is_none());
+        let mut replay_count = 0;
+        flush_agent_outbound_queue_with(&queue, |_| {
+            replay_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replay_count, 0);
+    }
+
     #[test]
     fn agent_session_read_interrupt_is_idle_not_a_session_failure() {
         let interrupted =
@@ -11487,16 +16212,24 @@ steps:
         assert!(capabilities.contains(&"service_control".to_owned()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_session_busy_task_rejects_new_assignment() {
+        let config = test_agent_config();
+        let (root, namespace, worker) = test_agent_journal("busy-rejection", &config);
+        let journal_client = worker.client();
         let sender = test_outbound_queue(4);
         let receiver = TestOutboundReceiver(sender.clone());
-        let config = test_agent_config();
         let task_state = AgentTaskSessionState {
             busy: Arc::new(AtomicBool::new(true)),
             runtime: Arc::new(AgentTaskRuntimeState::default()),
             replay_guard: Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default())),
             controller_trust_bundle: Arc::new(Mutex::new(None)),
+            journal_client: Arc::new(Mutex::new(Some(journal_client.clone()))),
+            delivery_identity: Arc::new(Mutex::new(Some(ControllerDeliveryIdentity {
+                namespace: namespace.clone(),
+                store_epoch: "e".repeat(64),
+            }))),
         };
 
         handle_agent_session_message(
@@ -11509,24 +16242,173 @@ steps:
         )
         .unwrap();
 
-        let event = receiver.try_recv().expect("busy reject event");
-        let fleet_protocol::WirePayload::TaskRejected {
-            job_id,
-            task_id,
-            reason_code,
-            reason,
-        } = event.payload
-        else {
-            panic!("expected task rejected event");
-        };
-        assert_eq!(job_id, "job-test");
-        assert_eq!(task_id, "task-test");
-        assert_eq!(
-            reason_code,
-            fleet_protocol::TaskRejectionReasonCode::AgentBusy
+        assert!(
+            receiver.try_recv().is_err(),
+            "rejection must not use control queue"
         );
-        assert_eq!(reason, "agent is busy");
+        let pending = journal_client
+            .pending(16, 8 * 1024 * 1024)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].report.key.parts(),
+            [
+                namespace.as_str(),
+                "agent-web-01",
+                "job-test",
+                "task-test",
+                "task-rejected"
+            ]
+        );
+        assert_eq!(
+            pending[0].report.body(),
+            br#"{"event":"task_rejected","reason_code":"agent_busy","reason":"agent is busy"}"#
+        );
         assert!(task_state.busy.load(Ordering::SeqCst));
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_task_rejection_replays_after_reopen_and_cleans_only_after_signed_receipt() {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_application::delivery::PendingReport;
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage};
+        use fleet_protocol::receipt::{
+            ReportDispositionWire, ReportReceiptStatementWire, SignedReportReceiptWire,
+        };
+        use fleet_store::agent_journal::SqliteAgentJournal;
+
+        let config = test_agent_config();
+        let (root, namespace, worker) = test_agent_journal("rejected-replay", &config);
+        let client = worker.client();
+        let envelope = test_task_envelope(&config.agent_id);
+        persist_agent_task_rejected_report_with_journal(
+            &client,
+            &namespace,
+            &config,
+            envelope.job_id.as_str(),
+            envelope.task_id.as_str(),
+            fleet_protocol::TaskRejectionReasonCode::LocalPolicy,
+            "local policy blocked token=topsecret",
+        )
+        .unwrap();
+        worker.shutdown().unwrap();
+        drop(client);
+
+        let limits = JournalWorkerLimits::new(16, 64 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: 4096,
+                bytes: 64 * 1024 * 1024,
+            },
+            JournalUsage {
+                reports: 4,
+                bytes: 4 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let repository =
+            SqliteAgentJournal::open(&root.join("journal.sqlite3"), &namespace, &config.agent_id)
+                .unwrap();
+        let reopened_worker = JournalWorker::spawn(repository, capacity, limits).unwrap();
+        let client = reopened_worker.client();
+        let pending = client
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].report.key.parts()[4], "task-rejected");
+        assert_eq!(
+            pending[0].report.body(),
+            br#"{"event":"task_rejected","reason_code":"local_policy","reason":"local policy blocked token=[REDACTED]"}"#
+        );
+
+        let pending: PendingReport = pending[0].clone();
+        let key = pending.report.key.clone();
+        let mut delivery = AgentJournalReportDelivery::new(
+            client.clone(),
+            ControllerDeliveryIdentity {
+                namespace: namespace.clone(),
+                store_epoch: "e".repeat(64),
+            },
+        );
+        delivery.pending.insert(
+            key.clone(),
+            AgentPendingJournalReport {
+                report: pending.clone(),
+                attempts: 0,
+                retry_at: Instant::now(),
+            },
+        );
+        let keys = fleet_core::generate_agent_key_pair().unwrap();
+        let mut config = config;
+        config.controller_fingerprint = keys.fingerprint.clone();
+        let [_, agent_id, job_id, task_id, report_id] = pending.report.key.parts();
+        let digest_hex = pending
+            .digest
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let statement = ReportReceiptStatementWire {
+            controller_namespace: namespace,
+            store_epoch: "e".repeat(64),
+            agent_id: agent_id.to_owned(),
+            job_id: job_id.to_owned(),
+            task_id: task_id.to_owned(),
+            report_id: report_id.to_owned(),
+            digest_hex,
+            signed_at_ms: epoch_millis() as u64,
+            disposition: ReportDispositionWire::Stored,
+            signing_key_fingerprint: keys.fingerprint.clone(),
+        };
+        let signature_hex = fleet_core::sign_challenge(
+            &keys.private_key_hex,
+            &statement.signing_preimage().unwrap(),
+        )
+        .unwrap();
+        let receipt = SignedReportReceiptWire {
+            statement,
+            signature_hex,
+        };
+        let message = fleet_protocol::WireMessage::new(
+            "msg-task-rejected-receipt",
+            "corr-task-rejected-reconnect",
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::ReportReceipt(receipt.clone()),
+        );
+        delivery
+            .handle_receipt(
+                &message,
+                &receipt,
+                &config,
+                &keys.public_key_hex,
+                "corr-task-rejected-reconnect",
+                &test_task_session_state(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivery.pending.contains_key(&key) && Instant::now() < deadline {
+            delivery.poll_acknowledgements().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!delivery.pending.contains_key(&key));
+        assert!(
+            client
+                .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap()
+                .is_empty()
+        );
+        reopened_worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11579,16 +16461,24 @@ steps:
         assert_eq!(reason, output.stderr);
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_session_due_telemetry_does_not_precede_inbound_task_handling() {
+        let config = test_agent_config();
+        let (root, namespace, worker) = test_agent_journal("rejection-telemetry", &config);
+        let journal_client = worker.client();
         let sender = test_outbound_queue(8);
         let receiver = TestOutboundReceiver(sender.clone());
-        let config = test_agent_config();
         let task_state = AgentTaskSessionState {
             busy: Arc::new(AtomicBool::new(true)),
             runtime: Arc::new(AgentTaskRuntimeState::default()),
             replay_guard: Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default())),
             controller_trust_bundle: Arc::new(Mutex::new(None)),
+            journal_client: Arc::new(Mutex::new(Some(journal_client.clone()))),
+            delivery_identity: Arc::new(Mutex::new(Some(ControllerDeliveryIdentity {
+                namespace: namespace.clone(),
+                store_epoch: "e".repeat(64),
+            }))),
         };
 
         handle_agent_session_message(
@@ -11615,13 +16505,6 @@ steps:
 
         assert!(matches!(
             receiver.try_recv().unwrap().payload,
-            fleet_protocol::WirePayload::TaskRejected {
-                reason_code: fleet_protocol::TaskRejectionReasonCode::AgentBusy,
-                ..
-            }
-        ));
-        assert!(matches!(
-            receiver.try_recv().unwrap().payload,
             fleet_protocol::WirePayload::Heartbeat { .. }
         ));
         assert!(matches!(
@@ -11635,8 +16518,17 @@ steps:
         assert!(matches!(
             receiver.try_recv().unwrap().payload,
             fleet_protocol::WirePayload::LogChunk { ref line, .. }
-                if line.contains("agent_heartbeat_completed")
+            if line.contains("agent_heartbeat_completed")
         ));
+        let pending = journal_client
+            .pending(16, 8 * 1024 * 1024)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].report.key.parts()[4], "task-rejected");
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11658,14 +16550,12 @@ steps:
             },
         )
         .unwrap();
-        send_agent_task_result_queue(
+        send_agent_task_result_queue_report(
             &sender,
             &config,
             "corr-test",
             &envelope,
-            0,
-            fleet_protocol::TaskResultStatus::Succeeded,
-            "",
+            AgentTaskResultReport::new(0, fleet_protocol::TaskResultStatus::Succeeded, ""),
         )
         .unwrap();
         send_agent_security_event_queue(&sender, &config, "corr-test", "task_checked", "ok")
@@ -11686,17 +16576,55 @@ steps:
     }
 
     #[test]
-    fn missing_program_task_reports_stderr_then_failed_result_through_outbound_queue() {
+    #[cfg(unix)]
+    fn missing_program_task_commits_stderr_and_final_result_before_delivery() {
+        use fleet_agent::journal_worker::JournalWorker;
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
         let sender = test_outbound_queue(4);
         let receiver = TestOutboundReceiver(sender.clone());
         let config = test_agent_config();
         let envelope = test_task_envelope(&config.agent_id);
-        let runtime = AgentTaskRuntimeState::default();
+        let task_state = test_task_session_state();
+        let namespace = "b".repeat(64);
+        let root = unique_test_dir("missing-command-journal");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let repository =
+            SqliteAgentJournal::open(&root.join("journal.sqlite3"), &namespace, &config.agent_id)
+                .unwrap();
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: AGENT_JOURNAL_MAX_REPORTS,
+                bytes: AGENT_JOURNAL_MAX_BYTES,
+            },
+            JournalUsage {
+                reports: AGENT_JOURNAL_FINAL_RESERVE_REPORTS,
+                bytes: AGENT_JOURNAL_FINAL_RESERVE_BYTES,
+            },
+        )
+        .unwrap();
+        let limits = fleet_agent::journal_worker::JournalWorkerLimits::new(
+            AGENT_JOURNAL_WORKER_REQUESTS,
+            AGENT_JOURNAL_MAX_BYTES,
+            AGENT_JOURNAL_WORKER_REQUEST_BYTES,
+        )
+        .unwrap();
+        let worker = JournalWorker::spawn(repository, capacity, limits).unwrap();
+        let journal = worker.client();
+        let session = AgentTaskExecutionSession {
+            outbound_sender: &sender,
+            config: &config,
+            controller_public_key: "controller-public-key",
+            correlation_id: "corr-test",
+            task_state: &task_state,
+            journal_client: &journal,
+            controller_namespace: &namespace,
+        };
 
         run_signed_command_task_queue(
-            &sender,
-            &config,
-            "corr-test",
+            &session,
             &envelope,
             fleet_protocol::CommandTaskWire {
                 program: "fleet-program-that-does-not-exist".to_owned(),
@@ -11704,33 +16632,54 @@ steps:
                 timeout_ms: 1_000,
                 max_output_bytes: 1_024,
             },
-            &runtime,
         )
         .expect("failed program should report a task result");
 
-        assert!(matches!(
-            receiver.try_recv().unwrap().payload,
-            fleet_protocol::WirePayload::TaskStarted { .. }
-        ));
-        let output = receiver.try_recv().expect("stderr output event");
-        assert!(matches!(
-            output.payload,
-            fleet_protocol::WirePayload::OutputChunk {
-                stream: fleet_protocol::OutputStream::Stderr,
-                sequence: 0,
-                ref data,
-                ..
-            } if data.contains("runner io error")
-        ));
-        assert!(matches!(
-            receiver.try_recv().unwrap().payload,
-            fleet_protocol::WirePayload::TaskResult {
-                exit_code: -1,
-                status: Some(fleet_protocol::TaskResultStatus::Failed),
-                ref reason,
-                ..
-            } if reason.contains("runner io error")
-        ));
+        assert!(receiver.try_recv().is_err());
+        let pending = journal
+            .pending(AGENT_REPORT_BATCH_SIZE, AGENT_REPORT_BATCH_BYTES)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(pending.len(), 4);
+        assert!(
+            pending
+                .iter()
+                .any(|entry| entry.report.key.parts()[4] == "task-ack")
+        );
+        assert!(pending.iter().any(|entry| {
+            entry.report.key.parts()[4] == "task-started"
+                && entry.report.body() == br#"{"event":"task_started"}"#
+        }));
+        let output = pending
+            .iter()
+            .find(|entry| entry.report.class == fleet_domain::delivery::ReportClass::Output)
+            .expect("stderr output is committed before final result");
+        let output_body: serde_json::Value = serde_json::from_slice(output.report.body()).unwrap();
+        assert_eq!(output_body["stream"], "stderr");
+        assert_eq!(output_body["sequence"], 0);
+        assert!(
+            output_body["data"]
+                .as_str()
+                .unwrap()
+                .contains("runner io error")
+        );
+        let final_result = pending
+            .iter()
+            .find(|entry| entry.report.class == fleet_domain::delivery::ReportClass::FinalResult)
+            .expect("failed result is committed to the journal");
+        let final_body: serde_json::Value =
+            serde_json::from_slice(final_result.report.body()).unwrap();
+        assert_eq!(final_body["exit_code"], -1);
+        assert_eq!(final_body["status"], "failed");
+        assert!(
+            final_body["reason"]
+                .as_str()
+                .unwrap()
+                .contains("runner io error")
+        );
+        worker.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12370,6 +17319,10 @@ steps:
         assert_eq!(config.private_key, "private-key-1");
         assert_eq!(config.controller_fingerprint, "controller-fp-1");
         assert_eq!(config.replay_store_path, dir.join("task_nonces.log"));
+        assert_eq!(
+            config.delivery_journal_path,
+            dir.join("journal").join("reports.sqlite3")
+        );
     }
 
     #[test]
@@ -12419,6 +17372,9 @@ steps:
             private_key: "private-key-1".to_owned(),
             controller_fingerprint: "controller-fp-1".to_owned(),
             replay_store_path: unique_test_dir("agent-replay-store").join("task_nonces.log"),
+            delivery_journal_path: unique_test_dir("agent-journal")
+                .join("journal")
+                .join("reports.sqlite3"),
             controller_trust_bundle_path: unique_test_dir("agent-trust-bundle")
                 .join("controller_trust_bundle.json"),
             controller_trust_bundle: None,
@@ -12476,6 +17432,9 @@ steps:
             private_key: "private-key-1".to_owned(),
             controller_fingerprint: "controller-fp-1".to_owned(),
             replay_store_path: unique_test_dir("agent-replay-store").join("task_nonces.log"),
+            delivery_journal_path: unique_test_dir("agent-journal")
+                .join("journal")
+                .join("reports.sqlite3"),
             controller_trust_bundle_path: unique_test_dir("agent-trust-bundle")
                 .join("controller_trust_bundle.json"),
             controller_trust_bundle: None,
@@ -12543,9 +17502,42 @@ steps:
         ))
     }
 
+    #[cfg(unix)]
+    fn test_agent_journal(
+        name: &str,
+        config: &LocalAgentConfig,
+    ) -> (PathBuf, String, fleet_agent::journal_worker::JournalWorker) {
+        use fleet_agent::journal_worker::{JournalWorker, JournalWorkerLimits};
+        use fleet_domain::delivery::{JournalCapacity, JournalUsage};
+        use fleet_store::agent_journal::SqliteAgentJournal;
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = unique_test_dir(name);
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let namespace = "a".repeat(64);
+        let path = root.join("journal.sqlite3");
+        let capacity = JournalCapacity::new(
+            JournalUsage {
+                reports: 4096,
+                bytes: 64 * 1024 * 1024,
+            },
+            JournalUsage {
+                reports: 4,
+                bytes: 4 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let limits = JournalWorkerLimits::new(16, 64 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        let repository = SqliteAgentJournal::open(&path, &namespace, &config.agent_id).unwrap();
+        let worker = JournalWorker::spawn(repository, capacity, limits).unwrap();
+        (root, namespace, worker)
+    }
+
     fn initialized_controller_backup_fixture(name: &str) -> PathBuf {
         let data_dir = unique_test_dir(name);
         fs::create_dir_all(controller_dir(&data_dir)).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir_all(agent_dir(&data_dir)).unwrap();
         let store = fleet_store::SqliteStore::open(controller_db_path(&data_dir)).unwrap();
         store.insert_admin_token_hash("backup-admin-hash").unwrap();
@@ -12562,6 +17554,9 @@ steps:
             private_key: "private-key-1".to_owned(),
             controller_fingerprint: "controller-fp-1".to_owned(),
             replay_store_path: unique_test_dir("agent-replay-store").join("task_nonces.log"),
+            delivery_journal_path: unique_test_dir("agent-journal")
+                .join("journal")
+                .join("reports.sqlite3"),
             controller_trust_bundle_path: unique_test_dir("agent-trust-bundle")
                 .join("controller_trust_bundle.json"),
             controller_trust_bundle: None,
@@ -12640,6 +17635,8 @@ steps:
             runtime: Arc::new(AgentTaskRuntimeState::default()),
             replay_guard: Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default())),
             controller_trust_bundle: Arc::new(Mutex::new(None)),
+            journal_client: Arc::new(Mutex::new(None)),
+            delivery_identity: Arc::new(Mutex::new(None)),
         }
     }
 

@@ -36,6 +36,10 @@ coverage/
 !.yarn/sdks/
 !.yarn/versions/
 
+# Python validation caches
+__pycache__/
+*.pyc
+
 # Environment files
 .env
 .env.*
@@ -77,4 +81,5 @@ PROJECT.md
 RESEARCH.md
 token.md
 
+.env
 .tasks

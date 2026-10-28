@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "build": "node ./scripts/build.js",
-    "test": "node ./scripts/test.js",
+    "test": "node ./scripts/test.js && node --test ./scripts/api-client.test.js ./scripts/job-observer.test.js ./scripts/job-output-reader.test.js ./scripts/job-observation-panel.test.js ./scripts/catalog-explorer.test.js ./scripts/catalog-panel.test.js ./scripts/catalog-actions.test.js ./scripts/catalog-action-panel.test.js ./scripts/catalog-job.test.js ./scripts/catalog-job-panel.test.js ./scripts/admin-accounts.test.js ./scripts/admin-accounts-ui.test.js",
     "typecheck": "node ./scripts/typecheck.js"
+  },
+  "devDependencies": {
+    "jsdom": "30.1.3"
   }
 }

@@ -1,6 +1,20 @@
 {
   "schema_version": "mvp-1",
   "endpoints": [
+    { "name": "getAdminPersonalTokens", "method": "GET", "path": "/api/auth/tokens", "authentication": "cookie" },
+    { "name": "revokeAdminPersonalToken", "method": "DELETE", "path": "/api/auth/tokens/{token_id}", "authentication": "cookie" },
+    { "name": "changeOwnAdminPassword", "method": "POST", "path": "/api/auth/password", "authentication": "cookie" },
+    { "name": "createAdminPersonalToken", "method": "POST", "path": "/api/auth/tokens", "authentication": "cookie" },
+    { "name": "createAdminUser", "method": "POST", "path": "/api/admin/users", "authentication": "cookie" },
+    { "name": "changeAdminUser", "method": "PATCH", "path": "/api/admin/users/{user_id}", "authentication": "cookie" },
+    { "name": "resetAdminUserPassword", "method": "POST", "path": "/api/admin/users/{user_id}/password-reset", "authentication": "cookie" },
+    { "name": "getAdminUsers", "method": "GET", "path": "/api/admin/users", "authentication": "cookie" },
+    { "name": "getAdminUser", "method": "GET", "path": "/api/admin/users/{user_id}", "authentication": "cookie" },
+    { "name": "getAuthStatus", "method": "GET", "path": "/api/auth/status", "authentication": "public" },
+    { "name": "loginAdmin", "method": "POST", "path": "/api/auth/login", "authentication": "public" },
+    { "name": "getAdminSession", "method": "GET", "path": "/api/auth/session", "authentication": "cookie" },
+    { "name": "logoutAdmin", "method": "POST", "path": "/api/auth/logout", "authentication": "cookie" },
+    { "name": "completeAdminSetup", "method": "POST", "path": "/api/auth/setup", "authentication": "public" },
     { "name": "listAgents", "method": "GET", "path": "/api/agents" },
     { "name": "getLatestFacts", "method": "GET", "path": "/api/agents/{agent_id}/facts/latest" },
     { "name": "listFacts", "method": "GET", "path": "/api/agents/{agent_id}/facts" },
@@ -13,6 +27,7 @@
     { "name": "listCatalogSources", "method": "GET", "path": "/api/catalog/sources" },
     { "name": "registerCatalogSource", "method": "POST", "path": "/api/catalog/sources" },
     { "name": "startCatalogSync", "method": "POST", "path": "/api/catalog/sources/{source_id}/sync" },
+    { "name": "getCatalogSyncOperation", "method": "GET", "path": "/api/catalog/sources/{source_id}/sync-operations/{operation_id}" },
     { "name": "activateCatalogRevision", "method": "POST", "path": "/api/catalog/sources/{source_id}/activate" },
     { "name": "listCatalogRevisions", "method": "GET", "path": "/api/catalog/sources/{source_id}/revisions" },
     { "name": "listCatalogDocuments", "method": "GET", "path": "/api/catalog/sources/{source_id}/revisions/{commit}/documents" },
@@ -42,6 +57,7 @@
     { "name": "previewSelector", "method": "POST", "path": "/api/selectors/preview" },
     { "name": "getJob", "method": "GET", "path": "/api/jobs/{job_id}" },
     { "name": "getJobOutput", "method": "GET", "path": "/api/jobs/{job_id}/output" },
+    { "name": "getJobOutputPage", "method": "GET", "path": "/api/jobs/{job_id}/output-page" },
     { "name": "getJobArtifact", "method": "GET", "path": "/api/jobs/{job_id}/artifacts/{artifact_id}" },
     { "name": "cancelJob", "method": "POST", "path": "/api/jobs/{job_id}/cancel" },
     { "name": "listAudit", "method": "GET", "path": "/api/audit" },
@@ -51,6 +67,7 @@
     { "name": "revokeEnrollmentToken", "method": "DELETE", "path": "/api/enrollment-tokens/{token_id}" },
     { "name": "createCommandJob", "method": "POST", "path": "/api/jobs/command" },
     { "name": "createDriftCheckJob", "method": "POST", "path": "/api/jobs/drift-check" },
+    { "name": "createCatalogRunbookJob", "method": "POST", "path": "/api/jobs/catalog-runbook" },
     { "name": "createRunbookJob", "method": "POST", "path": "/api/jobs/runbook" }
   ]
 }

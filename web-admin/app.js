@@ -1,4 +1,11 @@
+/** @file Static Admin views and explicit API effects; observation never writes Job state. */
 import { createApiClient, normalizeAdminToken } from "./api-client.js";
+import { createAdminAccounts } from "./admin-accounts.js";
+import { createJobObserver, classifyJobReadFailure, parseObservedJob } from "./job-observer.js";
+import { createJobOutputReader } from "./job-output-reader.js";
+import { createCatalogExplorer } from "./catalog-explorer.js";
+import { createCatalogActions } from "./catalog-actions.js";
+import { createCatalogJobSubmission } from "./catalog-job.js";
 
 const state = {
   token: "",
@@ -8,17 +15,10 @@ const state = {
   selectedAgentId: "",
   selectedPolicyId: "",
   selectedRemediationId: "",
-  lastJobId: "",
   createdEnrollmentToken: null,
   metricsWindowMs: 5 * 60 * 1000,
   auditCursor: "",
   auditItems: [],
-  catalogSources: [],
-  catalogRevisions: [],
-  catalogDocuments: [],
-  selectedCatalogSourceId: "",
-  selectedCatalogCommit: "",
-  catalogActionInFlight: false,
 };
 
 const ADMIN_ROUTES = new Set([
@@ -42,22 +42,80 @@ const ADMIN_ROUTE_PRESENTATION = {
   policies: ["Policies & Drift", "Manage policy sources, assignments, and observed drift."],
   remediations: ["Remediations", "Approve policy-driven fixes through their persisted lifecycle."],
   audit: ["Audit", "Review durable product and security events."],
-  settings: ["Settings", "Enrollment and Controller signing trust administration."],
+  settings: ["Settings", "Your account, people, enrollment and Controller signing trust."],
 };
 
 const DEFAULT_TELEMETRY_WINDOW_MS = 5 * 60 * 1000;
 const TELEMETRY_PAGE_LIMIT = 120;
 const DETAIL_PAGE_LIMIT = 25;
 const JOB_OUTPUT_POLL_ATTEMPTS = 45;
-const JOB_OUTPUT_POLL_INTERVAL_MS = 1000;
 const COMMAND_JOB_EXPIRES_IN_SECONDS = 300;
-const TERMINAL_DISPATCH_STATES = new Set(["completed", "failed", "expired", "rejected", "canceled"]);
-const TERMINAL_JOB_STATUSES = new Set(["success", "failed", "expired", "canceled"]);
+const TERMINAL_DISPATCH_STATES = new Set(["completed", "partial_success", "failed", "expired", "rejected", "canceled"]);
+const TERMINAL_JOB_STATUSES = new Set(["success", "partial_success", "failed", "expired", "canceled"]);
 
 const api = createApiClient({
   tokenProvider: () => state.token,
   formatError: formatApiError,
+  onUnauthorized: () => { adminAccounts.expire(); },
 });
+
+const adminAccounts = createAdminAccounts({ api, onChange: onAccountState, onOnce: showOnceSecret, onInvalidate: clearOnceSecret });
+
+const directSubmissions = Object.fromEntries(["command", "runbook"].map(kind => [kind, createDirectJobSubmission({
+  createJob: (body, options) => kind === "command" ? api.createCommandJob(body, options) : api.createRunbookJob(body, options),
+  getJob: (id, options) => api.getJob(id, options),
+  onChange: view => renderDirectSubmission(kind, view),
+})]));
+
+const jobObservation = typeof document !== "undefined" && document.querySelector("#job-output")
+  ? createJobObservationPanel({
+      apiClient: api,
+      outputReaderFactory: () => createJobOutputReader({ api }),
+      elements: {
+        status: document.querySelector("#job-observation-status"),
+        lastUpdated: document.querySelector("#job-last-updated"),
+        pause: document.querySelector("#pause-job-observation"),
+        resume: document.querySelector("#resume-job-observation"),
+        output: document.querySelector("#job-output"),
+        targets: document.querySelector("#job-targets"),
+        artifacts: document.querySelector("#job-artifacts"),
+        provenance: document.querySelector("#job-catalog-provenance"),
+        history: document.querySelector("#browse-job-output"),
+        nextPage: document.querySelector("#next-job-output-page"),
+        outputInfo: document.querySelector("#job-output-info"),
+      },
+    })
+  : null;
+
+const catalogPanel = typeof document !== "undefined" && document.querySelector("#catalog-list")
+  ? createCatalogPanel({ apiClient: api, onJobCreated: async (job, { signal }) => {
+      jobObservation?.select(job.job_id);
+      const token = state.token;
+      const [jobs, approvals] = await Promise.all([api.listJobs({ signal }), api.listApprovals("pending", { signal })]);
+      signal.throwIfAborted();
+      if (state.token !== token || currentAdminRoute() !== "runbooks") return;
+      document.querySelector("#jobs-list").innerHTML = renderJobs(jobs);
+      document.querySelector("#approvals-list").innerHTML = renderApprovals(approvals, jobs);
+      wireApprovalButtons();
+    }, elements: {
+      selection: document.querySelector("#catalog-selection"),
+      execution: Object.fromEntries(["panel", "reference", "selector", "preview", "body", "confirm", "review", "submit", "check", "retry", "reset", "status"]
+        .map(key => [key, document.querySelector(`#catalog-job-${key}`)])),
+      actions: {
+        form: document.querySelector("#catalog-action-form"),
+        status: document.querySelector("#catalog-action-status"), operation: document.querySelector("#catalog-operation-status"),
+        check: document.querySelector("#check-catalog-sync"), stop: document.querySelector("#stop-catalog-sync"), resume: document.querySelector("#resume-catalog-sync"),
+        dialog: document.querySelector("#catalog-activation-dialog"), details: document.querySelector("#catalog-activation-details"),
+        confirm: document.querySelector("#confirm-catalog-activation"), cancel: document.querySelector("#cancel-catalog-activation"),
+        fields: Object.fromEntries([["sourceId", "source-id"], ["operationId", "operation-id"], ["url", "url"], ["reference", "reference"], ["commit", "commit"]]
+          .map(([key, id]) => [key, document.querySelector(`#catalog-${id}`)])),
+      },
+      ...Object.fromEntries(["sources", "revisions", "documents"].map(level => [level, {
+        list: document.querySelector(level === "sources" ? "#catalog-list" : `#catalog-${level}`),
+        ...Object.fromEntries(["status", "first", "next", "retry"].map(action => [action, document.querySelector(`#catalog-${level}-${action}`)])),
+      }])),
+    } })
+  : null;
 
 function currentAdminRoute() {
   const route = globalThis.location?.hash?.slice(1).toLowerCase() || "overview";
@@ -91,7 +149,365 @@ export function applyAdminRoute({ focus = false } = {}) {
   if (focus) {
     document.querySelector(`[data-route-focus="${route}"]`)?.focus({ preventScroll: true });
   }
+  for (const submission of Object.values(directSubmissions)) submission.setContext(adminViewContext(route));
+  jobObservation?.setContext(adminViewContext(route));
+  void catalogPanel?.setContext(adminViewContext(route));
   return route;
+}
+
+/**
+ * Composes the tested read owner with the shared result panel. Route/auth changes
+ * release requests; returning reads the server afresh. View tokens also isolate
+ * artifact reads from a later selection, including re-selection of the same ID.
+ * Artifact inspection pauses Job observation and has its own bounded read, which
+ * is canceled on selection/context change or explicit resume. Missing artifact
+ * bodies are reported as unavailable, not as completed Job output.
+ * A focused control becoming disabled hands focus to its enabled counterpart;
+ * updates never move focus from another reading or input position.
+ * @param {{ apiClient: import('./job-observer.js').JobReadApi & { getJobArtifact?: (jobId: string, artifactId: string, options: {signal: AbortSignal}) => Promise<unknown> }, elements: { status: HTMLElement, lastUpdated: HTMLElement, pause: HTMLButtonElement, resume: HTMLButtonElement, output: HTMLElement, targets: HTMLElement, artifacts: HTMLElement, history?:HTMLButtonElement, nextPage?:HTMLButtonElement, outputInfo?:HTMLElement, provenance?:HTMLElement }, clock?: import('./job-observer.js').ObserverClock, outputReaderFactory?:()=>ReturnType<typeof createJobOutputReader> }} options
+ */
+export function createJobObservationPanel({ apiClient, elements, outputReaderFactory, clock = {
+  now: () => Date.now(),
+  setTimeout: (callback, delay) => globalThis.setTimeout(callback, delay),
+  clearTimeout: (id) => globalThis.clearTimeout(id),
+} }) {
+  /** @type {ReturnType<typeof createJobObserver> | null} */
+  let owner = null;
+  /** @type {Readonly<{ jobId: string }> | null} */
+  let selection = null;
+  let route = "";
+  let authenticated = false;
+  let authGeneration = 0;
+  let disposed = false;
+  let renderedJobId = "";
+  /** @type {{ controller: AbortController, deadline: number } | null} */
+  let artifactRead = null;
+  /** @typedef {{selection:Readonly<{jobId:string}>, reader:ReturnType<typeof createJobOutputReader>, page:number, canNext:boolean, snapshot:Readonly<import('./job-observer.js').ObservationSnapshot>|null, failures:number, timer:number|null}} HistoryView */
+  /** @type {HistoryView|null} */
+  let history = null;
+  /** @type {{controller:AbortController,deadline:number,view:HistoryView}|null} */
+  let historyRead = null;
+  const active = () => !disposed && authenticated && (route === "run" || route === "runbooks");
+
+  function release() {
+    cancelArtifactRead();
+    cancelHistory();
+    const previous = owner;
+    owner = null;
+    previous?.dispose();
+  }
+
+  function cancelHistory() {
+    const view = history;
+    history = null;
+    if (view?.timer !== null && view?.timer !== undefined) clock.clearTimeout(view.timer);
+    view?.reader.dispose();
+    if (view) { view.timer = null; view.snapshot = null; }
+    const previous = historyRead;
+    historyRead = null;
+    if (previous) { clock.clearTimeout(previous.deadline); previous.controller.abort(); }
+  }
+
+  function cancelArtifactRead() {
+    const previous = artifactRead;
+    artifactRead = null;
+    if (previous) {
+      clock.clearTimeout(previous.deadline);
+      previous.controller.abort();
+    }
+  }
+
+  /** @param {HTMLElement} element @param {string} text */
+  function writeText(element, text) {
+    if (element.textContent !== text) element.textContent = text;
+  }
+
+  /** @param {HTMLElement} element @param {string} html */
+  function writeHtml(element, html) {
+    if (element.innerHTML !== html) element.innerHTML = html;
+  }
+
+  function renderIdle() {
+    renderedJobId = "";
+    writeText(elements.status, "Select a job to observe.");
+    writeText(elements.lastUpdated, "Last successful update: Not yet.");
+    writeText(elements.output, "Run a command or select a job to view output.");
+    writeHtml(elements.targets, renderJobTargetTable(null));
+    writeHtml(elements.artifacts, renderJobArtifacts(null));
+    if (elements.provenance) writeText(elements.provenance, "Select a Job to inspect its document provenance.");
+    elements.pause.disabled = true;
+    elements.resume.disabled = true;
+    if (elements.history) { elements.history.disabled = true; elements.history.hidden = !outputReaderFactory; }
+    if (elements.nextPage) { elements.nextPage.disabled = true; elements.nextPage.hidden = !outputReaderFactory; }
+    if (elements.outputInfo) { elements.outputInfo.hidden = !outputReaderFactory; writeText(elements.outputInfo, "Select a job to read stored output."); }
+  }
+
+  /** @param {Readonly<import('./job-observer.js').ObservationError>} error */
+  function failureGuidance(error) {
+    return error.kind === "authentication" ? "Please authenticate again with an admin token."
+      : error.kind === "forbidden" ? "Permission denied. Check your access before retrying."
+      : error.kind === "not_found" ? "Job not found. Refresh history or select another job."
+      : error.kind === "output_stale" ? "Stored output changed after retention or restore. Reopen stored history to read again."
+      : error.kind === "output_limit" ? "An output entry exceeds this read's metadata limit. The entry was not skipped."
+      : error.kind === "output_query" ? "The stored output read position is invalid. Reopen the job to read again."
+      : error.kind === "output_conflict" || error.kind === "output_gap" ? "Stored output could not be reconciled with the previous read. Reopen stored history before continuing."
+      : "The latest job read failed. The last server result is unchanged.";
+  }
+
+  /** @param {Readonly<import('./job-observer.js').ObservationSnapshot>} snapshot */
+  function render(snapshot) {
+    const { phase, job, jobId, chunks, output, lastUpdatedAt, error, retryAt } = snapshot;
+    const historyMode = Boolean(history && history.snapshot === snapshot);
+    const focusedControl = elements.pause.ownerDocument?.activeElement;
+    let description = phase === "loading" ? "Loading job from the Controller."
+      : phase === "paused" ? "Observation paused. Pausing observation does not cancel the job."
+      : phase === "completed" ? `Observation complete. Server result: ${job?.status || "unknown"}.`
+      : "Following job. Pausing observation does not cancel the job.";
+    if (historyMode) description = phase === "history_loading" ? "Loading stored history. Live observation is paused."
+      : `Browsing stored history, page ${history?.page || 1}. Live observation is paused.`;
+    else if (output && phase === "following" && (!output.caughtUp || isTerminalJob(job))) {
+      description = `Reading the latest stored output. Server result: ${job?.status || "unknown"}.`;
+    }
+    if (error) {
+      const guidance = failureGuidance(error);
+      description = `${guidance} ${retryAt === null ? historyMode ? "Read stopped. Reopen stored history or retry the page." : "Automatic observation stopped. Retry observation to read again." : "Retrying automatically with bounded backoff."}`;
+    }
+    writeText(elements.status, `${jobId}: ${description}`);
+    writeText(elements.lastUpdated, `Last successful update: ${lastUpdatedAt === null ? "Not yet." : new Date(lastUpdatedAt).toISOString()}`);
+    elements.pause.disabled = historyMode || !(phase === "loading" || phase === "following" || retryAt !== null);
+    elements.resume.disabled = !historyMode && (phase === "loading" || phase === "following");
+    elements.resume.textContent = historyMode ? "Resume live observation" : phase === "completed" ? "Refresh result" : phase === "error" ? "Retry observation" : "Resume observation";
+    if (elements.history) {
+      elements.history.disabled = !outputReaderFactory || !active() || !selection;
+      elements.history.textContent = historyMode && error ? "Reopen stored history" : "Browse stored history";
+    }
+    if (elements.nextPage) {
+      elements.nextPage.disabled = !historyMode || retryAt !== null || !history?.canNext || Boolean(error && !error.retryable);
+      // Keep a busy next-page control focusable; its owned in-flight guard prevents duplicate reads.
+      elements.nextPage.textContent = historyMode && phase === "history_loading" ? "Loading page..."
+        : historyMode && error?.retryable && retryAt === null ? "Retry page" : "Next page";
+    }
+    if (elements.outputInfo && outputReaderFactory) writeText(elements.outputInfo,
+      historyMode ? `Stored history · page ${history?.page || 1}. ${output?.caughtUp ? "Read through the current stored snapshot." : "Read the next page to continue."}`
+        : output?.trimmed ? "The live view is limited. Some previously displayed output is outside this view; browse stored history to read earlier entries."
+        : output && !output.caughtUp ? "More stored output remains. Reading in bounded pages."
+        : "Live view of stored output. Browse stored history to read from the beginning.");
+    if (focusedControl === elements.pause && elements.pause.disabled && !elements.resume.disabled) {
+      elements.resume.focus({ preventScroll: true });
+    } else if (focusedControl === elements.resume && elements.resume.disabled && !elements.pause.disabled) {
+      elements.pause.focus({ preventScroll: true });
+    }
+    if (focusedControl === elements.nextPage && elements.nextPage?.disabled && !elements.resume.disabled) elements.resume.focus({ preventScroll: true });
+    const text = outputReaderFactory
+      ? output ? output.text || "No stored output is present in this snapshot."
+        : phase === "loading" || phase === "history_loading" ? "Loading stored output from the Controller."
+        : "No stored output snapshot loaded. The last server result is unchanged."
+      : job
+      ? chunks.length > 0 ? renderJobOutput(chunks, { jobId, job }) : renderJobOutputStatus(job, { jobId, observing: false })
+      : `Job: ${jobId}\nNo server result loaded yet.`;
+    const sameJob = renderedJobId === jobId;
+    const top = sameJob ? elements.output.scrollTop : 0;
+    const left = sameJob ? elements.output.scrollLeft : 0;
+    writeText(elements.output, text);
+    elements.output.scrollTop = top;
+    elements.output.scrollLeft = left;
+    renderedJobId = jobId;
+    writeHtml(elements.targets, renderJobTargetTable(job));
+    writeHtml(elements.artifacts, renderJobArtifacts(job));
+    if (elements.provenance) writeText(elements.provenance, formatJobCatalogProvenance(job));
+  }
+
+  function ensureOwner() {
+    if (owner) return owner;
+    const created = createJobObserver({
+      api: apiClient, isTerminal: isTerminalJob, clock,
+      outputReader: outputReaderFactory?.(),
+      onChange: (snapshot) => { if (owner === created && active()) render(snapshot); },
+    });
+    owner = created;
+    return created;
+  }
+
+  function pause() {
+    if (history) {
+      cancelHistory();
+      writeText(elements.status, "Stored history is paused. Resume observation to read the current result.");
+      if (elements.nextPage) elements.nextPage.disabled = true;
+      elements.pause.disabled = true; elements.resume.disabled = false;
+    } else owner?.pause();
+  }
+  function resume() {
+    cancelArtifactRead();
+    if (active() && selection) {
+      if (history || !owner) { cancelHistory(); ensureOwner().select(selection.jobId); }
+      else ensureOwner().resume();
+    }
+  }
+
+  /** @param {HistoryView} view @param {Readonly<import('./job-observer.js').ObservationSnapshot>} snapshot */
+  function publishHistory(view, snapshot) {
+    if (history !== view || !active() || selection !== view.selection) return false;
+    view.snapshot = snapshot;
+    try { render(snapshot); }
+    catch {
+      if (history === view) {
+        view.canNext = false; view.reader.dispose();
+        view.snapshot = Object.freeze({ ...snapshot, phase: "error", retryAt: null, error: Object.freeze({ kind: "view", status: null, retryable: false }) });
+      }
+      return false;
+    }
+    return history === view && active() && selection === view.selection;
+  }
+
+  /** One history page owns its Job/detail pair, deadline and finite retry timer. @param {HistoryView} view */
+  async function loadHistoryPage(view) {
+    if (history !== view || !active() || selection !== view.selection || historyRead) return;
+    const prior = view.snapshot;
+    const loading = Object.freeze({ phase: "history_loading", jobId: view.selection.jobId, job: prior?.job || null,
+      chunks: [], output: prior?.output || null, lastUpdatedAt: prior?.lastUpdatedAt ?? null, retryAt: null, error: null, attempt: view.page });
+    if (!publishHistory(view, loading)) return;
+    const controller = new AbortController(), { signal } = controller;
+    const deadline = clock.setTimeout(() => controller.abort(new DOMException("Stored history read timed out.", "TimeoutError")), 10000);
+    const request = { controller, deadline, view };
+    historyRead = request;
+    let onAbort = () => {};
+    /** @type {Promise<never>} */
+    const canceled = new Promise((_, reject) => { onAbort = () => reject(signal.reason); signal.addEventListener("abort", onAbort, { once: true }); });
+    const current = () => active() && selection === view.selection && history === view && historyRead === request;
+    /** @type {number|null} */
+    let retryDelay = null;
+    try {
+      const work = (async () => {
+        const job = parseObservedJob(await apiClient.getJob(view.selection.jobId, { signal }), view.selection.jobId);
+        signal.throwIfAborted();
+        const output = await view.reader.readHistoryPage(view.selection.jobId, { signal });
+        signal.throwIfAborted();
+        return { job, output };
+      })();
+      const result = await Promise.race([work, canceled]);
+      if (!current()) return;
+      view.page += 1; view.failures = 0; view.canNext = result.output.hasMore || !result.output.caughtUp;
+      renderedJobId = ""; // Explicit page navigation starts at the new page, unlike live background updates.
+      publishHistory(view, Object.freeze({ phase: "history", jobId: view.selection.jobId, job: result.job,
+        chunks: result.output.fragments, output: result.output, lastUpdatedAt: clock.now(), retryAt: null, error: null, attempt: view.page }));
+    } catch (error) {
+      if (!current()) return;
+      const failure = classifyJobReadFailure(error, { outputPage: true });
+      retryDelay = failure.retryable ? [1000, 2000, 4000][view.failures] ?? null : null;
+      view.failures += 1;
+      if (!publishHistory(view, Object.freeze({ ...loading, phase: "error", error: failure,
+        retryAt: retryDelay === null ? null : clock.now() + retryDelay }))) retryDelay = null;
+    } finally {
+      clock.clearTimeout(deadline); signal.removeEventListener("abort", onAbort);
+      if (historyRead === request) historyRead = null;
+    }
+    if (retryDelay !== null && history === view && active()) view.timer = clock.setTimeout(() => {
+      view.timer = null; void loadHistoryPage(view);
+    }, retryDelay);
+  }
+
+  async function browseHistory() {
+    if (!active() || !selection || !outputReaderFactory) return;
+    const selected = selection;
+    release();
+    const reader = outputReaderFactory(); reader.reset(selected.jobId);
+    /** @type {HistoryView} */
+    const view = { selection: selected, reader, page: 0, canNext: true, snapshot: null, failures: 0, timer: null };
+    history = view;
+    await loadHistoryPage(view);
+  }
+
+  async function nextHistoryPage() {
+    const view = history;
+    if (!view || !view.canNext || historyRead || view.timer !== null || (view.snapshot?.error && !view.snapshot.error.retryable)) return;
+    view.failures = 0;
+    await loadHistoryPage(view);
+  }
+
+  const onBrowseHistory = () => { void browseHistory(); };
+  const onNextHistoryPage = () => { void nextHistoryPage(); };
+
+  /** @param {string} jobId @param {string} artifactId */
+  async function showArtifact(jobId, artifactId) {
+    if (!active() || selection?.jobId !== jobId || !apiClient.getJobArtifact) return;
+    pause();
+    cancelArtifactRead();
+    if (elements.outputInfo && outputReaderFactory) writeText(elements.outputInfo, "Artifact inspection. Stored output observation is paused.");
+    const currentSelection = selection;
+    const controller = new AbortController();
+    const { signal } = controller;
+    const deadline = clock.setTimeout(() => controller.abort(new DOMException("Artifact read timed out.", "TimeoutError")), 10000);
+    const request = { controller, deadline };
+    artifactRead = request;
+    writeText(elements.output, `Loading artifact ${artifactId}. Job observation is paused.`);
+    let onAbort = () => {};
+    /** @type {Promise<never>} */
+    const canceled = new Promise((_, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    const current = () => active() && selection === currentSelection && artifactRead === request;
+    try {
+      const artifact = await Promise.race([apiClient.getJobArtifact(jobId, artifactId, { signal }), canceled]);
+      if (current()) writeText(elements.output, renderArtifactBody(artifact));
+    } catch {
+      if (current()) writeText(elements.output, signal.reason?.name === "TimeoutError"
+        ? "Artifact read timed out. Resume job observation or retry the artifact."
+        : "Could not load artifact. Check access and retry, or resume job observation.");
+    } finally {
+      clock.clearTimeout(deadline);
+      signal.removeEventListener("abort", onAbort);
+      if (artifactRead === request) artifactRead = null;
+    }
+  }
+  elements.pause.addEventListener("click", pause);
+  elements.resume.addEventListener("click", resume);
+  elements.history?.addEventListener("click", onBrowseHistory);
+  elements.nextPage?.addEventListener("click", onNextHistoryPage);
+  renderIdle();
+
+  return {
+    /** @param {{ route: string, authenticated: boolean, authGeneration?:number }} context */
+    setContext(context) {
+      if (disposed || (context.route === route && context.authenticated === authenticated && (context.authGeneration ?? 0) === authGeneration)) return;
+      const changedIdentity = (context.authGeneration ?? 0) !== authGeneration;
+      release();
+      authGeneration = context.authGeneration ?? 0;
+      route = context.route;
+      authenticated = context.authenticated;
+      selection = authenticated && !changedIdentity && selection ? Object.freeze({ jobId: selection.jobId }) : null;
+      if (!authenticated || !active() || !selection) renderIdle();
+      else if (active() && selection) ensureOwner().select(selection.jobId);
+    },
+    /** @param {string} jobId */
+    select(jobId) {
+      if (disposed || !authenticated) return;
+      const id = String(jobId).trim();
+      if (!id) throw new Error("A Job ID is required.");
+      cancelArtifactRead();
+      cancelHistory();
+      selection = Object.freeze({ jobId: id });
+      if (active()) ensureOwner().select(id);
+    },
+    pause,
+    resume,
+    showArtifact,
+    browseHistory,
+    nextHistoryPage,
+    getSnapshot: () => owner?.getSnapshot() || history?.snapshot || null,
+    getJobId: () => selection?.jobId || "",
+    captureSelection: () => selection,
+    isCurrentSelection: (value) => active() && value !== null && value === selection,
+    dispose() {
+      disposed = true;
+      selection = null;
+      release();
+      elements.pause.removeEventListener("click", pause);
+      elements.resume.removeEventListener("click", resume);
+      elements.history?.removeEventListener("click", onBrowseHistory);
+      elements.nextPage?.removeEventListener("click", onNextHistoryPage);
+    },
+  };
 }
 
 function renderOverviewSummary({ agents, jobs, approvals, remediations }) {
@@ -673,6 +1089,17 @@ export function renderJobs(jobs) {
       `;
     })
     .join("");
+}
+
+/** Formats only verified provenance fields for a textContent result view. */
+export function formatJobCatalogProvenance(job) {
+  if (!job || !("catalog_provenance" in job)) return "Catalog provenance was not reported by this Controller.";
+  const value = job.catalog_provenance;
+  if (value === null) return "No catalog provenance. This Job was created through another input path.";
+  if (!value || typeof value !== "object" || typeof value.source_id !== "string" || !value.source_id
+      || typeof value.path !== "string" || !value.path || typeof value.commit !== "string"
+      || !/^[a-f0-9]{40}([a-f0-9]{24})?$/.test(value.commit) || typeof value.checksum !== "string" || !/^[a-f0-9]{64}$/.test(value.checksum)) return "Catalog provenance could not be verified.";
+  return `Catalog source: ${value.source_id}\nCommit: ${value.commit}\nDocument: ${value.path}\nSHA256: ${value.checksum}`;
 }
 
 export function renderJobTargetTable(job) {
@@ -1278,7 +1705,7 @@ export function renderJobOutputWaiting({ jobId = "", attempt = 0, maxAttempts = 
 
 export function renderJobOutputStatus(
   job,
-  { jobId = "", attempt = 0, maxAttempts = JOB_OUTPUT_POLL_ATTEMPTS, paused = false } = {},
+  { jobId = "", attempt = 0, maxAttempts = JOB_OUTPUT_POLL_ATTEMPTS, paused = false, observing = true } = {},
 ) {
   const resolvedJobId = job?.id || jobId;
   const lines = [];
@@ -1297,9 +1724,9 @@ export function renderJobOutputStatus(
   if (expiresAt) {
     lines.push(`Expires at: ${expiresAt}`);
   }
-  if (!isTerminalJob(job)) {
+  if (observing && !paused && !isTerminalJob(job)) {
     if (isApprovalPendingJob(job)) {
-      lines.push("Open Approvals and approve or reject this job before output can appear.");
+      lines.push("Use the Approvals section in Run or Runbooks before output can appear.");
     } else {
       lines.push(`Polling job output${progress}.`);
     }
@@ -1336,6 +1763,9 @@ export function jobStatusMessage(job) {
   if (dispatchState === "completed" || status === "success") {
     return "Completed with no output.";
   }
+  if (dispatchState === "partial_success" || status === "partial_success") {
+    return "Completed with mixed results. Check each Agent's Assignment.";
+  }
   if (dispatchState === "expired" || status === "expired") {
     return `Expired before delivery or completion.${reason} Create a new job after the agent reconnects.`;
   }
@@ -1346,7 +1776,10 @@ export function jobStatusMessage(job) {
     return `Rejected by controller policy.${reason} Review confirmation, target state, or audit entries before retrying.`;
   }
   if (dispatchState === "failed" || status === "failed") {
-    return `Failed on agent.${reason} Review job output or audit entries before retrying.`;
+    if (job?.last_error === "execution_outcome_unknown" || job?.last_error === "exit_code=-1,reason=execution_outcome_unknown") {
+      return `Execution outcome unknown.${reason} Do not assume success or repeat the command without checking its effects.`;
+    }
+    return `Job failed.${reason} Review job output or audit entries before retrying.`;
   }
   return `Job state is ${dispatchState || status || "unknown"}. Refresh jobs or check controller logs.`;
 }
@@ -1386,10 +1819,10 @@ function jobTargetSummary(job) {
 
 export function formatApiError(path, status) {
   if (status === 401) {
-    return "Admin authentication expired or missing. Paste the admin token and refresh.";
+    return "Your login expired or was revoked. Sign in again.";
   }
   if (status === 403) {
-    return "Controller rejected this request. Check the admin token permissions.";
+    return "Your account does not have permission for this action.";
   }
   if (status === 404) {
     return `${path} was not found. Refresh the list and select an existing resource.`;
@@ -1418,16 +1851,367 @@ async function loadAuditPage({ append = false } = {}) {
   if (more) more.disabled = !state.auditCursor;
 }
 
+function showUiError(error) {
+  if (error?.name !== "AbortError") setStatus(error.message, "error");
+}
+
 function readAdminTokenInput() {
   return normalizeAdminToken(document.querySelector("#admin-token")?.value || "");
 }
 
+/**
+ * Owns one direct command/Runbook submission and a metadata-only uncertain ID.
+ * It never retains or replays the command body, and never changes a server Job.
+ */
+export function createDirectJobSubmission({ createJob, getJob, onChange = () => {}, clock = globalThis }) {
+  let authenticated = false, generation = 0, owner = {}, pending = null, disposed = false;
+  let phase = "idle", jobId = "";
+  const snapshot = () => Object.freeze({ phase, jobId,
+    canSubmit: authenticated && !disposed && !pending && !["unknown", "submitting", "checking"].includes(phase),
+    canCheck: authenticated && !disposed && !pending && Boolean(jobId) && ["unknown", "created", "missing"].includes(phase) });
+  const current = token => !disposed && authenticated && owner === token;
+  function publish() {
+    try { onChange(snapshot()); return !disposed; }
+    catch { disposed = true; pending?.abort(); return false; }
+  }
+  async function request(effect, token) {
+    if (!current(token)) throw new DOMException("Authentication changed.", "AbortError");
+    const controller = new AbortController();
+    pending = controller;
+    const deadline = clock.setTimeout(() => controller.abort(new DOMException("Submission timed out.", "TimeoutError")), 10000);
+    let abort;
+    const canceled = new Promise((_, reject) => {
+      abort = () => reject(controller.signal.reason);
+      controller.signal.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      return await Promise.race([Promise.resolve().then(() => {
+        controller.signal.throwIfAborted(); return effect(controller.signal);
+      }), canceled]);
+    } finally {
+      clock.clearTimeout(deadline); controller.signal.removeEventListener("abort", abort);
+      if (pending === controller) pending = null;
+    }
+  }
+  return {
+    getSnapshot: snapshot,
+    setContext(next) {
+      if (disposed || (authenticated === next.authenticated && generation === (next.authGeneration ?? 0))) return;
+      owner = {}; pending?.abort(new DOMException("Authentication changed.", "AbortError")); pending = null;
+      if (phase === "submitting" || phase === "checking") phase = "unknown";
+      authenticated = next.authenticated; generation = next.authGeneration ?? 0; publish();
+    },
+    async submit(body) {
+      if (!snapshot().canSubmit) return null;
+      if (typeof body?.job_id !== "string" || !body.job_id) throw new Error("A Job ID is required.");
+      const token = owner;
+      jobId = body.job_id; phase = "submitting";
+      if (!publish() || !current(token)) return null;
+      try {
+        const response = await request(signal => createJob(body, { signal }), token);
+        if (!current(token)) return null;
+        if (response?.job_id !== jobId || typeof response.status !== "string") throw new Error("Invalid submission response.");
+        phase = "created"; return publish() && current(token) ? response : null;
+      } catch (error) {
+        if (current(token)) {
+          phase = [400, 401, 403, 404, 422].includes(error?.status) ? "rejected" : "unknown";
+          publish();
+        }
+        return null;
+      }
+    },
+    async check() {
+      if (!snapshot().canCheck) return null;
+      const token = owner, id = jobId;
+      phase = "checking"; if (!publish() || !current(token)) return null;
+      try {
+        const job = await request(signal => getJob(id, { signal }), token);
+        if (!current(token)) return null;
+        if (job?.id !== id || typeof job.status !== "string") throw new Error("Invalid Job response.");
+        phase = "created"; return publish() && current(token) ? job : null;
+      } catch (error) {
+        if (current(token)) { phase = error?.status === 404 ? "missing" : "unknown"; publish(); }
+        return null;
+      }
+    },
+    dispose() { if (disposed) return; disposed = true; owner = {}; pending?.abort(); pending = null; },
+  };
+}
+
+function renderDirectSubmission(kind, view) {
+  if (typeof document === "undefined") return;
+  const messages = {
+    idle: "No submission yet.", submitting: "Submitting Job ", checking: "Checking stored Job ",
+    unknown: "Outcome unknown. Check stored Job before submitting again: ",
+    created: "Stored Job: ", missing: "No stored Job found. A new submission requires your action: ",
+    rejected: "Submission rejected: ",
+  };
+  const status = document.querySelector("#" + kind + "-submission-status");
+  if (status) status.textContent = messages[view.phase] + view.jobId;
+  const check = document.querySelector("#" + kind + "-check-submission");
+  if (check) { check.hidden = !view.jobId; check.disabled = !view.canCheck; }
+}
+
+
+let lastAccountGeneration = -1;
+let selectedAccountId = "";
+let accountRows = "", tokenRows = "";
+let onceReturnFocus = null;
+let settingsSection = "account";
+
+function clearOnceSecret(restoreFocus = false) {
+  if (typeof document === "undefined") return;
+  const input = document.querySelector("#once-secret");
+  if (input) { input.value = ""; input.type = "password"; }
+  const panel = document.querySelector("#once-secret-panel");
+  if (panel) panel.hidden = true;
+  document.querySelector("#reveal-once-secret")?.setAttribute("aria-pressed", "false");
+  const reveal = document.querySelector("#reveal-once-secret");
+  if (reveal) reveal.textContent = "Show value";
+  const target = onceReturnFocus;
+  onceReturnFocus = null;
+  if (restoreFocus) {
+    if (target?.isConnected && !target.disabled && target.getClientRects().length) target.focus({preventScroll:true});
+    else document.querySelector("#login-username")?.focus({preventScroll:true});
+  }
+}
+function showOnceSecret(value) {
+  const target = onceReturnFocus || document.activeElement;
+  clearOnceSecret();
+  onceReturnFocus = target;
+  const input = document.querySelector("#once-secret");
+  input.value = value.value;
+  document.querySelector("#once-secret-title").textContent = value.kind + " — shown once";
+  document.querySelector("#once-secret-help").textContent = "Expires " + new Date(value.expiresAt * 1000).toLocaleString()
+    + ". Copy it now and deliver setup/reset codes privately. Fleet cannot show it again.";
+  document.querySelector("#once-secret-feedback").textContent = "";
+  document.querySelector("#once-secret-panel").hidden = false;
+  input.focus({ preventScroll: true });
+}
+function clearProtectedAccountView() {
+  state.token = ""; state.agents = []; state.policies = []; state.remediations = [];
+  state.selectedAgentId = ""; state.selectedPolicyId = ""; state.selectedRemediationId = "";
+  state.auditCursor = ""; state.auditItems = []; state.createdEnrollmentToken = null;
+  selectedAccountId = ""; accountRows = ""; tokenRows = "";
+  settingsSection = "account";
+  for (const id of ["admin-token", "login-password", "setup-code", "setup-password"]) {
+    const field = document.querySelector("#" + id); if (field) field.value = "";
+  }
+  for (const id of ["agents-list", "agent-detail", "jobs-list", "approvals-list", "policies-list", "remediations-list", "audit-list", "enrollment-tokens-list", "admin-users-list", "personal-tokens-list"]) {
+    const element = document.querySelector("#" + id); if (element) element.textContent = "Authenticate to load current data.";
+  }
+  for (const form of document.querySelectorAll(".account-form")) {
+    for (const input of form.querySelectorAll('input[type="password"]')) input.value = "";
+  }
+  for (const id of ["run-command-form", "runbook-form", "remediation-form"]) document.querySelector("#" + id)?.reset();
+}
+function onAccountState(view) {
+  if (typeof document === "undefined") return;
+  if (lastAccountGeneration !== api.getAuthGeneration()) {
+    lastAccountGeneration = api.getAuthGeneration(); clearProtectedAccountView();
+  }
+  const active = Boolean(view.user);
+  const legacy = view.mode === "legacy";
+  document.querySelector("#admin-auth").hidden = !legacy;
+  document.querySelector("#personal-account-header").hidden = !active;
+  document.querySelector("#personal-login").hidden = view.mode !== "personal" || active;
+  document.querySelector("#local-owner-required").hidden = view.mode !== "local_setup_required";
+  document.querySelector("#admin-workspace").hidden = !active && !legacy;
+  document.querySelector(".page-heading").hidden = !active && !legacy;
+  const error = document.querySelector("#account-error");
+  error.hidden = !view.error; error.textContent = view.error?.message || "";
+  const current = document.querySelector("#current-admin-user");
+  document.querySelector("#logout-admin").disabled = view.phase === "signing_out";
+  current.textContent = active ? (view.user.display_name || view.user.username) + " · " + view.user.role : "";
+  document.querySelector("#account-profile").textContent = active ? view.user.username + " · " + view.user.id
+    + " · login expires " + new Date(view.expiresAt * 1000).toLocaleString() : "";
+  const route = currentAdminRoute();
+  if (!active) settingsSection = "controller";
+  if (settingsSection === "people" && view.user?.role !== "owner") settingsSection = "account";
+  document.querySelector("#account-settings-tabs").hidden = route !== "settings" || (!active && !legacy);
+  document.querySelector("#settings-account-tab").hidden = !active;
+  document.querySelector("#settings-people-tab").hidden = view.user?.role !== "owner";
+  for (const button of document.querySelectorAll("[data-settings-tab]")) {
+    const selected = button.dataset.settingsTab === settingsSection;
+    button.setAttribute("aria-selected", String(selected)); button.tabIndex = selected ? 0 : -1;
+  }
+  document.querySelector("#personal-account-panel").hidden = !active || route !== "settings" || settingsSection !== "account";
+  document.querySelector("#owner-accounts-panel").hidden = view.user?.role !== "owner" || route !== "settings" || settingsSection !== "people";
+  document.querySelector("#controller-settings-panel").hidden = route !== "settings" || settingsSection !== "controller";
+  const managesController = active ? ["owner", "admin"].includes(view.user.role) : legacy;
+  document.querySelector(".token-panel").hidden = route !== "settings" || !managesController;
+  document.querySelector("#controller-access-note").hidden = managesController;
+  for (const control of document.querySelectorAll("#staged-trust-bundle-form input, #staged-trust-bundle-form textarea, #staged-trust-bundle-form button")) control.disabled = !managesController;
+  const executesJobs = active ? view.user.role !== "viewer" : legacy;
+  document.querySelector("#job-permission-note").hidden = executesJobs || !["run", "runbooks", "remediations"].includes(route);
+  for (const control of document.querySelectorAll("#run-command-form input, #run-command-form button, #runbook-form input, #runbook-form textarea, #runbook-form button, #remediation-form input, #remediation-form textarea, #remediation-form button, #expire-approvals")) control.disabled = !executesJobs;
+  document.querySelector("#edit-admin-user-form").hidden = !selectedAccountId;
+  const rows = view.users.map(user => '<button type="button" class="account-row account-secondary" data-user-id="' + escapeHtml(user.id) + '"><span><strong>'
+    + escapeHtml(user.display_name || user.username) + '</strong><small>' + escapeHtml(user.username) + '</small></span><span>'
+    + escapeHtml(user.role) + ' · ' + escapeHtml(user.status) + '</span></button>').join("") || '<p class="muted">No accounts on this page.</p>';
+  if (rows !== accountRows) { accountRows = rows; document.querySelector("#admin-users-list").innerHTML = rows; }
+  const tokens = view.tokens.map(token => '<div class="account-row"><span><strong>' + escapeHtml(token.label || "Unlabeled token") + '</strong><small>'
+    + escapeHtml(token.id) + ' · expires ' + escapeHtml(new Date(token.expires_at * 1000).toLocaleString()) + '</small></span><span>'
+    + (token.active ? 'Active <button type="button" class="account-secondary" data-personal-token-id="' + escapeHtml(token.id) + '">Revoke token</button>' : "Inactive") + '</span></div>').join("") || '<p class="muted">No personal tokens on this page. Create one to connect the CLI.</p>';
+  if (tokens !== tokenRows) { tokenRows = tokens; document.querySelector("#personal-tokens-list").innerHTML = tokens; }
+  document.querySelector("#next-admin-users").disabled = view.busy || !view.userCursor;
+  document.querySelector("#next-personal-tokens").disabled = view.busy || !view.tokenCursor;
+  for (const button of document.querySelectorAll("#personal-login button[type=submit], #personal-account-panel button, #owner-accounts-panel button")) {
+    if (!["next-admin-users", "next-personal-tokens"].includes(button.id)) button.disabled = view.busy;
+  }
+  setStatus(view.error?.message || view.message, view.error ? "error" : "");
+  for (const submission of Object.values(directSubmissions)) submission.setContext(adminViewContext());
+  jobObservation?.setContext(adminViewContext()); void catalogPanel?.setContext(adminViewContext());
+}
+async function refreshAccountMetadata() {
+  if (adminAccounts.getSnapshot().user?.role === "owner") await adminAccounts.loadUsers();
+  if (adminAccounts.getSnapshot().user) await adminAccounts.loadTokens();
+}
+async function restoreAdminSession() {
+  await adminAccounts.start();
+  if (adminAccounts.getSnapshot().user) {
+    await refreshAll().catch(showUiError);
+    if (currentAdminRoute() === "settings") await refreshAccountMetadata();
+  }
+}
+function wireAccountForms() {
+  const activateTab = button => {
+    if (!button || button.hidden) return;
+    settingsSection = button.dataset.settingsTab;
+    onAccountState(adminAccounts.getSnapshot());
+    button.focus({preventScroll:true});
+  };
+  document.querySelector("#account-settings-tabs").addEventListener("click", event => activateTab(event.target.closest("[data-settings-tab]")));
+  document.querySelector("#account-settings-tabs").addEventListener("keydown", event => {
+    const buttons = [...document.querySelectorAll("[data-settings-tab]")].filter(button => !button.hidden);
+    const index = buttons.indexOf(event.target); if (index < 0) return;
+    const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1
+      : event.key === "ArrowRight" ? (index + 1) % buttons.length : event.key === "ArrowLeft" ? (index + buttons.length - 1) % buttons.length : -1;
+    if (next >= 0) { event.preventDefault(); activateTab(buttons[next]); }
+  });
+  const bind = (id, effect) => {
+    const form = document.querySelector("#" + id);
+    form.addEventListener("submit", event => {
+      event.preventDefault();
+      form.removeAttribute("aria-describedby");
+      for (const input of form.querySelectorAll("input, select")) input.removeAttribute("aria-invalid");
+      if (["personal-token-form", "create-admin-user-form"].includes(id)) onceReturnFocus = event.submitter;
+      const body = Object.fromEntries(new FormData(form));
+      for (const input of form.querySelectorAll('input[type="password"]')) input.value = "";
+      const action = effect(body), generation = api.getAuthGeneration();
+      void Promise.resolve(action).then(() => {
+        if (generation !== api.getAuthGeneration()) return;
+        if (["invalid", "authentication"].includes(adminAccounts.getSnapshot().error?.kind)) {
+          form.setAttribute("aria-describedby", "account-error");
+          for (const input of form.querySelectorAll("input, select")) input.setAttribute("aria-invalid", "true");
+        }
+      }).catch(showUiError);
+    });
+    form.addEventListener("input", event => { event.target.removeAttribute?.("aria-invalid"); });
+  };
+  bind("personal-login-form", async body => {
+    if (await adminAccounts.login(body.username, body.password)) {
+      await refreshAll().catch(showUiError);
+      if (currentAdminRoute() === "settings") await refreshAccountMetadata();
+    }
+  });
+  bind("password-setup-form", async body => {
+    if (await adminAccounts.completeSetup(body.code, body.new_password)) {
+      document.querySelector("#password-setup-form").hidden = true;
+      document.querySelector("#personal-login-form").hidden = false;
+      document.querySelector("#login-username").focus();
+    }
+  });
+  bind("own-password-form", body => adminAccounts.changePassword(body));
+  bind("personal-token-form", async body => {
+    if (!body.label) delete body.label;
+    if (await adminAccounts.createToken(body)) await adminAccounts.loadTokens();
+  });
+  bind("create-admin-user-form", async body => { if (await adminAccounts.createUser(body)) await adminAccounts.loadUsers(); });
+  bind("edit-admin-user-form", async body => {
+    if (selectedAccountId && await adminAccounts.changeUser(selectedAccountId, body) && adminAccounts.getSnapshot().user) await adminAccounts.loadUsers();
+  });
+  document.querySelector("#logout-admin").addEventListener("click", () => { void adminAccounts.logout(); });
+  document.querySelector("#refresh-controller").addEventListener("click", () => { void refreshAll().catch(showUiError); });
+  document.querySelector("#open-password-setup").addEventListener("click", () => {
+    document.querySelector("#personal-login-form").hidden = true;
+    document.querySelector("#password-setup-form").hidden = false; document.querySelector("#setup-code").focus();
+  });
+  document.querySelector("#close-password-setup").addEventListener("click", () => {
+    document.querySelector("#password-setup-form").hidden = true; document.querySelector("#personal-login-form").hidden = false;
+    document.querySelector("#setup-code").value = ""; document.querySelector("#setup-password").value = "";
+    document.querySelector("#login-username").focus();
+  });
+  document.querySelector("#dismiss-once-secret").addEventListener("click", () => clearOnceSecret(true));
+  document.querySelector("#once-secret-panel").addEventListener("keydown", event => {
+    if (event.key === "Escape") { event.preventDefault(); clearOnceSecret(true); }
+  });
+  document.querySelector("#reveal-once-secret").addEventListener("click", () => {
+    const input = document.querySelector("#once-secret"), reveal = input.type === "password";
+    input.type = reveal ? "text" : "password";
+    document.querySelector("#reveal-once-secret").setAttribute("aria-pressed", String(reveal));
+    document.querySelector("#reveal-once-secret").textContent = reveal ? "Hide value" : "Show value";
+  });
+  document.querySelector("#copy-once-secret").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(document.querySelector("#once-secret").value); document.querySelector("#once-secret-feedback").textContent = "Copied. Store it safely, then clear this value."; }
+    catch { document.querySelector("#once-secret-feedback").textContent = "Copy was unavailable. Show the value and copy it manually."; }
+  });
+  for (const [id,effect] of Object.entries({
+    "refresh-admin-users":()=>adminAccounts.loadUsers(), "first-admin-users":()=>adminAccounts.loadUsers(),
+    "next-admin-users":()=>adminAccounts.loadUsers({after:adminAccounts.getSnapshot().userCursor}),
+    "refresh-personal-tokens":()=>adminAccounts.loadTokens(), "first-personal-tokens":()=>adminAccounts.loadTokens(),
+    "next-personal-tokens":()=>adminAccounts.loadTokens({after:adminAccounts.getSnapshot().tokenCursor}),
+  })) document.querySelector("#"+id).addEventListener("click",()=>{void effect();});
+  document.querySelector("#admin-users-list").addEventListener("click",event=>{
+    const button=event.target.closest("[data-user-id]");
+    const user=adminAccounts.getSnapshot().users.find(value=>value.id===button?.dataset.userId);if(!user)return;
+    selectedAccountId=user.id;
+    document.querySelector("#edit-admin-user-form").hidden=false;
+    document.querySelector("#selected-admin-user").textContent=user.username+" · "+user.id+" · "+user.status;
+    document.querySelector("#edit-admin-name").value=user.display_name;
+    document.querySelector("#edit-admin-role").value=user.role;
+    document.querySelector("#edit-admin-password").value="";
+    document.querySelector("#edit-admin-name").focus({preventScroll:true});
+  });
+  for(const [id,method] of [["reset-admin-password","resetUser"],["disable-admin-user","changeUser"]]) {
+    document.querySelector("#"+id).addEventListener("click",async()=>{
+      if (method === "resetUser") onceReturnFocus = document.querySelector("#"+id);
+      const password=document.querySelector("#edit-admin-password");
+      if(!password.reportValidity()||!selectedAccountId)return;
+      const value=password.value;password.value="";
+      if(!globalThis.confirm((method==="resetUser"?"Reset the password for ":"Disable ")+selectedAccountId+"? Existing logins and personal tokens will be revoked. Running Agent jobs continue."))return;
+      const input=method==="resetUser"?{current_password:value}:{current_password:value,disable:true};
+      if(await adminAccounts[method](selectedAccountId,input)&&adminAccounts.getSnapshot().user)await adminAccounts.loadUsers();
+    });
+  }
+  document.querySelector("#personal-tokens-list").addEventListener("click",async event=>{
+    const button=event.target.closest("[data-personal-token-id]");if(!button)return;
+    if(!globalThis.confirm("Revoke this personal token? CLI/API requests using it will stop. Running Agent jobs continue."))return;
+    if(await adminAccounts.revokeToken(button.dataset.personalTokenId))await adminAccounts.loadTokens();
+  });
+}
+
+function adminViewContext(route = currentAdminRoute()) {
+  return { route, authenticated: Boolean(state.token || adminAccounts.getSnapshot().user), authGeneration: api.getAuthGeneration() };
+}
+
+function setAdminToken(token) {
+  if (state.token !== token) {
+    state.token = token;
+    api.setAuthentication({ mode: token ? "legacy" : "anonymous" });
+  }
+  for (const submission of Object.values(directSubmissions)) submission.setContext(adminViewContext());
+  jobObservation?.setContext(adminViewContext());
+  void catalogPanel?.setContext(adminViewContext());
+}
+
 function syncAdminTokenFromInput({ requireToken = false } = {}) {
+  if (adminAccounts.getSnapshot().user) return "";
   const token = readAdminTokenInput();
   if (token) {
-    state.token = token;
+    setAdminToken(token);
   }
-  if (requireToken && !state.token) {
+  if (requireToken && !state.token && !adminAccounts.getSnapshot().user) {
     throw new Error("Admin token is required. Paste the token from controller init, then retry.");
   }
   return state.token;
@@ -1465,7 +2249,7 @@ function handleAgentsListClick(event) {
   state.selectedAgentId = button.dataset.agentId;
   document.querySelector("#agents-list").innerHTML = renderAgents(state.agents, state.selectedAgentId);
   syncAgentActions();
-  refreshSelectedAgent().catch((error) => setStatus(error.message, "error"));
+  refreshSelectedAgent().catch(showUiError);
 }
 
 function selectedAgent() {
@@ -1562,7 +2346,7 @@ async function readOptionalAgentData(label, load) {
 }
 
 async function refreshAll() {
-  if (!state.token) {
+  if (!state.token && !adminAccounts.getSnapshot().user) {
     setStatus("Admin token is required.", "error");
     return;
   }
@@ -1571,19 +2355,13 @@ async function refreshAll() {
   await loadCatalogSources();
   const [jobs, enrollmentTokens, approvals, policies, remediations, signingStatus] = await Promise.all([
     api.listJobs(),
-    api.listEnrollmentTokens(),
+    ["operator", "viewer"].includes(adminAccounts.getSnapshot().user?.role) ? Promise.resolve([]) : api.listEnrollmentTokens(),
     api.listApprovals("pending"),
     api.listPolicies(),
     api.listRemediations({ limit: DETAIL_PAGE_LIMIT }),
     api.getControllerSigningRotationStatus(),
   ]);
   document.querySelector("#jobs-list").innerHTML = renderJobs(jobs);
-  document.querySelectorAll("[data-job-id]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.lastJobId = button.dataset.jobId;
-      pollJobOutput(state.lastJobId).catch((error) => setStatus(error.message, "error"));
-    });
-  });
   document.querySelector("#approvals-list").innerHTML = renderApprovals(approvals, jobs);
   wireApprovalButtons();
   state.remediations = Array.isArray(remediations) ? remediations : [];
@@ -1599,7 +2377,7 @@ async function refreshAll() {
   document.querySelector("#enrollment-tokens-list").innerHTML = renderEnrollmentTokens(enrollmentTokens);
   document.querySelectorAll("[data-revoke-token-id]").forEach((button) => {
     button.addEventListener("click", () => {
-      revokeEnrollmentToken(button.dataset.revokeTokenId).catch((error) => setStatus(error.message, "error"));
+      revokeEnrollmentToken(button.dataset.revokeTokenId).catch(showUiError);
     });
   });
   await loadAuditPage();
@@ -1616,6 +2394,173 @@ async function refreshAll() {
     });
   }
   setStatus("Loaded latest controller data.", "ok");
+}
+
+/** Composes explicit catalog review/submission with DOM controls and the shared Job result callback. */
+export function createCatalogJobPanel({ apiClient, elements, clock = globalThis, makeJobId, onCreated = () => {} }) {
+  let route = "", authenticated = false, authGeneration = 0, selected = null, disposed = false;
+  const listeners = [];
+  const owner = createCatalogJobSubmission({ api: apiClient, clock, makeJobId, onCreated, onChange: render });
+  const setText = (element, value) => { if (element.textContent !== value) element.textContent = value; };
+  function render(view) {
+    const focused = elements.review.ownerDocument?.activeElement;
+    elements.panel.hidden = route !== "runbooks";
+    setText(elements.status, !view.active ? "Open Runbooks and authenticate to prepare a catalog Job."
+      : !view.eligible && !view.jobId ? "Choose a Runbook in the active, ready revision. Re-select after an active revision change."
+      : view.message);
+    const reference = view.submittedReference || view.reference;
+    setText(elements.reference, reference
+      ? `${view.submittedReference ? `Submitted Job: ${view.jobId}\n` : ""}Source: ${reference.source_id}\nCommit: ${reference.commit}\nPath: ${reference.path}\nSHA256: ${reference.checksum}`
+      : "No executable catalog selection.");
+    setText(elements.body, view.body);
+    const previewHtml = view.preview
+      ? `<p>${view.preview.ids.length} selected · ${view.preview.offline} offline · ${view.preview.disabled} disabled</p>`
+        + view.preview.agents.map(agent => `<div class="catalog-job-target"><span><strong>${escapeHtml(agent.name)}</strong><small>${escapeHtml(agent.id)}</small></span><span>${escapeHtml(agent.status)} · ${agent.selected ? "Selected" : "Excluded"}</span></div>`).join("")
+      : view.submittedTargetIds ? `<p>Submitted target snapshot (${view.submittedTargetIds.length}):</p><p>${view.submittedTargetIds.map(escapeHtml).join(", ")}</p>`
+      : '<p class="muted">Review targets to see the exact Agent IDs this Job will use.</p>';
+    if (elements.preview.innerHTML !== previewHtml) elements.preview.innerHTML = previewHtml;
+    elements.confirm.checked = view.confirmed;
+    elements.confirm.disabled = view.phase !== "prepared" || view.busy;
+    const controls = [[elements.review, view.canPreview, view.phase === "reading"],
+      [elements.submit, view.canSubmit, view.phase === "submitting"],
+      [elements.check, view.canReconcile, view.phase === "checking"],
+      [elements.retry, view.canRetry, view.phase === "submitting"]];
+    for (const [button, enabled, inFlight] of controls) {
+      button.disabled = !(enabled || (view.active && inFlight && focused === button));
+      button.setAttribute("aria-disabled", String(!enabled));
+    }
+    elements.reset.disabled = !view.canReset;
+    elements.check.hidden = !view.jobId || view.phase === "created";
+    elements.retry.hidden = view.phase !== "missing" && !(view.phase === "submitting" && focused === elements.retry);
+    elements.reset.hidden = !view.jobId && view.phase !== "error";
+    elements.review.textContent = view.phase === "reading" ? "Reviewing..." : "Review document and targets";
+    elements.submit.textContent = view.phase === "submitting" ? "Submitting..." : "Create catalog Job";
+    elements.selector.disabled = !view.active || view.busy;
+    elements.panel.setAttribute("aria-busy", String(view.busy));
+    if (view.active && [elements.submit, elements.check, elements.retry].includes(focused)
+        && (view.phase === "created" || view.phase === "error" || view.phase === "unknown")) {
+      elements.status.focus({ preventScroll: true });
+    }
+  }
+  function bind(element, event, handler) { element.addEventListener(event, handler); listeners.push([element, event, handler]); }
+  function context() {
+    owner.setContext({ route, authenticated, authGeneration, selection: selected?.selectedSource && selected?.selectedRevision && selected?.selectedDocument
+      ? { sourceId: selected.selectedSource.id, activeCommit: selected.selectedSource.active_commit,
+        commit: selected.selectedRevision.commit, state: selected.selectedRevision.state,
+        kind: selected.selectedDocument.kind, path: selected.selectedDocument.path, checksum: selected.selectedDocument.checksum,
+        stale: selected.selectionStale } : null });
+  }
+  bind(elements.selector, "input", () => owner.setSelector(elements.selector.value));
+  bind(elements.confirm, "change", () => owner.setConfirmed(elements.confirm.checked));
+  bind(elements.review, "click", () => { void owner.preview(); });
+  bind(elements.submit, "click", () => { void owner.submit(); });
+  bind(elements.check, "click", () => { void owner.reconcile(); });
+  bind(elements.retry, "click", () => { void owner.retry(); });
+  bind(elements.reset, "click", () => owner.reset());
+  render(owner.getSnapshot());
+  return {
+    setContext(next) { if (disposed) return; route = next.route; authenticated = Boolean(next.authenticated); authGeneration = next.authGeneration ?? 0; context(); },
+    setSelection(snapshot) { if (disposed) return; selected = snapshot; context(); },
+    getSnapshot: owner.getSnapshot,
+    dispose() { if (disposed) return; disposed = true; for (const [element, event, handler] of listeners) element.removeEventListener(event, handler); owner.dispose(); },
+  };
+}
+
+/**
+ * Connects body-free metadata pages to the existing Catalog lists. Selection only
+ * changes local view state. Mutations remain explicit form/API effects outside
+ * this panel; render never starts sync, activates a revision or creates a Job.
+ */
+export function createCatalogPanel({ apiClient, elements, clock = globalThis, onJobCreated = () => {} }) {
+  const levels = ["sources", "revisions", "documents"];
+  const keys = { sources: "catalogSourceId", revisions: "catalogCommit", documents: "catalogPath" };
+  const selectors = { sources: "[data-catalog-source-id]", revisions: "[data-catalog-commit]", documents: "[data-catalog-path]" };
+  const emptyMessages = { sources: "No catalog sources registered.", revisions: "No synced revisions for this source.", documents: "No validated documents in this revision." };
+  const listeners = [];
+  const renderedMarkup = new Map();
+  let disposed = false;
+  const explorer = createCatalogExplorer({ api: apiClient, clock, onChange: render });
+  const actionPanel = elements.actions ? createCatalogActionPanel({ apiClient, clock, elements: elements.actions,
+    onCommitted: action => { if (action === "register") void explorer.load("sources"); } }) : null;
+  const jobPanel = elements.execution ? createCatalogJobPanel({ apiClient, clock, elements: elements.execution, onCreated: onJobCreated }) : null;
+
+  function guidance(error) {
+    return error.kind === "authentication" ? "Authenticate again with an admin token."
+      : error.kind === "forbidden" ? "Permission denied. Check your catalog access."
+      : error.kind === "not_found" ? "Catalog read endpoint not found. Check the Controller version."
+      : error.kind === "invalid_response" ? "Catalog metadata could not be verified. Refresh before continuing."
+      : error.kind === "timeout" ? "Catalog read timed out. Retry when the Controller is reachable."
+      : "Catalog read failed. Retry or check the Controller connection.";
+  }
+  function writeText(element, value) { if (element.textContent !== value) element.textContent = value; }
+  function render(snapshot) {
+    for (const level of levels) {
+      const view = elements[level], page = snapshot[level], focused = view.list.ownerDocument?.activeElement;
+      const enabled = snapshot.active && (level === "sources" || Boolean(snapshot.selectedSource))
+        && (level !== "documents" || Boolean(snapshot.selectedRevision));
+      const busy = page.phase === "loading";
+      const html = !snapshot.active ? '<div class="empty">Open Runbooks or Policies and authenticate to browse catalog metadata.</div>'
+        : level === "sources" ? renderCatalogSources(page.items)
+        : level === "revisions" ? renderCatalogRevisions(page.items, "", snapshot.selectedSource?.active_commit || "")
+        : renderCatalogDocuments(page.items);
+      // Reading innerHTML back would include our dynamic aria-pressed/class updates.
+      if (renderedMarkup.get(level) !== html) { view.list.innerHTML = html; renderedMarkup.set(level, html); }
+      // Selection is a DOM attribute update, preserving the focused row's identity.
+      const selectedKey = level === "sources" ? snapshot.selectedSource?.id
+        : level === "revisions" ? snapshot.selectedRevision?.commit : snapshot.selectedDocument?.path;
+      view.list.querySelectorAll(selectors[level]).forEach(row => {
+        const selected = row.dataset[keys[level]] === selectedKey;
+        row.classList.toggle("selected", selected); row.setAttribute("aria-pressed", String(selected));
+      });
+      const message = !snapshot.active ? "Catalog reads are inactive."
+        : !enabled ? level === "documents" ? "Choose a revision to read document metadata." : "Choose a source to read revisions."
+        : page.error ? `${guidance(page.error)} The last loaded page is unchanged.`
+        : busy ? "Loading catalog metadata..."
+        : page.phase === "ready" ? `Page ${page.pageNumber}. ${page.items.length ? `${page.items.length} item(s). ${page.hasNext ? "More pages available." : "End of the current list."}` : emptyMessages[level]}`
+        : "Choose a catalog item to continue.";
+      writeText(view.status, message);
+      const conditions = { first: enabled, next: enabled && page.phase === "ready" && page.hasNext, retry: enabled && Boolean(page.error) };
+      for (const action of ["first", "next", "retry"]) {
+        const button = view[action];
+        button.disabled = busy ? focused !== button : !conditions[action];
+        writeText(button, busy && focused === button ? "Loading page..." : action === "first" ? "First page" : action === "next" ? "Next page" : "Retry");
+      }
+      if (focused === view.next && view.next.disabled) view.list.focus({ preventScroll: true });
+    }
+    writeText(elements.selection, snapshot.selectedSource
+      ? `Source: ${snapshot.selectedSource.id} · Revision: ${snapshot.selectedRevision?.commit || "Not selected"} · Document: ${snapshot.selectedDocument?.path || "Not selected"}${snapshot.selectionStale ? ". The active revision changed. Review and reselect before execution." : ""}`
+      : "No catalog selection. Choose a source, revision, then document.");
+    actionPanel?.setSelection(snapshot);
+    jobPanel?.setSelection(snapshot);
+  }
+  function bind(element, handler) { element.addEventListener("click", handler); listeners.push([element, handler]); }
+  for (const level of levels) {
+    const view = elements[level];
+    bind(view.list, event => {
+      const row = event.target?.closest?.(selectors[level]);
+      if (!row || !view.list.contains(row)) return;
+      const value = row.dataset[keys[level]];
+      if (level === "sources") void explorer.selectSource(value);
+      else if (level === "revisions") void explorer.selectRevision(value);
+      else explorer.selectDocument(value);
+    });
+    for (const action of ["first", "next", "retry"]) bind(view[action], () => {
+      if (!disposed && explorer.getSnapshot()[level].phase !== "loading") void explorer.load(level, { next: action === "next", retry: action === "retry" });
+    });
+  }
+  render(explorer.getSnapshot());
+  return {
+    setContext: next => { actionPanel?.setContext(next); jobPanel?.setContext(next); return explorer.setContext(next); },
+    refreshSources: () => explorer.load("sources"),
+    getSnapshot: () => explorer.getSnapshot(),
+    dispose() {
+      disposed = true;
+      actionPanel?.dispose();
+      jobPanel?.dispose();
+      for (const [element, handler] of listeners) element.removeEventListener("click", handler);
+      explorer.dispose(); render(explorer.getSnapshot());
+    },
+  };
 }
 
 export function renderCatalogSources(sources, selectedSourceId = "") {
@@ -1642,7 +2587,7 @@ export function renderCatalogRevisions(revisions, selectedCommit = "", activeCom
       const selected = revision.commit === selectedCommit ? " selected" : "";
       const active = revision.commit === activeCommit ? '<span class="status-pill active">active</span>' : "";
       const failure = revision.failure ? `<small>${escapeHtml(revision.failure)}</small>` : "";
-      return `<button class="catalog-row${selected}" type="button" data-catalog-commit="${escapeHtml(revision.commit)}"><span><strong>${escapeHtml(revision.commit.slice(0, 12))}</strong><small>${escapeHtml(revision.state)} · ${escapeHtml(revision.document_count)} documents</small>${failure}</span>${active}</button>`;
+      return `<button class="catalog-row${selected}" type="button" data-catalog-commit="${escapeHtml(revision.commit)}"><span><strong>${escapeHtml(revision.commit.slice(0, 12))}…${escapeHtml(revision.commit.slice(-8))}</strong><small>${escapeHtml(revision.state)} · ${escapeHtml(revision.document_count)} documents</small>${failure}</span>${active}</button>`;
     })
     .join("");
 }
@@ -1654,140 +2599,84 @@ export function renderCatalogDocuments(documents) {
   return documents
     .map(
       (document) =>
-        `<div class="catalog-document"><span class="status-pill">${escapeHtml(document.kind)}</span><span><strong>${escapeHtml(document.path)}</strong><small>checksum ${escapeHtml(document.checksum.slice(0, 12))}</small></span></div>`,
+        `<button class="catalog-row catalog-document" type="button" data-catalog-path="${escapeHtml(document.path)}"><span class="status-pill">${escapeHtml(document.kind)}</span><span><strong>${escapeHtml(document.path)}</strong><small>checksum ${escapeHtml(document.checksum.slice(0, 12))}</small></span></button>`,
     )
     .join("");
 }
 
-function catalogSourceById(sourceId) {
-  return state.catalogSources.find((source) => source.id === sourceId) || null;
-}
-
-function setCatalogActionPending(form, pending) {
-  form.querySelectorAll('button[name="catalog-action"]').forEach((button) => {
-    button.disabled = pending;
+/** Binds explicit Catalog commands and native activation confirmation to one owned view. */
+export function createCatalogActionPanel({ apiClient, elements, clock = globalThis, onCommitted = () => {} }) {
+  let context = { route: "", authenticated: false }, selected = null, selectionKey = "", disposed = false;
+  let focusAfterConfirmation = null, confirmationTrigger = null, contextKey = "";
+  const listeners = [];
+  const owner = createCatalogActions({ api: apiClient, clock, onCommitted, onChange: render });
+  function render(view) {
+    elements.status.textContent = view.message || (view.active
+      ? "Start sync accepts a request. Check its operation to see the actual result."
+      : "Open Runbooks or Policies and authenticate to manage the Catalog.");
+    elements.status.dataset.tone = view.tone;
+    elements.operation.textContent = view.operation
+      ? `Source: ${view.operation.source_id} · Operation: ${view.operation.id} · State: ${view.operation.state}${view.operation.commit ? ` · Commit: ${view.operation.commit}` : ""}`
+      : "No verified sync operation loaded.";
+    const observing = ["reading", "waiting"].includes(view.observation);
+    elements.form.querySelectorAll('button[name="catalog-action"]').forEach(button => { button.disabled = !view.active || view.busy || Boolean(view.confirmation) || observing; });
+    elements.check.disabled = !view.active || view.busy || Boolean(view.confirmation) || observing;
+    elements.stop.disabled = !observing;
+    elements.resume.disabled = !view.canResume || Boolean(view.confirmation);
+    elements.confirm.disabled = view.busy || !view.confirmation;
+    if (view.confirmation) {
+      elements.details.textContent = `Source: ${view.confirmation.sourceId}\nReady commit: ${view.confirmation.commit}\nLast observed active commit: ${view.confirmation.activeCommit || "None"}\nActivate this exact revision? This does not execute a Job. Another administrator may change the active revision independently.`;
+      if (!elements.dialog.open) elements.dialog.showModal();
+    } else if (elements.dialog.open) elements.dialog.close();
+    if (focusAfterConfirmation && !view.confirmation && !view.busy) {
+      if (view.active) (focusAfterConfirmation === "trigger" ? confirmationTrigger : elements.status)?.focus?.({ preventScroll: true });
+      focusAfterConfirmation = null;
+    }
+  }
+  function bind(element, type, handler) { element.addEventListener(type, handler); listeners.push([element, type, handler]); }
+  function input() { return Object.fromEntries(Object.entries(elements.fields).map(([key, field]) => [key, field.value.trim()])); }
+  bind(elements.form, "submit", event => {
+    event.preventDefault();
+    if (event.submitter?.value === "activate") confirmationTrigger = event.submitter;
+    if (!disposed) void owner.submit(event.submitter?.value || "", input());
   });
-}
-
-function renderCatalogDetails() {
-  const revisions = document.querySelector("#catalog-revisions");
-  const documents = document.querySelector("#catalog-documents");
-  const source = catalogSourceById(state.selectedCatalogSourceId);
-  if (revisions) {
-    revisions.innerHTML = renderCatalogRevisions(
-      state.catalogRevisions,
-      state.selectedCatalogCommit,
-      source?.active_commit || "",
-    );
+  bind(elements.check, "click", () => { if (!disposed) void owner.resumeSync(input()); });
+  bind(elements.stop, "click", () => owner.stopObservation());
+  bind(elements.resume, "click", () => { if (!disposed) void owner.resumeSync(); });
+  bind(elements.confirm, "click", () => { if (!disposed) { focusAfterConfirmation = "status"; void owner.confirmActivation(); } });
+  const cancel = () => { focusAfterConfirmation = "trigger"; owner.cancelActivation(); };
+  bind(elements.cancel, "click", cancel);
+  bind(elements.dialog, "cancel", event => { event.preventDefault(); cancel(); });
+  function updateContext() {
+    const next = { ...context, selection: selected }, key = JSON.stringify(next);
+    if (key !== contextKey) { contextKey = key; focusAfterConfirmation = null; }
+    owner.setContext(next);
   }
-  if (documents) {
-    documents.innerHTML = renderCatalogDocuments(state.catalogDocuments);
-  }
-}
-
-async function loadCatalogDocuments(sourceId, commit) {
-  const documents = document.querySelector("#catalog-documents");
-  if (!documents || !sourceId || !commit) {
-    return;
-  }
-  documents.innerHTML = '<div class="empty">Loading document metadata…</div>';
-  try {
-    const page = await api.listCatalogDocuments(sourceId, commit);
-    if (state.selectedCatalogSourceId !== sourceId || state.selectedCatalogCommit !== commit) {
-      return;
-    }
-    state.catalogDocuments = Array.isArray(page.items) ? page.items : [];
-    documents.innerHTML = renderCatalogDocuments(state.catalogDocuments);
-  } catch (error) {
-    documents.innerHTML = '<div class="empty">Document metadata could not be loaded. Refresh or check permissions.</div>';
-  }
-}
-
-async function loadCatalogRevisions(sourceId) {
-  const revisions = document.querySelector("#catalog-revisions");
-  const documents = document.querySelector("#catalog-documents");
-  if (!revisions || !documents || !sourceId) {
-    return;
-  }
-  revisions.innerHTML = '<div class="empty">Loading revisions…</div>';
-  documents.innerHTML = '<div class="empty">Choose a revision to load document metadata.</div>';
-  state.catalogDocuments = [];
-  try {
-    const page = await api.listCatalogRevisions(sourceId);
-    if (state.selectedCatalogSourceId !== sourceId) {
-      return;
-    }
-    state.catalogRevisions = Array.isArray(page.items) ? page.items : [];
-    const source = catalogSourceById(sourceId);
-    if (!state.catalogRevisions.some((revision) => revision.commit === state.selectedCatalogCommit)) {
-      state.selectedCatalogCommit = source?.active_commit || state.catalogRevisions[0]?.commit || "";
-    }
-    renderCatalogDetails();
-    await loadCatalogDocuments(sourceId, state.selectedCatalogCommit);
-  } catch (error) {
-    state.catalogRevisions = [];
-    state.selectedCatalogCommit = "";
-    revisions.innerHTML = '<div class="empty">Revisions could not be loaded. Refresh or check permissions.</div>';
-  }
+  render(owner.getSnapshot());
+  return {
+    setContext(next) { context = next; updateContext(); },
+    setSelection(snapshot) {
+      selected = snapshot.selectedSource ? { sourceId: snapshot.selectedSource.id,
+        commit: snapshot.selectedRevision?.commit || null, state: snapshot.selectedRevision?.state || null,
+        stale: snapshot.selectionStale, activeCommit: snapshot.selectedSource.active_commit,
+        documentPath: snapshot.selectedDocument?.path || null } : null;
+      const key = JSON.stringify([selected?.sourceId, selected?.commit]);
+      if (key !== selectionKey && selected) {
+        elements.fields.sourceId.value = selected.sourceId;
+        elements.fields.commit.value = selected.commit || "";
+      }
+      selectionKey = key; updateContext();
+    },
+    dispose() {
+      disposed = true; focusAfterConfirmation = null; owner.dispose();
+      for (const [element, type, handler] of listeners) element.removeEventListener(type, handler);
+      render(owner.getSnapshot());
+    },
+  };
 }
 
 async function loadCatalogSources() {
-  const list = document.querySelector("#catalog-list");
-  if (!list || !state.token) return;
-  list.innerHTML = '<div class="empty">Loading catalog sources…</div>';
-  try {
-    const page = await api.listCatalogSources();
-    state.catalogSources = Array.isArray(page.items) ? page.items : [];
-    if (!state.catalogSources.some((source) => source.id === state.selectedCatalogSourceId)) {
-      state.selectedCatalogSourceId = state.catalogSources[0]?.id || "";
-      state.selectedCatalogCommit = "";
-    }
-    list.innerHTML = renderCatalogSources(state.catalogSources, state.selectedCatalogSourceId);
-    if (state.selectedCatalogSourceId) {
-      await loadCatalogRevisions(state.selectedCatalogSourceId);
-    } else {
-      state.catalogRevisions = [];
-      state.catalogDocuments = [];
-      renderCatalogDetails();
-    }
-  } catch (error) {
-    list.innerHTML = '<div class="empty">Catalog could not be loaded. Refresh or check permissions.</div>';
-  }
-}
-
-async function submitCatalogAction(form, submitter) {
-  if (state.catalogActionInFlight) return;
-  const data = new FormData(form);
-  const action = submitter instanceof HTMLButtonElement ? submitter.value : "";
-  const sourceId = String(data.get("source-id") || "").trim();
-  if (!sourceId) throw new Error("Catalog source ID is required.");
-  state.catalogActionInFlight = true;
-  setCatalogActionPending(form, true);
-  setStatus(`Catalog ${action} request in progress…`);
-  try {
-    if (action === "register") {
-      const url = String(data.get("url") || "").trim();
-      const reference = String(data.get("reference") || "").trim();
-      if (!url || !reference) throw new Error("A public HTTPS URL and reference are required to register a source.");
-      await api.registerCatalogSource({ source_id: sourceId, url, reference });
-    } else if (action === "sync") {
-      const operationId = String(data.get("operation-id") || "").trim();
-      if (!operationId) throw new Error("A sync operation ID is required.");
-      await api.startCatalogSync(sourceId, { operation_id: operationId });
-    } else if (action === "activate") {
-      const commit = String(data.get("commit") || "").trim();
-      if (!commit) throw new Error("A ready revision commit is required for activation.");
-      await api.activateCatalogRevision(sourceId, { commit });
-    } else {
-      throw new Error("Choose a catalog action.");
-    }
-    state.selectedCatalogSourceId = sourceId;
-    await loadCatalogSources();
-    setStatus(`Catalog ${action} request completed.`, "ok");
-  } finally {
-    state.catalogActionInFlight = false;
-    setCatalogActionPending(form, false);
-  }
+  await catalogPanel?.refreshSources();
 }
 
 function renderPolicyList() {
@@ -1800,6 +2689,7 @@ function renderPolicyList() {
 
 function wireApprovalButtons() {
   document.querySelectorAll("[data-approve-approval-id]").forEach((button) => {
+    button.disabled = adminAccounts.getSnapshot().user?.role === "viewer";
     button.addEventListener("click", () => {
       decideApproval(button.dataset.approveApprovalId, "approve").catch((error) =>
         setStatus(error.message, "error"),
@@ -1807,6 +2697,7 @@ function wireApprovalButtons() {
     });
   });
   document.querySelectorAll("[data-reject-approval-id]").forEach((button) => {
+    button.disabled = adminAccounts.getSnapshot().user?.role === "viewer";
     button.addEventListener("click", () => {
       decideApproval(button.dataset.rejectApprovalId, "reject").catch((error) =>
         setStatus(error.message, "error"),
@@ -1950,9 +2841,10 @@ async function approveRemediationJob() {
     reason: "approved from Web Admin",
   });
   state.selectedRemediationId = response?.remediation?.id || form.remediationId;
-  state.lastJobId = response?.job_id || form.jobId;
+  const jobId = response?.job_id || form.jobId;
+  jobObservation?.select(jobId);
   document.querySelector("#remediation-result").textContent = renderRemediationActionResult(response);
-  setStatus(`Created remediation job ${state.lastJobId}.`, "ok");
+  setStatus(`Created remediation job ${jobId}.`, "ok");
   await loadApprovalsJobsAndAudit();
 }
 
@@ -1978,18 +2870,7 @@ async function decideApproval(id, action) {
   await loadApprovalsJobsAndAudit();
   const jobIdToPoll = approvalDecisionJobToPoll(action, decision);
   if (jobIdToPoll) {
-    state.lastJobId = jobIdToPoll;
-    document.querySelector("#job-output").textContent = renderJobOutputStatus(
-      {
-        id: jobIdToPoll,
-        status: "queued",
-        dispatch_state: "created",
-        target_agents: [],
-      },
-      { jobId: jobIdToPoll },
-    );
-    document.querySelector("#job-targets").innerHTML = renderJobTargetTable(null);
-    await pollJobOutput(jobIdToPoll);
+    jobObservation?.select(jobIdToPoll);
   }
 }
 
@@ -2069,7 +2950,7 @@ async function loadEnrollmentTokens() {
   document.querySelector("#enrollment-tokens-list").innerHTML = renderEnrollmentTokens(enrollmentTokens);
   document.querySelectorAll("[data-revoke-token-id]").forEach((button) => {
     button.addEventListener("click", () => {
-      revokeEnrollmentToken(button.dataset.revokeTokenId).catch((error) => setStatus(error.message, "error"));
+      revokeEnrollmentToken(button.dataset.revokeTokenId).catch(showUiError);
     });
   });
 }
@@ -2171,27 +3052,16 @@ async function submitCommand(form) {
     args: data.get("args"),
     confirmed: data.get("confirm-risk") === "on",
   });
-  const response = await api.createCommandJob(request);
-  state.lastJobId = response.job_id;
+  const response = await directSubmissions.command.submit(request);
+  if (!response) return;
+  jobObservation?.select(response.job_id);
   const pendingApproval = response.status === "pending_approval" || response.approval_request_id;
-  document.querySelector("#job-output").textContent = renderJobOutputStatus(
-    {
-      id: response.job_id,
-      status: pendingApproval ? "pending_approval" : "queued",
-      dispatch_state: pendingApproval ? "created" : "created",
-      target_count: response.target_count,
-      target_agents: [],
-    },
-    { jobId: response.job_id },
-  );
-  document.querySelector("#job-targets").innerHTML = renderJobTargetTable(null);
   if (pendingApproval) {
     setStatus(`Created ${response.job_id}; approval ${response.approval_request_id} is required.`, "ok");
     await loadApprovalsJobsAndAudit();
     return;
   }
   setStatus(`Created ${response.job_id} for ${response.target_count} target.`, "ok");
-  await pollJobOutput(response.job_id);
 }
 
 async function submitRunbook(form) {
@@ -2208,77 +3078,16 @@ async function submitRunbook(form) {
     document: data.get("runbook-document"),
     confirmed: data.get("confirm-risk") === "on",
   });
-  const response = await api.createRunbookJob(request);
-  state.lastJobId = response.job_id;
+  const response = await directSubmissions.runbook.submit(request);
+  if (!response) return;
+  jobObservation?.select(response.job_id);
   const pendingApproval = response.status === "pending_approval" || response.approval_request_id;
   const statusText = pendingApproval
     ? `Runbook job ${response.job_id} requires approval ${response.approval_request_id}.`
     : `Runbook job ${response.job_id} created.`;
   document.querySelector("#runbook-result").textContent = statusText;
-  document.querySelector("#job-output").textContent = renderJobOutputStatus(
-    {
-      id: response.job_id,
-      status: pendingApproval ? "pending_approval" : "queued",
-      dispatch_state: "created",
-      target_count: response.target_count,
-      target_agents: [],
-    },
-    { jobId: response.job_id },
-  );
   setStatus(statusText, "ok");
   await loadApprovalsJobsAndAudit();
-  if (!pendingApproval) {
-    await pollJobOutput(response.job_id);
-  }
-}
-
-async function pollJobOutput(jobId) {
-  const outputElement = document.querySelector("#job-output");
-  const targetElement = document.querySelector("#job-targets");
-  const artifactElement = document.querySelector("#job-artifacts");
-  for (let attempt = 1; attempt <= JOB_OUTPUT_POLL_ATTEMPTS; attempt += 1) {
-    const [job, chunks] = await Promise.all([api.getJob(jobId), api.getJobOutput(jobId)]);
-    if (targetElement) {
-      targetElement.innerHTML = renderJobTargetTable(job);
-    }
-    if (artifactElement) {
-      artifactElement.innerHTML = renderJobArtifacts(job);
-    }
-    if (Array.isArray(chunks) && chunks.length > 0) {
-      outputElement.textContent = renderJobOutput(chunks, { jobId, job });
-      if (isTerminalJob(job)) {
-        return;
-      }
-    } else {
-      outputElement.textContent = renderJobOutputStatus(job || { id: jobId }, {
-        jobId,
-        attempt,
-        maxAttempts: JOB_OUTPUT_POLL_ATTEMPTS,
-      });
-      if (isTerminalJob(job) || isApprovalPendingJob(job)) {
-        return;
-      }
-    }
-    if (attempt < JOB_OUTPUT_POLL_ATTEMPTS) {
-      await new Promise((resolve) => setTimeout(resolve, JOB_OUTPUT_POLL_INTERVAL_MS));
-    }
-  }
-  const [job, chunks] = await Promise.all([api.getJob(jobId), api.getJobOutput(jobId)]);
-  if (targetElement) {
-    targetElement.innerHTML = renderJobTargetTable(job);
-  }
-  if (artifactElement) {
-    artifactElement.innerHTML = renderJobArtifacts(job);
-  }
-  outputElement.textContent =
-    Array.isArray(chunks) && chunks.length > 0
-      ? renderJobOutput(chunks, { jobId, job })
-      : renderJobOutputStatus(job || { id: jobId }, {
-          jobId,
-          attempt: JOB_OUTPUT_POLL_ATTEMPTS,
-          maxAttempts: JOB_OUTPUT_POLL_ATTEMPTS,
-          paused: !isTerminalJob(job),
-        });
 }
 
 export async function pollJobOutputOnce(apiClient, jobId) {
@@ -2316,30 +3125,33 @@ async function handleJobArtifactClick(event) {
     return;
   }
   const artifactId = button.dataset.artifactId || "";
-  const jobId = button.dataset.artifactJobId || state.lastJobId || "";
+  const jobId = button.dataset.artifactJobId || jobObservation?.getJobId() || "";
   if (!artifactId || !jobId) {
     return;
   }
-  const outputElement = document.querySelector("#job-output");
-  if (outputElement) {
-    outputElement.textContent = `Loading artifact ${artifactId}.`;
-  }
-  try {
-    const artifact = await api.getJobArtifact(jobId, artifactId);
-    if (outputElement) {
-      outputElement.textContent = renderArtifactBody(artifact);
-    }
-  } catch (error) {
-    if (outputElement) {
-      outputElement.textContent = `Could not load artifact ${artifactId}. ${error.message}`;
-    }
-    setStatus(error.message, "error");
-  }
+  await jobObservation?.showArtifact(jobId, artifactId);
 }
 
 function boot() {
+  wireAccountForms();
+  void restoreAdminSession();
   applyAdminRoute();
-  globalThis.addEventListener?.("hashchange", () => applyAdminRoute({ focus: true }));
+  globalThis.addEventListener?.("hashchange", () => { applyAdminRoute({ focus: true }); onAccountState(adminAccounts.getSnapshot()); if(currentAdminRoute() === "settings") void refreshAccountMetadata(); });
+  globalThis.addEventListener?.("pagehide", () => {
+    adminAccounts.suspend();
+    for (const submission of Object.values(directSubmissions)) submission.setContext({ authenticated: false, authGeneration: api.getAuthGeneration() });
+    jobObservation?.setContext(adminViewContext(""));
+    void catalogPanel?.setContext(adminViewContext(""));
+  });
+  globalThis.addEventListener?.("pageshow", event => {
+    applyAdminRoute(); onAccountState(adminAccounts.getSnapshot());
+    if (event.persisted) void restoreAdminSession();
+  });
+  for (const [kind, submission] of Object.entries(directSubmissions)) {
+    document.querySelector("#" + kind + "-check-submission")?.addEventListener("click", () => {
+      void submission.check().then(job => { if (job) jobObservation?.select(job.id); });
+    });
+  }
   const form = document.querySelector("#admin-auth");
   if (!form) {
     return;
@@ -2348,19 +3160,36 @@ function boot() {
   if (warning && globalThis.location?.protocol === "http:") {
     warning.hidden = false;
   }
+  const transport = document.querySelector(".transport-chip");
+  if (transport) {
+    transport.textContent = globalThis.location?.protocol === "https:" ? "HTTPS" : "HTTP · test only";
+    transport.dataset.secure = String(globalThis.location?.protocol === "https:");
+  }
   document.querySelector("#job-artifacts")?.addEventListener("click", (event) => {
-    handleJobArtifactClick(event).catch((error) => setStatus(error.message, "error"));
+    handleJobArtifactClick(event).catch(showUiError);
   });
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    state.token = readAdminTokenInput();
-    refreshAll().catch((error) => setStatus(error.message, "error"));
+    setAdminToken(readAdminTokenInput());
+    refreshAll().catch(showUiError);
+  });
+  document.querySelector("#clear-admin-token")?.addEventListener("click", () => {
+    setAdminToken("");
+    document.querySelector("#admin-token").value = "";
+    setStatus("Admin token cleared. Job observation stopped; running jobs are not canceled.");
+  });
+  document.querySelector("#admin-token")?.addEventListener("input", () => {
+    if (state.token && readAdminTokenInput() !== state.token) setAdminToken("");
+  });
+  document.querySelector("#jobs-list")?.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("[data-job-id]");
+    if (button?.dataset?.jobId) jobObservation?.select(button.dataset.jobId);
   });
   const runForm = document.querySelector("#run-command-form");
   if (runForm) {
     runForm.addEventListener("submit", (event) => {
       event.preventDefault();
-      submitCommand(runForm).catch((error) => setStatus(error.message, "error"));
+      submitCommand(runForm).catch(showUiError);
     });
     document.querySelector("#preview-command-targets")?.addEventListener("click", () => {
       const data = new FormData(runForm);
@@ -2371,14 +3200,14 @@ function boot() {
             "ok",
           );
         })
-        .catch((error) => setStatus(error.message, "error"));
+        .catch(showUiError);
     });
   }
   const runbookForm = document.querySelector("#runbook-form");
   if (runbookForm) {
     runbookForm.addEventListener("submit", (event) => {
       event.preventDefault();
-      submitRunbook(runbookForm).catch((error) => setStatus(error.message, "error"));
+      submitRunbook(runbookForm).catch(showUiError);
     });
     document.querySelector("#preview-runbook-targets")?.addEventListener("click", () => {
       const data = new FormData(runbookForm);
@@ -2389,14 +3218,14 @@ function boot() {
             "ok",
           );
         })
-        .catch((error) => setStatus(error.message, "error"));
+        .catch(showUiError);
     });
   }
   const policyForm = document.querySelector("#policy-form");
   if (policyForm) {
     policyForm.addEventListener("submit", (event) => {
       event.preventDefault();
-      submitPolicy(policyForm).catch((error) => setStatus(error.message, "error"));
+      submitPolicy(policyForm).catch(showUiError);
     });
   }
   const agentsList = document.querySelector("#agents-list");
@@ -2415,14 +3244,14 @@ function boot() {
     });
   }
   document.querySelector("#revoke-agent-key")?.addEventListener("click", () => {
-    revokeSelectedAgentKey().catch((error) => setStatus(error.message, "error"));
+    revokeSelectedAgentKey().catch(showUiError);
   });
   document.querySelector("#refresh-signing-rotation")?.addEventListener("click", () => {
     try {
       syncAdminTokenFromInput({ requireToken: true });
       loadSigningRotationStatus()
         .then(() => setStatus("Refreshed controller signing status.", "ok"))
-        .catch((error) => setStatus(error.message, "error"));
+        .catch(showUiError);
     } catch (error) {
       setStatus(error.message, "error");
     }
@@ -2431,48 +3260,20 @@ function boot() {
   if (stagedTrustBundleForm) {
     stagedTrustBundleForm.addEventListener("submit", (event) => {
       event.preventDefault();
-      submitStagedTrustBundle(stagedTrustBundleForm).catch((error) => setStatus(error.message, "error"));
+      submitStagedTrustBundle(stagedTrustBundleForm).catch(showUiError);
     });
   }
   document.querySelector("#expire-approvals")?.addEventListener("click", () => {
-    expireDueApprovals().catch((error) => setStatus(error.message, "error"));
+    expireDueApprovals().catch(showUiError);
   });
   document.querySelector("#refresh-catalog")?.addEventListener("click", () => {
-    loadCatalogSources().catch((error) => setStatus(error.message, "error"));
+    loadCatalogSources().catch(showUiError);
   });
-  document.querySelector("#catalog-list")?.addEventListener("click", (event) => {
-    const button = event.target?.closest?.("[data-catalog-source-id]");
-    if (!(button instanceof HTMLButtonElement)) return;
-    state.selectedCatalogSourceId = button.dataset.catalogSourceId || "";
-    state.selectedCatalogCommit = "";
-    document.querySelector("#catalog-list").innerHTML = renderCatalogSources(
-      state.catalogSources,
-      state.selectedCatalogSourceId,
-    );
-    loadCatalogRevisions(state.selectedCatalogSourceId).catch((error) => setStatus(error.message, "error"));
-  });
-  document.querySelector("#catalog-revisions")?.addEventListener("click", (event) => {
-    const button = event.target?.closest?.("[data-catalog-commit]");
-    if (!(button instanceof HTMLButtonElement) || !state.selectedCatalogSourceId) return;
-    state.selectedCatalogCommit = button.dataset.catalogCommit || "";
-    renderCatalogDetails();
-    loadCatalogDocuments(state.selectedCatalogSourceId, state.selectedCatalogCommit).catch((error) =>
-      setStatus(error.message, "error"),
-    );
-  });
-  const catalogActionForm = document.querySelector("#catalog-action-form");
-  if (catalogActionForm instanceof HTMLFormElement) {
-    catalogActionForm.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const submitter = event.submitter instanceof HTMLButtonElement ? event.submitter : null;
-      submitCatalogAction(catalogActionForm, submitter).catch((error) => setStatus(error.message, "error"));
-    });
-  }
   document.querySelector("#refresh-audit")?.addEventListener("click", () => {
-    loadAuditPage().catch((error) => setStatus(error.message, "error"));
+    loadAuditPage().catch(showUiError);
   });
   document.querySelector("#load-more-audit")?.addEventListener("click", () => {
-    loadAuditPage({ append: true }).catch((error) => setStatus(error.message, "error"));
+    loadAuditPage({ append: true }).catch(showUiError);
   });
   document.querySelector("#remediations-list")?.addEventListener("click", (event) => {
     const button = event.target?.closest?.("[data-remediation-id]");
@@ -2486,25 +3287,25 @@ function boot() {
   document.querySelector("#refresh-remediations")?.addEventListener("click", () => {
     loadRemediations()
       .then(() => setStatus("Refreshed remediation requests.", "ok"))
-      .catch((error) => setStatus(error.message, "error"));
+      .catch(showUiError);
   });
   document.querySelector("#request-remediation-approval")?.addEventListener("click", () => {
-    requestRemediationApproval().catch((error) => setStatus(error.message, "error"));
+    requestRemediationApproval().catch(showUiError);
   });
   document.querySelector("#approve-remediation")?.addEventListener("click", () => {
-    approveRemediationJob().catch((error) => setStatus(error.message, "error"));
+    approveRemediationJob().catch(showUiError);
   });
   document.querySelector("#assign-policy")?.addEventListener("click", () => {
-    assignSelectedPolicy().catch((error) => setStatus(error.message, "error"));
+    assignSelectedPolicy().catch(showUiError);
   });
   document.querySelector("#schedule-policy")?.addEventListener("click", () => {
-    scheduleSelectedPolicy().catch((error) => setStatus(error.message, "error"));
+    scheduleSelectedPolicy().catch(showUiError);
   });
   document.querySelector("#metrics-range")?.addEventListener("change", (event) => {
     const value = Number.parseInt(event.target?.value || "", 10);
     state.metricsWindowMs = Number.isInteger(value) && value > 0 ? value : DEFAULT_TELEMETRY_WINDOW_MS;
     if (state.selectedAgentId) {
-      refreshSelectedAgent().catch((error) => setStatus(error.message, "error"));
+      refreshSelectedAgent().catch(showUiError);
     }
   });
   document.querySelector("#refresh-telemetry")?.addEventListener("click", () => {
@@ -2516,7 +3317,7 @@ function boot() {
       setStatus(`Refreshing telemetry for ${state.selectedAgentId}...`);
       refreshSelectedAgent()
         .then(() => setStatus(`Refreshed telemetry for ${state.selectedAgentId}.`, "ok"))
-        .catch((error) => setStatus(error.message, "error"));
+        .catch(showUiError);
     } catch (error) {
       setStatus(error.message, "error");
     }
@@ -2525,7 +3326,7 @@ function boot() {
   if (enrollmentForm) {
     enrollmentForm.addEventListener("submit", (event) => {
       event.preventDefault();
-      submitEnrollmentToken(enrollmentForm).catch((error) => setStatus(error.message, "error"));
+      submitEnrollmentToken(enrollmentForm).catch(showUiError);
     });
   }
 }

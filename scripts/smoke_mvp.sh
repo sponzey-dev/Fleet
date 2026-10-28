@@ -28,7 +28,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 INIT_OUTPUT="$("$BIN" controller init --data-dir "$WORK_DIR")"
-printf '%s\n' "$INIT_OUTPUT"
+printf '%s\n' "$INIT_OUTPUT" | sed '/^admin token:/d'
 ADMIN_TOKEN="$(printf '%s\n' "$INIT_OUTPUT" | sed -n 's/^admin token: //p')"
 
 "./scripts/run_controller.sh" \

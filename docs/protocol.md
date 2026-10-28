@@ -8,7 +8,7 @@ Sponzey Fleet agent-controller protocol은 JSON wire message를 사용한다. Ru
 
 ```json
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "message_id": "msg-1",
   "correlation_id": "corr-1",
   "agent_id": "agent-1",
@@ -25,10 +25,12 @@ Sponzey Fleet agent-controller protocol은 JSON wire message를 사용한다. Ru
 
 필수 규칙:
 
-- `protocol_version`은 현재 `1`이다.
+- `protocol_version`은 현재 `2`다. 다른 버전은 payload 해석 전에 거부한다.
+- v1과의 호환 fallback 또는 협상은 없다. Controller와 모든 Agent는 같은 릴리스의 v2를 사용해야 한다.
 - version mismatch는 reject한다.
 - unknown message type은 reject한다.
 - malformed JSON은 reject한다.
+- JSON wire message는 최대 8 MiB이며, `task_report` body는 base64 decode 후 최대 4 MiB다.
 - `message_id`는 message 단위 식별자다.
 - `correlation_id`는 request-response 또는 task-output 흐름을 묶는다.
 - `agent_id`는 enrollment 이전 message에서는 없을 수 있다.
@@ -45,6 +47,7 @@ Sponzey Fleet agent-controller protocol은 JSON wire message를 사용한다. Ru
 - `auth_response`
 - `auth_accepted`
 - `heartbeat`
+- `task_report` and `report_receipt` (v2 reporting path)
 
 예:
 
@@ -56,6 +59,23 @@ Sponzey Fleet agent-controller protocol은 JSON wire message를 사용한다. Ru
   }
 }
 ```
+
+인증 성공 응답은 Controller의 영속 delivery identity를 포함한다.
+
+```json
+{
+  "type": "auth_accepted",
+  "payload": {
+    "controller_namespace": "<64 lowercase hex characters>",
+    "store_epoch": "<64 lowercase hex characters>"
+  }
+}
+```
+
+Agent는 응답의 Agent ID와 correlation ID가 현재 handshake와 일치하고 두 identity 값이
+64자리 소문자 hex인지 확인한다. persistent Agent runtime은 Controller namespace와 Agent ID를
+local journal owner에 바인딩한다. 현재 handshake의 epoch는 receipt 검증에 사용하며, receipt만으로
+정확한 pending report 일치와 서명 검증을 건너뛸 수는 없다.
 
 ## WebSocket Gateway
 
@@ -71,14 +91,40 @@ ws://127.0.0.1:7700/api/agents/ws
 2. Controller loads the enrolled agent public key and verifies the fingerprint.
 3. Controller sends `auth_challenge` with nonce.
 4. Agent signs the nonce with its local Ed25519 private key and sends `auth_response`.
-5. Controller sends `auth_accepted`.
+5. Controller sends `auth_accepted` with its durable delivery namespace and store epoch. The persistent Agent binds the journal to the namespace and Agent ID, and uses the accepted epoch as the current receipt-verification boundary.
 6. Controller registers the authenticated persistent session.
 7. Controller drains at most one pending assignment for the agent immediately after session registration.
 8. Agent sends periodic `heartbeat` liveness ticks on the same session.
+   Each matching authenticated heartbeat refreshes stored inventory liveness using Controller
+   receipt time, without clearing degraded health or emitting an unexpected-message audit.
+   A mismatched payload Agent ID cannot refresh another Agent.
    Facts, metrics, and operational log chunks use separate agent-side intervals.
 9. New command, drift-check, or runbook jobs are stored first, then dispatched immediately to active sessions.
-10. Agent verifies the signed envelope and executes the command, drift check, or runbook task.
-11. Agent sends `output_chunk` messages and one `task_result`.
+10. Agent verifies the signed envelope. For persistent Command and no-artifact Runbook, nonce/target/expiry
+    checks precede durable execution admission; `StartIntent` and output sequence progress commit before
+    TaskAck/TaskStarted and host effects. After process restart or prior task-owner exit, an interrupted
+    execution becomes a typed failed final report with its committed stream counts, never a rerun.
+    Reconnect during a live task skips recovery; idle reconnect retries it. Artifact-producing Runbook,
+    DriftCheck execution recovery, and direct one-shot execution remain on separate paths.
+11. For persistent sessions, the CLI Agent commits `task_ack` and then `task_started` Lifecycle
+    reports (stable report ids `task-ack` and `task-started`) to its local journal before sending
+    either. TaskStarted is committed before Command child execution or Runbook/Drift execution.
+    Lifecycle reports are ordered by stable report key, so TaskAck precedes TaskStarted, then
+    TaskRejected; lifecycle reports precede Output and FinalResult reports. The Controller checks the authenticated Agent and stored
+    Assignment owner, then atomically commits `dispatched -> accepted`, `accepted -> started`, or
+    the pre-execution `dispatched -> rejected` transition, the
+    Job aggregate, one Job audit event, and the inbox marker before returning a signed `stored`
+    receipt. When the started Assignment belongs to a remediation runbook, its `job_created -> running`
+    transition and Policy audit share that same transaction.
+    The Agent replays pending reports after reconnect and removes each only after verifying its exact
+    signed receipt in the current authenticated session. Persistent DriftCheck evidence uses a strict
+    `drift_evidence` report; its terminal TaskResult is a separate strict `final_result` report on the
+    same journal/receipt path. The evidence receipt confirms stored evidence only; the final-result
+    effect is what transitions the Assignment/Job. Persistent Command and no-artifact Runbook
+    stdout/stderr and no-artifact Command/Runbook final results use the same Agent journal/receipt path.
+    Artifact-bearing Runbook finals use the authenticated Controller v2 effect/receipt path but are
+    not Agent-journaled. Direct one-shot `agent heartbeat --once`, artifact-producing Runbook output
+    replay, and Drift execution recovery remain outside their corresponding durable paths.
 
 ### Current WebSocket lifecycle
 
@@ -86,6 +132,7 @@ ws://127.0.0.1:7700/api/agents/ws
 
 - Agent가 Controller로 outbound WebSocket을 연다.
 - 인증이 끝난 뒤 Agent가 heartbeat를 보낸다.
+- v2만 지원하며 v1 Agent는 즉시 version mismatch로 거부된다. Controller와 모든 Agent는 함께 업그레이드해야 한다.
 - Controller는 인증된 session을 runtime registry에 등록한다.
 - session 등록 직후 해당 agent의 pending assignment를 최대 1개 drain한다.
 - `POST /api/jobs/command`, `POST /api/jobs/runbook`, `POST /api/jobs/drift-check`는 job과 assignment를 DB에 저장한 뒤 active session으로 즉시 dispatch를 시도한다.
@@ -103,7 +150,7 @@ Controller session implementation note:
 - session당 WebSocket writer는 하나의 writer loop만 소유한다.
 - Controller 내부 producer는 bounded outbound channel로 `task_assignment` 같은 `WireMessage`를 전달한다.
 - outbound queue overflow는 write queue overflow로 구분되며, dispatch 계층에서는 DB queued assignment를 source of truth로 유지해야 한다.
-- read loop가 처리하는 heartbeat, facts, metrics, log, output, task result, drift, security event는 authenticated session agent id와 payload agent id를 비교한다.
+- read loop는 기존 heartbeat, facts, metrics, log, `output_chunk`, task lifecycle, drift, security event와 v2 `task_report`를 처리한다. 일반 payload는 authenticated session agent id와 payload agent id를 비교하고, v2 report는 authenticated owner를 inbox admission에서 확인한다.
 - agent id mismatch payload는 저장하지 않고 security audit 대상으로 처리한다.
 - DB write failure는 message만 조용히 무시하지 않고 `store_error` close reason으로 session cleanup 대상이 된다.
 - raw command output은 일반 product log로 흘리지 않고 job output storage에만 저장한다.
@@ -111,11 +158,15 @@ Controller session implementation note:
 - output chunk는 bounded runner output limit과 chunk sequence를 유지한다.
 - 같은 `(job_id, agent_id, stream, sequence)` output chunk가 같은 body로 다시 오면 idempotent duplicate로 보고 무시한다.
 - 같은 key의 output chunk가 다른 body로 오면 raw body를 audit/log에 남기지 않고 `websocket_output_chunk_conflict` security audit를 남긴 뒤 protocol error로 session cleanup 대상이 된다.
-- controller connection drop만으로 `running` job을 즉시 `failed`로 바꾸지 않는다. task result가 없으면 기존 expiry/reconciler 정책이 최종 상태를 결정한다.
+- controller connection drop만으로 `running` job을 즉시 `failed`로 바꾸지 않는다. 현재 dispatch의 expiry 검사는 queued assignment에만 적용되며, Agent가 돌아오지 않는 dispatched/accepted/started assignment를 일반적으로 수렴시키는 worker는 없다. Agent의 timeout result와 remediation verification recovery는 이 누락을 대신하지 않는다.
 - Agent key revoke 성공 직후 controller는 active session이 있으면 `agent_revoked` close reason으로 writer loop에 close를 enqueue하고 registry에서 제거한다.
 - Revoke는 추가 task 수신 차단과 session 종료를 보장한다. 특정 job을 중단하려면 revoke가 아니라 `POST /api/jobs/{job_id}/cancel`을 사용한다.
 - Cancel API는 queued assignment를 DB에서 terminal `canceled`로 바꾸고, 이미 `dispatched`, `accepted`, `started` 상태인 active session에는 `task_cancel`을 보낸다.
 - Agent는 `task_cancel`이 현재 실행 중인 task id와 일치하면 cancel flag를 설정하고, command runner는 child process를 kill한 뒤 `task_result.status = "canceled"`를 돌려보낸다.
+- Darwin/Linux command runner는 실행별 process group을 소유하며 출력 callback 실패·cancel·timeout 때 정리한다.
+  종료를 관찰할 때 leader를 먼저 reap하지 않아 group 정리 전 PID 재사용을 피한다. 출력은 poll로 제한된 크기만 읽으며,
+  후손이 pipe를 유지해도 cancel/timeout 확인을 막는 reader join이나 무한 메모리 queue를 만들지 않는다.
+  이 정리는 이미 일어난 host 변경을 되돌리거나 별도 session/group으로 이탈한 daemon을 제어하는 보장이 아니다.
 - session lifecycle audit action은 `agent_session_started`, `agent_session_ended`, `agent_session_replaced`, `agent_session_revoked_closed`, `agent_session_auth_failed`를 사용한다.
 
 ## Controller Identity And Fingerprints
@@ -377,9 +428,9 @@ Drift report does not carry an arbitrary JSON body, so controller uses the agent
 
 When an agent executes a signed `drift_check` assignment, its `drift_report`
 payload includes optional `job_id` and `task_id` values copied from that signed
-task envelope. Both fields are omitted for older agents and uncorrelated
-observation reports; omission keeps the v1 wire form decodable and does not
-change `protocol_version`.
+task envelope. Both fields are omitted for uncorrelated observation reports;
+the current v2 payload contract permits that omission without changing
+`protocol_version`.
 
 These values are correlation claims, not execution authority. The controller
 must still authenticate the agent session and match the values to its persisted
@@ -506,7 +557,172 @@ MVP agent는 agent data directory의 local file-backed nonce replay store를 사
 
 ## Assignment Lifecycle, Output, and Result
 
-WebSocket write 성공은 agent가 task를 수락하거나 실행했다는 뜻이 아니다. Controller는 dispatch write 성공 시 assignment를 `dispatched`로만 저장한다.
+### Active v2 output report and stored-report receipt
+
+`task_report` and `report_receipt` are payloads in the active v2 `WireMessage` session envelope.
+A report carries a stable Controller/Agent/Job/Task/report key, class (`lifecycle`,
+`drift_evidence`, `output`, `final_result`), lowercase SHA-256 of its exact decoded body, and a nonempty base64 body limited
+to 4 MiB. The whole JSON message is limited to 8 MiB. Encoding/decoding checks required identity
+fields, matching outer Agent ID, body encoding, digest, and receipt shape. v1 is rejected before
+payload parsing; there is no compatibility fallback.
+
+The authenticated Controller WebSocket handles `lifecycle` TaskAck/TaskStarted/TaskRejected,
+`drift_evidence`, `output`, and a limited `final_result` subset on SQLite. Supported lifecycle bodies are strict
+`{"event":"task_ack"}`, `{"event":"task_started"}`, and
+`{"event":"task_rejected","reason_code":"invalid_signature","reason":"..."}`, with stable report ids
+`task-ack`, `task-started`, and `task-rejected`. It verifies the authenticated Agent and stored Assignment owner, then atomically
+commits TaskAck's `dispatched -> accepted`, TaskStarted's `accepted -> started`, or TaskRejected's
+`dispatched -> rejected` transition, the Job aggregate, one redacted Job audit, and the inbox marker.
+TaskRejected stores the typed reason code plus redacted reason on the Assignment. Exact retries replay
+the same receipt without another transition or audit; terminal rows and mismatched owners fail closed. Output reports use the strict `{stream, sequence, data}` body and
+atomically commit the output chunk with the inbox marker. A final result requires strict
+`{exit_code, status, reason, artifacts, output}` fields and an `output` summary containing
+`stdout_chunks`, `stderr_chunks`, and `truncated`; there is no older-body fallback. Command,
+no-artifact Runbook, and artifact-bearing persistent Runbook finals are supported. Artifact metadata
+is validated before staging; an included body must match its declared size and SHA-256 and fit the
+body limit. Metadata-only artifacts remain valid, but do not imply that a body is retrievable.
+For persistent Command and no-artifact Runbook jobs, the Controller verifies each stored stream is exactly the contiguous sequence
+`[0, count)` before it commits final effects or issues a receipt. Missing, gapped, or extra chunks
+leave the final inbox report pending for retry. A truncated result cannot be reported as
+succeeded. Its Job audit records only the two counts and truncation flag, never output bytes. This
+barrier proves delivery of the Agent-journaled chunk prefix, not that every byte produced by task
+execution was captured. The Controller atomically commits the Assignment status, Job aggregate,
+artifact metadata, redacted Job audit and inbox marker. Included artifact bodies are first written
+to the immutable local artifact store; an identical retry is safe if the later SQLite transaction
+fails. Filesystem publication and SQLite are not one atomic transaction, so an unreferenced object
+can remain after a failed/abandoned effect. Unsupported follow-up effects fail closed without a
+receipt. For every supported class, the
+Controller verifies the report key against the authenticated Agent and current Controller
+namespace, stages the exact encoded body and digest, then signs and persists a `stored` receipt only
+after the effect commits. It enqueues the stored receipt to the existing bounded, single-writer
+session queue. A retry with the same key/body replays the exact persisted receipt without duplicating
+effects. A changed body for the same key is audited as a conflict and receives no receipt. Owner
+mismatch is also Security-audited and fails closed. Postgres report handling is currently unsupported
+and fails closed.
+
+Persistent DriftCheck uses a strict `drift_evidence` body with only `status`, `expected`, and `actual`;
+policy identity, version, purpose, and ownership are read from Controller-stored Job/Assignment data.
+The Agent commits the exact report to its local SQLite journal before send and retains it until the
+current-session signed `stored` receipt is verified. The Controller commits correlated drift evidence,
+its required redacted audit, an eligible remediation proposal and its audit when applicable, and the
+inbox marker in one SQLite transaction. Exact retries replay the receipt; changed bytes, owner mismatch,
+or provenance mismatch fail closed. This evidence receipt confirms only the evidence and required
+effects were stored: it does not mark the Job/Assignment successful or replace the separate `TaskResult`.
+
+The persistent CLI Agent uses this live path for TaskAck, TaskStarted, and TaskRejected on Command, Runbook, and
+Drift assignments, DriftCheck evidence, Command/no-artifact Runbook stdout/stderr chunks, no-artifact
+Command/Runbook finals, and artifact-bearing Runbook finals:
+it commits each exact body and stable report key to its local
+journal before send, then retries pending rows after reconnect. The WebSocket envelope receives a
+fresh message/correlation identity per session; the report key and body remain stable. Persistent-task
+summary counts advance only after the local journal confirms each output append; if an append result
+is uncertain, the Agent does not guess the count or append a final report. The Agent
+checks receipt session identity, current namespace and epoch, exact pending report identity/digest,
+signing time and pinned/rotated Controller Ed25519 trust before submitting journal cleanup for
+journaled reports. Artifact-producing Runbook output and final reports are intentionally ephemeral:
+the final uses a strict v2 `FinalResult` report, but neither its bytes nor its receipt are retained
+by the Agent journal. Therefore a disconnect before Controller inbox staging can lose that report;
+the Controller receipt confirms a committed effect but does not create Agent-side replay. A pending
+Controller inbox row remains available for an exact report retry, but automatic pending-row recovery
+is not implemented. The direct one-shot `agent heartbeat --once` handler remains on its separate
+legacy `TaskResult` path.
+Persistent DriftCheck evidence and terminal TaskResult are now distinct journaled v2 reports: evidence
+does not complete the Assignment, while its final-result report applies the terminal effect. Lifecycle
+events other than TaskAck, TaskStarted, and TaskRejected, artifact/follow-up effects, rejected-receipt
+disposition UX, and Drift execution recovery remain unsupported.
+
+`fleet-protocol::receipt` now defines a signed receipt statement shape and canonical signing
+preimage. Its domain-separated `fleet:report-receipt:v2:` prefix and byte-length-framed fields bind
+the stable Controller namespace, Controller store epoch, Agent/Job/Task/report identity, lowercase
+SHA-256 digest, signing time, disposition (`stored` or typed `rejected` reason), and signing-key fingerprint.
+The signature is a separate lowercase Ed25519 hex field. A malformed field is rejected before
+signing/verification. The active session codec validates receipt shape and outer Agent ownership;
+the persistent Agent session additionally verifies Ed25519 against pinned/rotated Controller signing
+trust, the accepted namespace/epoch and exact pending report before ACK cleanup. Only a committed
+`stored` disposition can authorize cleanup. A `rejected` disposition fails closed and retains the
+report; explicit conflict handling remains future work. Namespace/epoch persist in Controller
+schema v23 and actual restore rotates the epoch. Namespace and Agent ID bind the local journal owner;
+the current authenticated epoch is used for receipt verification. This does not recover output already
+confirmed and deleted after a Controller backup snapshot. A still-pending exact journal report can be
+replayed after restore: the Controller rechecks its authenticated owner and digest, avoids repeating a
+committed effect, and issues a receipt bound to the current epoch. A prior-epoch receipt cannot clean
+the Agent journal; a missing owner or assignment is not ACKed. This is not recovery for reports already
+deleted by Agent ACK cleanup before the restored snapshot was taken.
+
+The Controller Application layer now has a separate incoming-report admission contract: the
+authenticated Agent ID and local namespace must match the report key and the encoded body must
+fit a caller-supplied limit before repository staging. Its typed `pending effects`, duplicate,
+conflict and capacity outcomes are not themselves signed storage ACKs. SQLite staging and TaskAck/
+TaskStarted effect handling are connected for the live `lifecycle` class, correlated evidence and
+eligible proposal effects for `drift_evidence`, output effects for `output`, and supported Command,
+Runbook, and DriftCheck final-result effects for `final_result`. Artifact-bearing Runbook final reports
+stage validated artifact bodies in the local immutable store and atomically commit artifact metadata,
+Assignment/Job/audit effects, and the inbox marker in SQLite. Prepared remediation final-result
+follow-up remains unconnected.
+Persistent Command and no-artifact Runbook final reports
+now verify exact contiguous stored output prefixes; this does not prove every task-execution byte was
+captured. Persistent DriftCheck evidence and its terminal final result use separate durable reports;
+artifact-producing Runbook output remains outside the Agent journal. A bounded SQLite recovery read
+can retrieve pending final-result bytes after reopen, verifying digest and Assignment ownership.
+Controller startup and the periodic worker use this read to apply supported effects; receipt
+authority follows the committed transaction and signed receipt persistence. Optional artifact-body
+puts occur before that DB transaction and are idempotent on exact retry. Output gaps, unsupported
+effects, terminal Assignments, and corrupt rows fail closed and remain pending. There is no Agent
+journal replay for an artifact-bearing Runbook report, so a pre-inbox disconnect remains unrecoverable.
+File-only orphans can remain after a failed/abandoned effect.
+Prepared remediation execution status and audit share the transaction, leaving a
+durable `succeeded_pending_verify` recovery intent for the existing bounded verification worker.
+Drift-check verification final Assignment/Job/audit/inbox effects now commit atomically as a
+separate library path. The live `drift_evidence` report commits its correlated drift row, redacted audit,
+eligible proposal effects, and inbox marker after exact bytes, authenticated Agent/Assignment, and
+stored policy provenance checks. A final result and evidence can arrive in either order; duplicates
+create no new effects. Neither report alone resolves remediation. If both effects are committed, a bounded Controller
+startup scan now joins the persisted successful final and fresh compliant evidence through the
+existing resolution use case. It does not recover still-pending inbox bodies or retry periodically;
+prepared artifact effects for persistent Runbook finals are live, while remediation final-result
+follow-up remains outside the v2 report handler.
+
+The Controller now has a separate stored-receipt issuance helper. It accepts only `Committed` or
+`AlreadyCommitted` inbox-effect outcomes, binds the resulting digest to the current durable
+namespace/epoch and authenticated Agent ID supplied by its caller, checks the signing public/
+private key pair and fingerprint, then signs the v2 statement. Pending/conflicting/not-staged
+outcomes cannot produce a stored receipt. The authenticated TaskAck/TaskStarted/TaskRejected, DriftEvidence, output, and supported final-result
+handlers call this helper only after their SQLite effect commits. The helper cannot itself authenticate its caller or
+prove that a caller-provided outcome came from a committed DB result; rejected-disposition
+persistence remains separate work.
+An Application receipt port and SQLite schema v25 now persist signed bytes only after the exact inbox
+row is committed. Same-signer duplicate reports replay identical bytes across Controller reopen. If
+the active Controller signing key changed before Agent ACK cleanup, an exact committed report may
+replace the receipt row with a newly signed current-key receipt without repeating its effect. The
+Controller helper verifies the current candidate before persistence and verifies returned fields and
+signature afterward. Pending, mismatched digest/owner/epoch, and stale-epoch candidates fail closed.
+The Agent accepts the previous signer only during its configured trust grace. For SQLite TaskAck/TaskStarted/TaskRejected,
+DriftEvidence, output, and supported final-result reports, the live WebSocket handler queues that receipt after
+persistence. The persistent Agent consumes it only as permission to clean the exact acknowledged
+journal row; an artifact-bearing Runbook report has no Agent journal row to clean and is not retained
+for receipt-driven replay.
+
+Controller schema v26 expands the SQLite inbox class check to include `drift_evidence`; it preserves
+previous inbox and receipt rows while rebuilding the class-constrained inbox table with its receipt
+foreign key intact.
+
+### Current delivery limits
+
+- Persistent TaskAck, TaskStarted, and TaskRejected for Command/Runbook/Drift assignments, DriftCheck evidence and terminal result, Command stdout/stderr, no-artifact Runbook stdout/stderr, and no-artifact Command/Runbook final results use the Agent journal and active v2 receipt path. Each report is committed locally before send and retained until a matching signed `stored` receipt is verified. TaskAck acceptance, TaskStarted start, and a pre-execution TaskRejected transition each commit with the Job aggregate, audit, and inbox marker; TaskRejected applies only to an owned `dispatched` Assignment and stores a redacted reason. DriftEvidence uses Controller-stored provenance and atomically commits the drift row, required audit, eligible remediation proposal effects and inbox marker. Its receipt does not mark the Job/Assignment successful. The separate DriftCheck final result applies the terminal status with its own exact receipt. Terminal Assignment state is never downgraded. Persistent Command and no-artifact Runbook finalization verifies exact per-stream `[0, count)` storage before its receipt and rejects a truncated success; this does not prove every task-execution byte was captured or guarantee exactly-once effects.
+- Artifact-bearing persistent Runbook finals use the authenticated strict v2 `FinalResult` report. Controller size/checksum validation and owner checks precede an idempotent local body put; artifact metadata, Assignment/Job/audit effects, and the inbox marker then commit in one SQLite transaction, and the signed stored receipt is persisted afterward. A bounded SQLite startup pass and periodic worker retry up to 100 pending reports/8 MiB per effect scan, revalidate exact staged bytes and ownership, and queue committed receipts through an active session's single writer. It separately scans up to 100 committed final identities missing receipt bytes using only key/digest and persists those receipts without repeating effects. Output gaps, corruption, unsupported follow-up, and terminal Assignment state fail closed and remain pending. Postgres report handling/recovery is unsupported. The Agent does not journal artifact bodies or this final report, so disconnect before inbox staging can lose it. File-only orphans can remain across a failed/abandoned transaction; DB and filesystem are not atomic. This receipt is Controller commit confirmation, not end-to-end Agent replay or exactly-once execution.
+- The direct one-shot `agent heartbeat --once` handler remains on the separate ephemeral `TaskResult` payload; those socket writes are not durable Controller receipts. DriftCheck evidence and terminal TaskResult are durable on persistent sessions, but Drift execution recovery and remediation final-result follow-up remain pending.
+- Persistent Command and no-artifact Runbook execution records admission and start intent; a new process or idle runtime after prior task-owner exit journals `agent_interrupted_before_start` or `execution_outcome_unknown` as a failed final result without reexecution. The local execution record tracks committed stdout/stderr sequence counts in the same SQLite transaction as each output report, so output receipt cleanup cannot make a recovery final contradict Controller coverage. Final reports must match those counts. Reconnect during a live task skips recovery. Artifact-producing Runbook, direct one-shot, and Drift execution recovery remain outside this path.
+- Agent journal schema v4 adds DriftEvidence while preserving v3 report rows and bytes; v3 persists stream counts. Upgrading a v2 journal with a `StartIntent` still active is rejected before changing its schema or stored reports; finish or reconcile that execution under the existing Agent first, then upgrade. This protects the final output-coverage contract and is separate from unsupported old wire-protocol compatibility.
+- The active v2 session decoder ignores unknown fields on known payloads but rejects unknown message types. Ignoring a proposed capability field does not negotiate support for a new acknowledgement message.
+- The legacy direct `TaskResult` path can commit the Assignment terminal status before artifact storage, Job aggregation, and audit complete. If artifact storage fails, reopening the store and replaying that result follows the terminal-assignment ignore path rather than repairing the missing effects. Persistent artifact-bearing Runbook finals now use the v2 inbox effect transaction; see `authenticated_artifact_final_result_commits_prepared_body_and_replays_receipt` and the [storage contract](storage.md).
+- TaskRejected/TaskResult require the authenticated Agent and claimed Job to match the stored Assignment owner inside the transition transaction. A mismatch leaves the Assignment unchanged and is Security-audited. Persistent TaskAck, TaskStarted, and TaskRejected use the owner-bound durable report path; the durable report path also carries Command final results and no-artifact Runbook final results.
+- A matching no-artifact persistent Command, Runbook, or DriftCheck final report that arrives after SQLite G2 recovery has marked its owned Assignment `failed/execution_outcome_unknown` receives a durable late disposition and signed `stored` receipt. The Controller records one redacted first-arrival audit and preserves the existing Assignment/Job terminal state; an exact retry replays the same receipt without repeating effects or audit. Command/Runbook reports require exact output coverage; DriftCheck reports require a no-artifact Job without remediation follow-up. Artifact-bearing Runbook reports and unrelated job classes remain fail-closed after a terminal Assignment. This is not an execution-success override or an exactly-once guarantee. One-shot final delivery, artifact-report Agent replay/automatic inbox recovery, Drift execution recovery, proof that every task-execution byte was captured, cross-epoch reconciliation for reports already ACK-cleaned before backup, and lossless backup recovery remain unsupported.
+- A matching TaskAck/TaskStarted/TaskRejected that arrives after SQLite G2 has set its owned Assignment to `failed/execution_outcome_unknown` receives a late lifecycle disposition: the Controller atomically records one redacted Job audit and commits the inbox marker, without changing the Assignment, Job aggregate, or G2 reason, then persists and returns a signed `stored` receipt. Exact retry replays that receipt, so the Agent can clean the report and continue ordered replay. The receipt confirms durable report disposition, not acceptance, execution, or success. Owner mismatch and conflicting body remain fail-closed; the additional dispatched-cancellation exception is described below.
+- A previously dispatched Assignment that the Controller has already marked `canceled` can receive a late final report from its authenticated owner. For no-artifact Command/Runbook Jobs without remediation follow-up, the Controller verifies exact body identity and stored output coverage, commits one `assignment_canceled_final_result_received` audit and the inbox disposition, then persists/replays a signed `stored` receipt. A valid `succeeded`, `failed`, `canceled`, or `timed_out` report can race cancellation; none changes the canonical canceled Assignment, its original reason/completion time, or the Job aggregate. Truncated success remains invalid. TaskAck/TaskStarted/TaskRejected racing the same dispatched cancellation use `assignment_canceled_lifecycle_report_received` and likewise apply no state transition. Undispatched canceled work, other terminal states/reasons, conflicting bodies, owner mismatches, and artifact/remediation/DriftCheck final effects are outside this exception. Stored means durable disposition, not permission to execute, execution success, or authority to rerun a task.
+
+- TaskRejected is a pre-execution event and only transitions `dispatched -> rejected`; a report against another active Assignment state also fails closed and remains pending. Repeated admission of an already recorded Command reuses its existing durable result reports rather than producing a second TaskRejected. These guards prevent a replay refusal from replacing an uncertain execution result.
+
+WebSocket write 성공은 agent가 task를 수락하거나 실행했다는 뜻이 아니다. Controller는 dispatch write 성공 시 assignment를 `dispatched`로만 저장한다. Persistent v2 session의 TaskAck, TaskStarted, TaskRejected는 위 `Lifecycle` report 경로를 사용하며, direct one-shot의 `task_ack`/`task_started`/`task_rejected` JSON은 별도의 control path 형식이다.
 
 Agent lifecycle events:
 

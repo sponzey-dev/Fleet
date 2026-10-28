@@ -9,23 +9,34 @@ repository.workspace = true
 postgres = ["fleet-store/postgres"]
 
 [dependencies]
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 axum = { workspace = true }
+base64 = { workspace = true }
 fleet-core = { path = "../fleet-core" }
 fleet-application = { path = "../fleet-application" }
 fleet-domain = { path = "../fleet-domain" }
 fleet-protocol = { path = "../fleet-protocol" }
 fleet-store = { path = "../fleet-store" }
 futures-util = { workspace = true }
+getrandom = { workspace = true }
+hmac = "0.12"
 git2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+subtle = "2.6"
 rustls-pemfile = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
+unicode-normalization = "0.1.25"
+url = "2.5.8"
+zeroize = "1.8"
 tempfile = "3"
 
 [dev-dependencies]
+rusqlite = { workspace = true }
+tracing-subscriber = { workspace = true }
 rcgen = "0.12"
 reqwest = { workspace = true }
+tungstenite = { workspace = true }

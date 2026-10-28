@@ -1,7 +1,19 @@
+//! Versioned Controller-Agent JSON contracts.
+//!
+//! The active session envelope is v2 and includes bounded report/receipt
+//! payloads. The authenticated SQLite Controller handles output and a limited
+//! no-artifact final-result subset. Persistent Command Agents journal those
+//! reports before send and clean them only after exact signed stored receipts;
+//! lifecycle, artifact/follow-up, one-shot and runbook/drift reports remain
+//! outside that durable path.
+
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub mod delivery_v2;
+pub mod receipt;
+
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageId(pub String);
@@ -75,7 +87,12 @@ pub enum WirePayload {
         nonce: String,
         signature: String,
     },
-    AuthAccepted,
+    AuthAccepted {
+        controller_namespace: String,
+        store_epoch: String,
+    },
+    TaskReport(delivery_v2::V2TaskReportWire),
+    ReportReceipt(receipt::SignedReportReceiptWire),
     Heartbeat {
         agent_id: String,
         status: String,
@@ -192,7 +209,7 @@ impl WirePayload {
             | Self::AgentHello { .. }
             | Self::AuthChallenge { .. }
             | Self::AuthResponse { .. }
-            | Self::AuthAccepted
+            | Self::AuthAccepted { .. }
             | Self::Heartbeat { .. } => ProtocolChannel::AuthSession,
             Self::ControllerSigningTrustBundleUpdate { .. }
             | Self::ControllerSigningTrustBundleAck { .. }
@@ -203,6 +220,8 @@ impl WirePayload {
             | Self::TaskStarted { .. }
             | Self::TaskRejected { .. }
             | Self::TaskCancel { .. }
+            | Self::TaskReport(_)
+            | Self::ReportReceipt(_)
             | Self::OutputChunk { .. }
             | Self::TaskResult { .. }
             | Self::SecurityEvent { .. }
@@ -395,6 +414,8 @@ pub struct TaskResultArtifactWire {
 pub enum ProtocolError {
     Json(String),
     VersionMismatch { expected: u16, actual: u16 },
+    InvalidV2Payload(crate::delivery_v2::V2ProtocolError),
+    MessageTooLarge,
 }
 
 impl Display for ProtocolError {
@@ -407,6 +428,10 @@ impl Display for ProtocolError {
                     "protocol version mismatch: expected {expected}, actual {actual}"
                 )
             }
+            Self::InvalidV2Payload(error) => {
+                write!(formatter, "invalid v2 delivery payload: {error}")
+            }
+            Self::MessageTooLarge => formatter.write_str("protocol message exceeds size limit"),
         }
     }
 }
@@ -415,14 +440,65 @@ impl std::error::Error for ProtocolError {}
 
 pub fn encode_message(message: &WireMessage) -> Result<String, ProtocolError> {
     message.validate_version()?;
-    serde_json::to_string(message).map_err(|error| ProtocolError::Json(error.to_string()))
+    validate_v2_delivery_payload(message)?;
+    let encoded =
+        serde_json::to_string(message).map_err(|error| ProtocolError::Json(error.to_string()))?;
+    if encoded.len() > crate::delivery_v2::MAX_V2_MESSAGE_BYTES {
+        return Err(ProtocolError::MessageTooLarge);
+    }
+    Ok(encoded)
 }
 
 pub fn decode_message(body: &str) -> Result<WireMessage, ProtocolError> {
+    if body.len() > crate::delivery_v2::MAX_V2_MESSAGE_BYTES {
+        return Err(ProtocolError::MessageTooLarge);
+    }
+    let version: VersionProbe =
+        serde_json::from_str(body).map_err(|error| ProtocolError::Json(error.to_string()))?;
+    if version.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError::VersionMismatch {
+            expected: PROTOCOL_VERSION,
+            actual: version.protocol_version,
+        });
+    }
     let message: WireMessage =
         serde_json::from_str(body).map_err(|error| ProtocolError::Json(error.to_string()))?;
     message.validate_version()?;
+    validate_v2_delivery_payload(&message)?;
     Ok(message)
+}
+
+fn validate_v2_delivery_payload(message: &WireMessage) -> Result<(), ProtocolError> {
+    let payload = match &message.payload {
+        WirePayload::TaskReport(report) => Some(crate::delivery_v2::V2WirePayload::TaskReport(
+            report.clone(),
+        )),
+        WirePayload::ReportReceipt(receipt) => Some(
+            crate::delivery_v2::V2WirePayload::ReportReceipt(receipt.clone()),
+        ),
+        _ => None,
+    };
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+    let agent_id = message.agent_id.clone().ok_or({
+        ProtocolError::InvalidV2Payload(crate::delivery_v2::V2ProtocolError::InvalidIdentity)
+    })?;
+    crate::delivery_v2::V2WireMessage {
+        protocol_version: message.protocol_version,
+        message_id: message.message_id.clone(),
+        correlation_id: message.correlation_id.clone(),
+        agent_id,
+        timestamp_ms: message.timestamp_ms,
+        payload,
+    }
+    .validate()
+    .map_err(ProtocolError::InvalidV2Payload)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct VersionProbe {
+    pub protocol_version: u16,
 }
 
 pub fn protocol_version() -> u16 {
@@ -432,6 +508,11 @@ pub fn protocol_version() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delivery_v2::{
+        V2ProtocolError, V2TaskReportWire, V2WireMessage, V2WirePayload, decode_v2_message,
+        encode_v2_message,
+    };
+    use fleet_domain::delivery::{ReportClass, ReportKey};
 
     fn heartbeat() -> WireMessage {
         WireMessage::new(
@@ -448,7 +529,153 @@ mod tests {
 
     #[test]
     fn exposes_protocol_version() {
-        assert_eq!(protocol_version(), 1);
+        assert_eq!(protocol_version(), 2);
+    }
+
+    #[test]
+    fn v2_report_roundtrips_without_legacy_fallback() {
+        let key = ReportKey::new("controller-1", "agent-1", "job-1", "task-1", "report-1").unwrap();
+        let report =
+            V2TaskReportWire::new(&key, ReportClass::FinalResult, b"secret-body-marker").unwrap();
+        assert_eq!(report.body_bytes().unwrap(), b"secret-body-marker");
+        let message = V2WireMessage::new(
+            "msg-v2",
+            "corr-v2",
+            "agent-1",
+            10,
+            V2WirePayload::TaskReport(report),
+        );
+        let encoded = encode_v2_message(&message).unwrap();
+        assert_eq!(decode_v2_message(&encoded).unwrap(), message);
+        assert!(!format!("{message:?}").contains("secret-body-marker"));
+        assert!(!format!("{message:?}").contains("c2VjcmV0LWJvZHktbWFya2Vy"));
+        let session_message = decode_message(&encoded).unwrap();
+        assert_eq!(session_message.agent_id.as_deref(), Some("agent-1"));
+        assert!(matches!(
+            session_message.payload,
+            WirePayload::TaskReport(_)
+        ));
+        let legacy = encode_message(&heartbeat()).unwrap();
+        assert!(matches!(
+            decode_v2_message(&legacy),
+            Err(V2ProtocolError::Json)
+        ));
+    }
+
+    #[test]
+    fn v2_report_rejects_wrong_owner_digest_and_oversize_body() {
+        let key = ReportKey::new("controller-1", "agent-1", "job-1", "task-1", "report-1").unwrap();
+        let report = V2TaskReportWire::new(&key, ReportClass::Output, b"output").unwrap();
+        let message = V2WireMessage::new(
+            "msg-v2",
+            "corr-v2",
+            "agent-1",
+            10,
+            V2WirePayload::TaskReport(report),
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&encode_v2_message(&message).unwrap()).unwrap();
+        value["agent_id"] = "agent-2".into();
+        assert_eq!(
+            decode_v2_message(&value.to_string()),
+            Err(V2ProtocolError::IdentityMismatch)
+        );
+        value["agent_id"] = "agent-1".into();
+        value["payload"]["payload"]["digest_hex"] = "0".repeat(64).into();
+        assert_eq!(
+            decode_v2_message(&value.to_string()),
+            Err(V2ProtocolError::DigestMismatch)
+        );
+        assert_eq!(
+            V2TaskReportWire::new(&key, ReportClass::Output, &vec![0; 4 * 1024 * 1024 + 1]),
+            Err(V2ProtocolError::BodyTooLarge)
+        );
+        assert_eq!(
+            V2TaskReportWire::new(&key, ReportClass::Output, b""),
+            Err(V2ProtocolError::EmptyBody)
+        );
+    }
+
+    #[test]
+    fn v2_decoder_rejects_invalid_report_encoding_and_unknown_payload() {
+        let key = ReportKey::new("controller-1", "agent-1", "job-1", "task-1", "report-1").unwrap();
+        let report = V2TaskReportWire::new(&key, ReportClass::Lifecycle, b"accepted").unwrap();
+        let message = V2WireMessage::new(
+            "msg-v2",
+            "corr-v2",
+            "agent-1",
+            10,
+            V2WirePayload::TaskReport(report),
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&encode_v2_message(&message).unwrap()).unwrap();
+        value["payload"]["payload"]["body_base64"] = "not base64".into();
+        assert_eq!(
+            decode_v2_message(&value.to_string()),
+            Err(V2ProtocolError::InvalidBodyEncoding)
+        );
+        value["payload"]["type"] = "task_result".into();
+        assert_eq!(
+            decode_v2_message(&value.to_string()),
+            Err(V2ProtocolError::Json)
+        );
+        value["protocol_version"] = 1.into();
+        assert_eq!(
+            decode_v2_message(&value.to_string()),
+            Err(V2ProtocolError::VersionMismatch {
+                expected: 2,
+                actual: 1
+            })
+        );
+    }
+
+    #[test]
+    fn v2_signed_receipt_roundtrips_but_shape_and_owner_are_checked() {
+        use crate::receipt::{
+            ReportDispositionWire, ReportReceiptStatementWire, SignedReportReceiptWire,
+        };
+        let receipt = SignedReportReceiptWire {
+            statement: ReportReceiptStatementWire {
+                controller_namespace: "controller-1".into(),
+                store_epoch: "epoch-1".into(),
+                agent_id: "agent-1".into(),
+                job_id: "job-1".into(),
+                task_id: "task-1".into(),
+                report_id: "report-1".into(),
+                digest_hex: "a".repeat(64),
+                signed_at_ms: 10,
+                disposition: ReportDispositionWire::Stored,
+                signing_key_fingerprint: "b".repeat(64),
+            },
+            signature_hex: "c".repeat(128),
+        };
+        let message = V2WireMessage::new(
+            "receipt-v2",
+            "corr-v2",
+            "agent-1",
+            11,
+            V2WirePayload::ReportReceipt(receipt),
+        );
+        let encoded = encode_v2_message(&message).unwrap();
+        assert_eq!(decode_v2_message(&encoded).unwrap(), message);
+        let session_message = decode_message(&encoded).unwrap();
+        assert_eq!(session_message.agent_id.as_deref(), Some("agent-1"));
+        assert!(matches!(
+            session_message.payload,
+            WirePayload::ReportReceipt(_)
+        ));
+        let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        value["agent_id"] = "agent-2".into();
+        assert_eq!(
+            decode_v2_message(&value.to_string()),
+            Err(V2ProtocolError::IdentityMismatch)
+        );
+        value["agent_id"] = "agent-1".into();
+        value["payload"]["payload"]["signature_hex"] = "bad".into();
+        assert_eq!(
+            decode_v2_message(&value.to_string()),
+            Err(V2ProtocolError::InvalidReceipt)
+        );
     }
 
     #[test]
@@ -457,14 +684,14 @@ mod tests {
         let decoded = decode_message(&encoded).unwrap();
 
         assert_eq!(decoded, heartbeat());
-        assert!(encoded.contains("\"protocol_version\":1"));
+        assert!(encoded.contains("\"protocol_version\":2"));
         assert!(encoded.contains("\"heartbeat\""));
     }
 
     #[test]
     fn drift_report_legacy_fixture_decodes_without_task_correlation() {
         let body = r#"{
-            "protocol_version": 1,
+            "protocol_version": 2,
             "message_id": "msg-drift-legacy",
             "correlation_id": "corr-drift-legacy",
             "agent_id": "agent-1",
@@ -527,7 +754,7 @@ mod tests {
     #[test]
     fn rejects_unknown_message_type() {
         let body = r#"{
-            "protocol_version": 1,
+            "protocol_version": 2,
             "message_id": "msg-1",
             "correlation_id": "corr-1",
             "agent_id": "agent-1",
@@ -549,9 +776,92 @@ mod tests {
         assert_eq!(
             encode_message(&message),
             Err(ProtocolError::VersionMismatch {
-                expected: 1,
+                expected: 2,
                 actual: 999,
             })
+        );
+    }
+
+    #[test]
+    fn rejects_v1_session_message_after_protocol_hard_cut() {
+        let body = r#"{
+            "protocol_version": 1,
+            "message_id": "msg-legacy",
+            "correlation_id": "corr-legacy",
+            "agent_id": "agent-1",
+            "timestamp_ms": 1,
+            "payload": {
+                "type": "heartbeat",
+                "payload": { "agent_id": "agent-1", "status": "online" }
+            }
+        }"#;
+
+        assert!(matches!(
+            decode_message(body),
+            Err(ProtocolError::VersionMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_v1_controller_auth_acceptance_after_protocol_hard_cut() {
+        let body = r#"{
+            "protocol_version": 1,
+            "message_id": "msg-legacy-accepted",
+            "correlation_id": "corr-legacy-accepted",
+            "agent_id": "agent-1",
+            "timestamp_ms": 1,
+            "payload": { "type": "auth_accepted", "payload": {} }
+        }"#;
+
+        assert!(matches!(
+            decode_message(body),
+            Err(ProtocolError::VersionMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn v2_auth_acceptance_requires_delivery_identity() {
+        let body = r#"{
+            "protocol_version": 2,
+            "message_id": "msg-missing-identity",
+            "correlation_id": "corr-missing-identity",
+            "agent_id": "agent-1",
+            "timestamp_ms": 1,
+            "payload": { "type": "auth_accepted", "payload": {} }
+        }"#;
+
+        assert!(matches!(decode_message(body), Err(ProtocolError::Json(_))));
+    }
+
+    #[test]
+    fn legacy_hello_ignores_unknown_delivery_capability_without_negotiating_it() {
+        let hello = WireMessage::new(
+            "msg-hello",
+            "corr-hello",
+            Some("agent-1".to_owned()),
+            1,
+            WirePayload::AgentHello {
+                agent_id: "agent-1".to_owned(),
+                fingerprint: "public-fingerprint".to_owned(),
+            },
+        );
+        let mut body = serde_json::to_value(&hello).unwrap();
+        body["payload"]["payload"]["delivery_capabilities"] =
+            serde_json::json!(["test-only-future-receipt"]);
+
+        let decoded = decode_message(&body.to_string()).unwrap();
+
+        assert_eq!(decoded, hello);
+        assert!(
+            !encode_message(&decoded)
+                .unwrap()
+                .contains("delivery_capabilities")
         );
     }
 
@@ -570,6 +880,124 @@ mod tests {
         assert_eq!(
             decode_message(&encode_message(&message).unwrap()).unwrap(),
             message
+        );
+    }
+
+    #[test]
+    fn auth_accepted_roundtrips_controller_delivery_identity() {
+        let message = WireMessage::new(
+            "msg-auth-accepted",
+            "corr-auth-accepted",
+            Some("agent-1".to_owned()),
+            2,
+            WirePayload::AuthAccepted {
+                controller_namespace: "a".repeat(64),
+                store_epoch: "b".repeat(64),
+            },
+        );
+
+        let encoded = encode_message(&message).unwrap();
+
+        assert_eq!(decode_message(&encoded).unwrap(), message);
+        assert!(encoded.contains("\"protocol_version\":2"));
+    }
+
+    #[test]
+    fn active_v2_report_payloads_roundtrip_through_session_envelope() {
+        use crate::receipt::{
+            ReportDispositionWire, ReportReceiptStatementWire, SignedReportReceiptWire,
+        };
+
+        let key = ReportKey::new("controller-1", "agent-1", "job-1", "task-1", "report-1").unwrap();
+        let report = V2TaskReportWire::new(&key, ReportClass::Output, b"stdout bytes").unwrap();
+        let report_message = WireMessage::new(
+            "msg-report",
+            "corr-report",
+            Some("agent-1".to_owned()),
+            10,
+            WirePayload::TaskReport(report),
+        );
+
+        let receipt = SignedReportReceiptWire {
+            statement: ReportReceiptStatementWire {
+                controller_namespace: "controller-1".into(),
+                store_epoch: "epoch-1".into(),
+                agent_id: "agent-1".into(),
+                job_id: "job-1".into(),
+                task_id: "task-1".into(),
+                report_id: "report-1".into(),
+                digest_hex: "a".repeat(64),
+                signed_at_ms: 11,
+                disposition: ReportDispositionWire::Stored,
+                signing_key_fingerprint: "b".repeat(64),
+            },
+            signature_hex: "c".repeat(128),
+        };
+        let receipt_message = WireMessage::new(
+            "msg-receipt",
+            "corr-receipt",
+            Some("agent-1".to_owned()),
+            11,
+            WirePayload::ReportReceipt(receipt),
+        );
+
+        for message in [report_message, receipt_message] {
+            let encoded = encode_message(&message).unwrap();
+            assert_eq!(decode_message(&encoded).unwrap(), message);
+            assert_eq!(decode_v2_message(&encoded).unwrap().agent_id, "agent-1");
+        }
+    }
+
+    #[test]
+    fn active_v2_report_envelope_validates_body_digest_and_owner() {
+        let key = ReportKey::new("controller-1", "agent-1", "job-1", "task-1", "report-1").unwrap();
+        let report = V2TaskReportWire::new(&key, ReportClass::Output, b"stdout bytes").unwrap();
+        let message = WireMessage::new(
+            "msg-report",
+            "corr-report",
+            Some("agent-1".to_owned()),
+            10,
+            WirePayload::TaskReport(report),
+        );
+        let encoded = encode_message(&message).unwrap();
+
+        let mut wrong_digest: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        wrong_digest["payload"]["payload"]["digest_hex"] = "0".repeat(64).into();
+        assert_eq!(
+            decode_message(&wrong_digest.to_string()),
+            Err(ProtocolError::InvalidV2Payload(
+                V2ProtocolError::DigestMismatch
+            ))
+        );
+
+        let mut wrong_owner: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        wrong_owner["agent_id"] = "agent-2".into();
+        assert_eq!(
+            decode_message(&wrong_owner.to_string()),
+            Err(ProtocolError::InvalidV2Payload(
+                V2ProtocolError::IdentityMismatch
+            ))
+        );
+    }
+
+    #[test]
+    fn active_session_message_size_is_bounded() {
+        let body = " ".repeat(crate::delivery_v2::MAX_V2_MESSAGE_BYTES + 1);
+        assert_eq!(decode_message(&body), Err(ProtocolError::MessageTooLarge));
+
+        let message = WireMessage::new(
+            "msg-large",
+            "corr-large",
+            Some("agent-1".to_owned()),
+            1,
+            WirePayload::Heartbeat {
+                agent_id: "agent-1".to_owned(),
+                status: "x".repeat(crate::delivery_v2::MAX_V2_MESSAGE_BYTES + 1),
+            },
+        );
+        assert_eq!(
+            encode_message(&message),
+            Err(ProtocolError::MessageTooLarge)
         );
     }
 
@@ -735,7 +1163,7 @@ mod tests {
     #[test]
     fn legacy_task_result_without_status_still_decodes() {
         let body = r#"{
-            "protocol_version":1,
+            "protocol_version": 2,
             "message_id":"msg-result",
             "correlation_id":"corr-result",
             "agent_id":"agent-1",
@@ -769,7 +1197,7 @@ mod tests {
     #[test]
     fn legacy_task_result_artifact_without_body_still_decodes() {
         let body = r#"{
-            "protocol_version":1,
+            "protocol_version": 2,
             "message_id":"msg-result",
             "correlation_id":"corr-result",
             "agent_id":"agent-1",
@@ -841,7 +1269,7 @@ mod tests {
     #[test]
     fn old_agent_hello_without_capability_snapshot_still_decodes() {
         let body = r#"{
-            "protocol_version":1,
+            "protocol_version": 2,
             "message_id":"msg-hello",
             "correlation_id":"corr-hello",
             "agent_id":"agent-1",
@@ -937,7 +1365,7 @@ mod tests {
     #[test]
     fn trust_bundle_update_ignores_private_material_like_unknown_fields() {
         let body = r#"{
-            "protocol_version": 1,
+            "protocol_version": 2,
             "message_id": "msg-trust-update",
             "correlation_id": "corr-trust-update",
             "agent_id": "agent-1",
@@ -1064,7 +1492,7 @@ mod tests {
     #[test]
     fn agent_certificate_lifecycle_update_ignores_private_material_like_unknown_fields() {
         let body = r#"{
-            "protocol_version": 1,
+            "protocol_version": 2,
             "message_id": "msg-agent-cert",
             "correlation_id": "corr-agent-cert",
             "agent_id": "agent-1",
@@ -1159,7 +1587,7 @@ mod tests {
     #[test]
     fn task_ack_ignores_unknown_compatible_fields() {
         let body = r#"{
-            "protocol_version": 1,
+            "protocol_version": 2,
             "message_id": "msg-ack",
             "correlation_id": "task-1",
             "agent_id": "agent-1",

@@ -1,3 +1,6 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod process_stream;
+
 use fleet_domain::{
     AgentId, ControllerSigningTrustBundle, ControllerSigningTrustVerification,
     DriftAcknowledgement, DriftReport, DriftSeverity, DriftStatus, JobError, PackageState, Policy,
@@ -9,13 +12,18 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+use std::io::Read;
+use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::process::{Command, Stdio};
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
 use std::sync::mpsc;
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1993,6 +2001,21 @@ pub fn run_command_with_spec(spec: CommandSpec) -> Result<CommandOutput, RunnerE
 
 pub fn run_command_with_cancel(
     spec: CommandSpec,
+    should_cancel: impl FnMut() -> bool,
+) -> Result<CommandOutput, RunnerError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        process_stream::run(spec, should_cancel, |_| Ok(()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        run_command_with_cancel_fallback(spec, should_cancel)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn run_command_with_cancel_fallback(
+    spec: CommandSpec,
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<CommandOutput, RunnerError> {
     let started_at = Instant::now();
@@ -2032,7 +2055,26 @@ pub fn run_command_streaming(
     run_command_streaming_with_cancel(spec, || false, on_chunk)
 }
 
+/// Runs a bounded output stream. On Darwin/Linux a scoped process-group owner
+/// terminates and reaps on callback failure/cancel/timeout, including inherited
+/// pipes; no PID from an earlier Agent process is used for cleanup.
 pub fn run_command_streaming_with_cancel(
+    spec: CommandSpec,
+    should_cancel: impl FnMut() -> bool,
+    on_chunk: impl FnMut(CommandOutputChunk) -> Result<(), RunnerError>,
+) -> Result<CommandOutput, RunnerError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        process_stream::run(spec, should_cancel, on_chunk)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        run_command_streaming_fallback(spec, should_cancel, on_chunk)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn run_command_streaming_fallback(
     spec: CommandSpec,
     mut should_cancel: impl FnMut() -> bool,
     mut on_chunk: impl FnMut(CommandOutputChunk) -> Result<(), RunnerError>,
@@ -2056,7 +2098,8 @@ pub fn run_command_streaming_with_cancel(
     let mut stdout_body = Vec::new();
     let mut stderr_body = Vec::new();
     let mut total_output = 0usize;
-    let mut sequence = 0u64;
+    let mut stdout_sequence = 0u64;
+    let mut stderr_sequence = 0u64;
 
     loop {
         while let Ok(event) = receiver.try_recv() {
@@ -2073,12 +2116,16 @@ pub fn run_command_streaming_with_cancel(
                 CommandOutputStream::Stdout => stdout_body.extend_from_slice(&bytes),
                 CommandOutputStream::Stderr => stderr_body.extend_from_slice(&bytes),
             }
+            let sequence = match stream {
+                CommandOutputStream::Stdout => &mut stdout_sequence,
+                CommandOutputStream::Stderr => &mut stderr_sequence,
+            };
             on_chunk(CommandOutputChunk {
                 stream,
-                sequence,
+                sequence: *sequence,
                 data: String::from_utf8_lossy(&bytes).to_string(),
             })?;
-            sequence += 1;
+            *sequence += 1;
         }
 
         if let Some(status) = child.try_wait()? {
@@ -2090,7 +2137,8 @@ pub fn run_command_streaming_with_cancel(
                 &mut stderr_body,
                 &mut total_output,
                 spec.max_output_bytes,
-                &mut sequence,
+                &mut stdout_sequence,
+                &mut stderr_sequence,
                 &mut on_chunk,
             )?;
             return Ok(CommandOutput {
@@ -2121,11 +2169,13 @@ pub fn run_command_streaming_with_cancel(
     }
 }
 
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
 struct StreamingOutputEvent {
     stream: CommandOutputStream,
     bytes: Vec<u8>,
 }
 
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
 fn spawn_output_reader<R>(
     mut reader: R,
     stream: CommandOutputStream,
@@ -2160,13 +2210,15 @@ where
     })
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn drain_streaming_receiver(
     receiver: &mpsc::Receiver<Result<StreamingOutputEvent, RunnerError>>,
     stdout_body: &mut Vec<u8>,
     stderr_body: &mut Vec<u8>,
     total_output: &mut usize,
     max_output_bytes: usize,
-    sequence: &mut u64,
+    stdout_sequence: &mut u64,
+    stderr_sequence: &mut u64,
     on_chunk: &mut impl FnMut(CommandOutputChunk) -> Result<(), RunnerError>,
 ) -> Result<(), RunnerError> {
     while let Ok(event) = receiver.try_recv() {
@@ -2179,6 +2231,10 @@ fn drain_streaming_receiver(
             CommandOutputStream::Stdout => stdout_body.extend_from_slice(&bytes),
             CommandOutputStream::Stderr => stderr_body.extend_from_slice(&bytes),
         }
+        let sequence = match stream {
+            CommandOutputStream::Stdout => stdout_sequence,
+            CommandOutputStream::Stderr => stderr_sequence,
+        };
         on_chunk(CommandOutputChunk {
             stream,
             sequence: *sequence,
@@ -2189,12 +2245,14 @@ fn drain_streaming_receiver(
     Ok(())
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn join_output_reader(handle: &mut Option<thread::JoinHandle<()>>) {
     if let Some(handle) = handle.take() {
         let _ = handle.join();
     }
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn command_output_from_process_output(
     output: std::process::Output,
     max_output_bytes: usize,
@@ -2238,10 +2296,10 @@ fn push_chunks(
         return;
     }
     let chunk_size = chunk_size.max(1);
-    for chunk in data.as_bytes().chunks(chunk_size) {
+    for (sequence, chunk) in data.as_bytes().chunks(chunk_size).enumerate() {
         chunks.push(CommandOutputChunk {
             stream,
-            sequence: chunks.len() as u64,
+            sequence: sequence as u64,
             data: String::from_utf8_lossy(chunk).to_string(),
         });
     }
@@ -3905,6 +3963,73 @@ spec:
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn streaming_callback_failure_stops_later_host_effects() {
+        let root = temp_test_dir("stream-callback-cleanup");
+        let marker = root.join("unexpected-effect");
+        let mut spec = shell_spec(
+            "printf ready; sleep 0.2; printf survived > \"$FLEET_TEST_EFFECT_PATH\"",
+            Duration::from_secs(3),
+        );
+        spec.env.insert(
+            "FLEET_TEST_EFFECT_PATH".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        );
+        let result = run_command_streaming(spec, |_| {
+            Err(RunnerError::Stream("journal unavailable".to_owned()))
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        let effect_happened = marker.exists();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            result,
+            Err(RunnerError::Stream("journal unavailable".to_owned()))
+        );
+        assert!(!effect_happened, "callback failure left command running");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn streaming_timeout_is_checked_while_descendant_holds_pipes() {
+        let started = Instant::now();
+        let result = run_command_streaming(
+            shell_spec("sleep 2 & exit 0", Duration::from_millis(100)),
+            |_| Ok(()),
+        );
+        assert_eq!(result, Err(RunnerError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn buffered_command_drains_output_before_waiting_for_exit() {
+        let result = run_command_with_spec(shell_spec(
+            "head -c 131072 /dev/zero",
+            Duration::from_millis(500),
+        ));
+        let output = result.expect("a full pipe must not deadlock a bounded command");
+        assert_eq!(output.stdout.len(), 131072);
+        assert_eq!(output.exit_code, 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn streaming_cancel_is_checked_while_descendant_holds_pipes() {
+        let started = Instant::now();
+        let mut polls = 0;
+        let result = run_command_streaming_with_cancel(
+            shell_spec("sleep 2 & exit 0", Duration::from_secs(3)),
+            || {
+                polls += 1;
+                polls >= 5
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(result, Err(RunnerError::Canceled));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn output_reader_retries_interrupted_read_before_emitting_chunk() {
         struct InterruptedThenData {
@@ -4009,7 +4134,7 @@ spec:
         assert_eq!(chunks[0].data, "ab");
         assert_eq!(chunks[1].sequence, 1);
         assert_eq!(chunks[1].data, "cd");
-        assert_eq!(chunks[2].sequence, 2);
+        assert_eq!(chunks[2].sequence, 0);
         assert_eq!(chunks[2].stream, CommandOutputStream::Stderr);
         assert_eq!(chunks[2].data, "ef");
     }

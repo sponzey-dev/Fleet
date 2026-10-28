@@ -1,7 +1,17 @@
 //! Agent-side bootstrap contracts.
 //!
 //! Product execution is exposed through the single product binary. This crate
-//! owns agent-specific, process-local state as the runtime grows.
+//! owns process-local session state, a generic owned journal I/O worker, and
+//! receipt verification. The CLI composes these with the active v2 session for
+//! persistent Command admission/start intent, restart outcome reporting,
+//! stdout/stderr and no-artifact final-result delivery. Persistent DriftCheck
+//! evidence and its separate terminal result also use the journal/receipt path;
+//! direct one-shot and artifact-producing Runbook results remain separate.
+//! Constructing the in-memory supervisor below does not itself enable durable
+//! delivery.
+
+pub mod journal_worker;
+pub mod receipt_verifier;
 
 use std::collections::VecDeque;
 

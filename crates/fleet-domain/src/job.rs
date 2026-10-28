@@ -521,6 +521,38 @@ pub enum JobStatus {
     Expired,
 }
 
+impl JobStatus {
+    /// Stable lifecycle label used by boundary adapters.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::PendingApproval => "pending_approval",
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::PartialSuccess => "partial_success",
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Expired => "expired",
+        }
+    }
+    /// Unknown persisted or interface labels cannot become a valid lifecycle state.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "draft" => Some(Self::Draft),
+            "pending_approval" => Some(Self::PendingApproval),
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "partial_success" => Some(Self::PartialSuccess),
+            "success" => Some(Self::Success),
+            "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobResultSummary {
     pub success_count: u32,

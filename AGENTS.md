@@ -1,8 +1,9 @@
 # Sponzey Fleet Development Rules
 
 이 문서는 Sponzey Fleet 저장소에서 코드, 테스트, 문서, schema, 배포 구성을 변경하는
-사람과 자동화 에이전트가 따라야 하는 강제 규칙이다. 제품 방향은 `PROJECT.md`, 현재
-지원 상태는 실제 코드·test·manifest와 `docs/feature-matrix.md`를 함께 근거로 판단한다.
+사람과 자동화 에이전트가 따라야 하는 강제 규칙이다. 제품 조사에서는 `README.md`를
+먼저 읽고 `.docs/README.md` 문서 지도를 따라 제품·구조·전체 계획을 확인한다.
+현재 지원 상태는 실제 코드·test·manifest와 `docs/feature-matrix.md`를 함께 근거로 판단한다.
 
 ## 1. Project Context and Method Selection
 
@@ -30,8 +31,9 @@ artifact, audit를 다룬다. 따라서 다음 위험은 일반 기능 편의보
 3. `docs/feature-matrix.md`, `docs/security.md`, `docs/protocol.md`, `docs/storage.md`,
    `docs/api.md`, `docs/release-gate.md`
 4. `README.md`와 `README.ko.md`의 사용자 흐름
-5. `PROJECT.md`의 제품 목표와 장기 계획
-6. `.tasks/`의 과거 phase·task 기록
+5. `.docs/product/overview.md`, `.docs/product/capabilities.md`, `.docs/architecture/system.md`,
+   `.docs/plans/plan.md`의 제품 목표·전체 순서·인수 기준
+6. `.tasks/`의 실행 기록·과거 phase와 `.docs/archive/`의 초기 제안
 
 하위 근거가 상위 근거와 충돌하면 현재 구현으로 가장하거나 임의로 제품 범위를 바꾸지
 않는다. public contract, data ownership 또는 제품 범위를 바꾸는 충돌은 사용자에게
@@ -54,8 +56,9 @@ artifact, audit를 다룬다. 따라서 다음 위험은 일반 기능 편의보
   runtime composition과 worker를 포함한다.
 - `fleet-cli`는 clap entrypoint와 composition root이며, 현재 agent session/runtime와
   일부 local operations도 포함한다.
-- `fleet-agent`는 현재 agent library의 목표 경계만 가진 얇은 crate다. agent 기능이 이미
-  이 crate에 있다고 가정하지 않는다.
+- `fleet-agent`는 process-local session supervisor, 범용 bounded journal worker와 receipt
+  verifier를 소유한다. CLI에는 active socket session, task 실행 adapter와 report 생산·전송
+  조립이 남아 있으므로 agent runtime 전체가 이미 이 crate로 이동했다고 가정하지 않는다.
 - Web Admin은 현재 React/Vite가 아니다. ES module 기반 정적 JavaScript, CSS, HTML,
   dependency-free API client, `allowJs + checkJs` 검증과 Node test/build script를 쓴다.
 - npm은 Rust runtime이 아니라 `@sponzey/fleet` wrapper와 Darwin/Linux arm64/x64
@@ -64,7 +67,7 @@ artifact, audit를 다룬다. 따라서 다음 위험은 일반 기능 편의보
   S3 adapter, full mTLS client-certificate enforcement, OIDC/project RBAC, HA coordination,
   Windows service와 automatic self-update는 현재 완료된 기능으로 주장하지 않는다.
 
-`PROJECT.md`가 설명하는 `fleet-agent` runtime 분리, 더 얇은 interface, Postgres 운영
+`.docs/architecture/system.md`가 설명하는 `fleet-agent` runtime 분리, 더 얇은 interface, Postgres 운영
 성숙도, 외부 secret/artifact adapter와 cross-platform 지원은 목표 구조다. 목표 구조로
 이동할 때 characterization test와 작은 Tidy First 단계를 사용하며, 존재하지 않는
 구조를 현재 구현처럼 문서화하지 않는다.
@@ -255,8 +258,8 @@ fleet-cli          -> composition root and the only shipped binary
 
 ### 4.1 `source.md` 탐색 인덱스
 
-현재 저장소에는 `source.md`가 없다. 기존 누락을 한 번에 문서화하는 대규모 churn을 만들지
-않고 다음 source 변경부터 touched boundary에 점진적으로 도입한다.
+`source.md`는 touched boundary부터 점진적으로 도입 중이며, 아직 인덱스가 없는 디렉터리가
+있을 수 있다. 기존 누락을 한 번에 문서화하는 대규모 churn을 만들지 않고 변경 범위에서 갱신한다.
 
 - 사람이 유지하는 production/test/tool/script source가 직접 3개 이상이거나, 독립된
   ownership·architecture boundary·entrypoint가 있는 의미 있는 source directory에
@@ -493,9 +496,14 @@ tidy에 schema, protocol, public API, 사용자 behavior, unrelated formatting, 
 
 ### 7.3 compatibility, migration과 성능
 
-- public API, OpenAPI, protocol, persistence, serialization과 npm package 변경은 version
-  compatibility, old/new 양쪽 contract test, migration과 rollback 근거를 포함한다.
-- protocol unknown field/version/rejection policy를 명시하고 legacy fixture를 유지한다.
+- public API, OpenAPI, protocol, persistence, serialization과 npm package 변경은 승인된
+  compatibility profile, supported/rejected contract test, migration과 rollback 근거를 포함한다.
+- Active agent wire는 v2 paired cutover다. 구버전 v1 wire 상호운용, fallback과 mixed-version
+  rollout은 지원하지 않는다. v1↔v2 거부와 paired-v2 contract를 검증한다. 이 hard cut은
+  SQLite/Agent local data migration, legacy row 보존, backup/restore 안전성과 rollback rehearsal를
+  폐기하지 않는다.
+- protocol unknown field/version/rejection policy를 명시한다. Retained legacy fixtures는
+  persisted-data migration이나 명시적 rejection을 검증하며 live wire fallback의 근거가 아니다.
 - SQLite schema 변경은 `CURRENT_SCHEMA_VERSION`, repeatable migration, previous-version
   fixture, legacy row 보존, backup newer-schema rejection을 검증한다.
 - Postgres 변경은 `postgres` feature와 shared repository contract를 별도로 검증한다.
@@ -553,6 +561,26 @@ manual Linux/root, real Postgres, registry publish와 external account 검증은
   `sponzey-lab/Fleet`인지, active `gh` account가 `Leonard-Sponzey`인지 확인한다.
 - commit, tag, push, publish, release 생성은 사용자가 명시적으로 요청했을 때만 수행한다.
   요청을 받으면 working tree, branch, remote, version gate와 registry 결과를 확인한다.
+
+### 7.6 계획·문서와 실행 리소스
+
+- 프로젝트 전체의 우선순위·단계·착수/완료 기준은 `.docs/plans/plan.md`, 제품 기능의
+  ID·상세화 상태는 `.docs/product/capabilities.md`가 소유한다. 실제 task checkbox와
+  검증 결과는 `.tasks/`에 두고 중복 관리하지 않는다. `.tasks/`는 Git ignored 로컬 기록이므로
+  존재·현재성을 확인하고 파일 부재를 구현 완료로 해석하지 않는다.
+- 현재 계약을 API/protocol/storage/security 문서와 실제 schema/test에서 확인한다.
+  과거 `PROJECT.md`, `REMAINING.md`는 새 문서 안내이며 원문은 `.docs/archive/`의 이력이다.
+  과거 phase 번호를 현재 전체 계획의 단계나 구현 완료와 동일시하지 않는다.
+- Docker/VM/build/binary 자원은 `.docs/architecture/system.md`의 목록을 출발점으로 현재
+  소유권·사용 상태·source/version/target을 다시 확인한 후 재사용한다. 다른 프로젝트의
+  container/volume/service를 초기화하지 않는다. 계획만 요청받았으면 환경을 생성·교체·삭제하지 않는다.
+- 같은 OS/arch/channel 실행 대상에는 검증된 최신 공식 binary만 유지한다. source 기준·checksum·
+  공식 경로를 식별하고 임시 경로에서 새 binary 검증 → 공식 경로 반영 → 실제 service/npm 참조와
+  version 확인 → 이전 중복/임시 실행 파일 정리 → 남은 경로 검증 순서로 수행한다.
+  새 파일 검증 전에 정상 파일을 삭제하거나 파일 mtime만으로 최신 여부를 판단하지 않는다.
+- 필수 platform/channel 별 binary와 immutable published release는 중복 정리 대상이 아니다.
+  rollback/잠금 등 보존 예외는 정확한 대상·사유·영향·사용자 확인·해소 조건·정리 시점을 남긴다.
+  예외가 남아 있으면 최신 파일만 유지 완료라고 보고하지 않는다. 시스템·공용 도구는 정리하지 않는다.
 
 ## 8. Code Review and Prohibited Patterns
 

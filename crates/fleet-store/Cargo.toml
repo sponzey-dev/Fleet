@@ -11,9 +11,16 @@ postgres = ["dep:native-tls", "dep:postgres", "dep:postgres-native-tls"]
 [dependencies]
 fleet-application = { path = "../fleet-application" }
 fleet-domain = { path = "../fleet-domain" }
+getrandom = { workspace = true }
 postgres = { workspace = true, optional = true }
 postgres-native-tls = { workspace = true, optional = true }
 native-tls = { workspace = true, optional = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

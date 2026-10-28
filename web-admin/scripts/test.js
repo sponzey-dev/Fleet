@@ -35,6 +35,26 @@ const openapi = JSON.parse(readFileSync(openapiPath, "utf8"));
 assert(index.includes("Sponzey Fleet Admin"), "index must name the admin UI");
 assert(index.includes('class="admin-shell"'), "index must provide the admin application shell");
 assert(index.includes('class="admin-sidebar"'), "index must provide a left-side navigation region");
+assert(app.includes("const catalogPanel ="), "production Admin must compose the tested Catalog panel");
+for (const level of ["sources", "revisions", "documents"]) {
+  for (const action of ["status", "first", "next", "retry"]) {
+    assert(index.includes(`id="catalog-${level}-${action}"`), `catalog ${level} must expose ${action}`);
+  }
+}
+assert(!index.includes("Controller online"), "sidebar must not claim unobserved Controller health");
+assert(!/v\d+\.\d+\.\d+ · SQLite/.test(index), "sidebar must not hardcode a runtime version or backend");
+assert(index.includes("History snapshot. Refresh to update; select a job for its current result."), "job history must distinguish its snapshot from the selected live result");
+assert(styles.includes(".job-row:hover:not(:disabled)"), "history card hover must override the generic action-button fill without losing text contrast");
+const accentSoftValues = [...styles.matchAll(/--accent-soft:\s*(#[a-fA-F0-9]{6})/g)];
+function luminance(hex) {
+  const channels = [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255)
+    .map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+  return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+}
+const selectedBackground = accentSoftValues.at(-1)?.[1];
+assert(selectedBackground && (luminance(selectedBackground) + 0.05) / (luminance("#687385") + 0.05) >= 4.5,
+  "selected Agent secondary text must retain readable contrast on the final accent surface");
+
 assert(index.indexOf('class="admin-sidebar"') < index.indexOf('<main>'), "sidebar must precede the work area");
 assert(index.includes('id="page-title"'), "index must expose the current route title");
 assert(index.includes('id="page-subtitle"'), "index must expose the current route description");
@@ -90,10 +110,10 @@ assert(app.includes("hashchange"), "app must respond to browser history route ch
 assert(app.includes("focus: true"), "hash navigation must request route focus restoration");
 assert(app.includes("preventScroll: true"), "route focus must preserve scroll position");
 assert(!app.includes("localStorage"), "route state must not persist credentials in browser storage");
-assert(app.includes("loadCatalogRevisions"), "catalog source selection must load durable revisions");
-assert(app.includes("loadCatalogDocuments"), "catalog revision selection must load document metadata");
-assert(app.includes("submitCatalogAction"), "catalog mutations must use explicit action submission");
-assert(app.includes("catalogActionInFlight"), "catalog actions must prevent duplicate submissions while a request is pending");
+assert(app.includes("explorer.selectSource(value)"), "catalog source selection must use the scoped metadata owner");
+assert(app.includes("explorer.selectRevision(value)"), "catalog revision selection must use the scoped metadata owner");
+assert(app.includes("createCatalogActionPanel"), "catalog mutations must use explicit action submission");
+assert(app.includes("const owner = createCatalogActions"), "Catalog form must use the tested mutation and duplicate-request owner");
 assert(index.includes("id=\"agents-list\""), "index must expose the agents surface");
 assert(index.includes("id=\"agent-detail\""), "index must expose selected agent detail");
 assert(index.includes("id=\"revoke-agent-key\""), "index must expose agent key revocation");
@@ -122,10 +142,23 @@ assert(index.includes("id=\"command-selector\""), "run command form must expose 
 assert(index.includes("id=\"preview-command-targets\""), "run command form must expose target preview action");
 assert(index.includes("id=\"command-target-preview\""), "run command form must expose target preview result");
 assert(index.includes("id=\"job-targets\""), "index must expose target assignment table");
+assert(/<div(?=[^>]*id="job-targets")(?=[^>]*tabindex="0")(?=[^>]*role="region")(?=[^>]*aria-label="Selected job assignments")[^>]*>/.test(index), "assignment overflow must be a named keyboard-accessible scroll region");
 assert(index.includes("id=\"job-artifacts\""), "index must expose rendered artifact list");
 assert(index.includes("id=\"job-output\""), "index must expose job output");
+assert(index.includes('class="panel job-panel job-result-panel" data-route="run runbooks"'), "selected Job results must be shared by Run and Runbooks");
+for (const id of ["job-observation-status", "job-last-updated", "pause-job-observation", "resume-job-observation", "browse-job-output", "next-job-output-page", "job-output-info", "clear-admin-token"]) {
+  assert(index.includes(`id="${id}"`), `index must expose ${id}`);
+}
+assert(index.includes('id="job-observation-status" role="status"'), "observation changes must be announced independently of output");
+assert(/import\s*\{[^}]*\bcreateJobObserver\b[^}]*\}\s*from\s*"\.\/job-observer\.js"/.test(app), "app must use the tested read owner");
+assert(app.includes('import { createJobOutputReader } from "./job-output-reader.js"'), "app must load the bounded output reader");
+assert(app.includes('outputReaderFactory: () => createJobOutputReader({ api })'), "production must explicitly compose page-only output reads");
+assert(!app.includes("async function pollJobOutput(jobId)"), "retired capped polling must not compete with the single owner");
+assert(app.includes('document.querySelector("#jobs-list")?.addEventListener("click"'), "history must retain delegated selection after approval refresh");
+assert(app.includes('jobObservation?.setContext(adminViewContext(route))') && app.includes('authGeneration: api.getAuthGeneration()'), "route changes must update observation ownership");
 assert(index.includes("Run a command or select a job"), "job output placeholder must not look like a completed empty result");
 assert(index.includes("id=\"jobs-list\""), "index must expose job history");
+assert(/<article class="panel job-history-panel" data-route="run runbooks">[\s\S]*?id="jobs-list"/.test(index), "both workspaces must allow reopening past jobs from the same history");
 assert(index.includes("id=\"approvals-list\""), "index must expose approval queue");
 assert(index.includes("id=\"remediations-list\""), "index must expose remediation queue");
 assert(index.includes("id=\"remediation-form\""), "index must expose remediation action form");
@@ -209,6 +242,7 @@ for (const endpoint of [
   "listCatalogSources",
   "registerCatalogSource",
   "startCatalogSync",
+  "getCatalogSyncOperation",
   "activateCatalogRevision",
   "listCatalogRevisions",
   "listCatalogDocuments",
@@ -246,6 +280,7 @@ for (const endpoint of [
   "createCommandJob",
   "createDriftCheckJob",
   "createRunbookJob",
+  "createCatalogRunbookJob",
 ]) {
   assert(
     schema.endpoints.some((entry) => entry.name === endpoint),
@@ -376,6 +411,7 @@ await client.listPolicies();
 await client.listCatalogSources({ limit: 10, after: "public-catalog" });
 await client.registerCatalogSource({ source_id: "public-catalog", url: "https://example.com/catalog.git", reference: "main" });
 await client.startCatalogSync("public/catalog", { operation_id: "sync-001" });
+await client.getCatalogSyncOperation("public/catalog", "sync-001");
 await client.activateCatalogRevision("public/catalog", { commit: "a".repeat(40) });
 await client.listCatalogRevisions("public/catalog", { limit: 10, after: "a".repeat(40) });
 await client.listCatalogDocuments("public/catalog", "a".repeat(40), { limit: 10, after: "runbooks/web service.yaml" });
@@ -1154,11 +1190,11 @@ const tokenListHtml = renderEnrollmentTokens([
 assert(tokenListHtml.includes("role=web"), "token summary must include label scope");
 assert(!tokenListHtml.includes("enroll-secret"), "token summary must never include the raw token");
 assert(
-  formatApiError("/api/agents", 401).includes("admin token"),
+  formatApiError("/api/agents", 401).includes("Sign in again"),
   "forbidden renderer must guide operator toward authorization",
 );
 assert(
-  formatApiError("/api/agents/agent-1/revoke-key", 403).includes("permissions"),
+  formatApiError("/api/agents/agent-1/revoke-key", 403).includes("permission"),
   "forbidden renderer must tell operator to check permissions",
 );
 assert(formatApiError("/api/jobs/job-missing", 404).includes("not found"), "404 errors must be explicit");
@@ -1346,7 +1382,7 @@ const approvalPendingOutput = renderJobOutputStatus(
 );
 assert(isApprovalPendingJob({ status: "pending_approval" }), "approval pending jobs must be detected");
 assert(
-  approvalPendingOutput.includes("Open Approvals and approve or reject this job"),
+  approvalPendingOutput.includes("Use the Approvals section in Run or Runbooks"),
   "approval pending output must point to approval action",
 );
 assert(

@@ -4,15 +4,152 @@ This document records the current security boundary for Sponzey Fleet. It is
 implementation-facing documentation: code changes that affect authentication,
 authorization, task dispatch, secrets, or audit should update this file.
 
+Project priorities and stable feature IDs are in the
+[capability map](../.docs/product/capabilities.md) and [overall plan](../.docs/plans/plan.md).
+Remaining numbered Phase references are historical labels, not the active `.tasks/` phases;
+the [documentation map](../.docs/README.md) records their correspondence.
+
 ## Current Scope
 
-Sponzey Fleet currently has a bootstrap admin token and a minimal permission
-model. Full OIDC, SSO, user management, and multi-admin session management are
-Phase 6 work in `.tasks/plan.md`.
+Sponzey Fleet supports single-organization local administrator accounts with the existing
+owner/admin/operator/viewer business permissions. Bootstrap-token access is a separate legacy
+mode that ends atomically at first-owner activation. Individual identity is IAM-001; project isolation is IAM-002.
+The selected first path is local username/password for one organization (D-012/D-013).
+Its scoped personal login/session lifecycle is implemented and exercised over HTTPS; the contract is
+[IAM-001](../.docs/domains/identity/features/IAM-001-auth-contract.md). OIDC is outside this scope.
+
+The implementation foundations now include pure account/credential rules, Application
+transaction ports and synthetic-tested owner/setup/password use cases. Controller crypto
+primitives use NFC, bounded input, a local weak-password blocklist, fixed Argon2id v19
+(19,456 KiB, two passes, one lane, 16-byte random salt, 32-byte output), constant-time
+hash comparison, and an explicitly owned wiped scratch buffer. Token generation uses
+OS entropy and purpose-specific 256-bit material with purpose-bound SHA-256 lookup digests.
+The primitives are crate-private behind a tested password worker with one or two owned threads,
+one pending queue slot, and at most workers-plus-one outstanding computations/replies. The
+30-second monotonic request deadline never renews; cancellation/drop skips queued work and
+discards late results. Shutdown closes cloned clients and joins native computations. Workers
+have no store or credential-issuance authority. SQLite and feature-gated Postgres v28 repositories provide atomic
+account/mode/credential/audit transactions, a separate human epoch, commit-time owner guards
+and conditional legacy-token rejection. Corrupt records fail closed. Controller composition,
+personal login/session/logout/setup and owner account reads/mutations now consume those boundaries.
+Own password replacement and PAT issuance/metadata/revocation are connected. Command, DriftCheck, direct and catalog Runbook creation plus
+approval/rejection, explicit cancellation, manual approval expiry and remediation approval/job creation revalidate current human authority in the same transaction as their effects.
+Personal Admin screens and personal-token CLI profiles are connected; scoped two-user HTTPS browser/API/CLI and Linux Agent acceptance have passed.
+CLI login reads a personal token from a hidden terminal or explicit single-line stdin,
+verifies the required personal session endpoint, and atomically saves an owned private profile.
+It never submits or stores a remote account password. The existing `controller_url`/`admin_token`
+profile format is retained; legacy explicit token arguments remain available but are not the
+recommended personal input. Profile reads reject unsafe modes, links, unknown fields and
+oversized content, with redacted diagnostics. Changing the server origin alone cannot reuse
+a saved credential. Protected CLI requests have a ten-second deadline and reject redirects;
+they never retry an operation under a replacement credential. Unix TTY restoration, temporary
+profiles and owned HTTP tests are supplemented by actual HTTPS PAT issuance/use/revocation with a Linux Agent.
+Idle dispatch polling is FieldDebug detail. Product logging records only new dispatch/failure
+effects for this event, avoiding repeated no-op traffic in the default profile. Log consumers
+must drain their streams; this does not introduce a general nonblocking logging guarantee.
+Optional login `--tls-ca-cert` saves only a canonical public CA path in `tls_ca_cert`;
+older two-field profiles remain valid and omit the optional field when resaved without a CA.
+Each command reads that regular file once at bootstrap, bounded to16KiB, rejects empty/invalid
+certificate sets, private-key PEM items and special files, and passes immutable public bytes
+to its scoped client. Built-in roots and hostname verification remain enabled; no OS/browser
+trust store is changed and no certificate/key body is printed.
+The Postgres identity adapter's shared Application, migration rollback and concurrent owner/claim/revocation contracts passed on an owned PostgreSQL18.3 fixture; Controller Postgres readiness remains unsupported. No PHC cost from a
+stored string can control this fixed primitive; repository adapters must validate the semantic
+profile/salt/hash components before constructing a verifier.
+
+Application login/PAT services now enforce fixed expiry, same-request password proof and current
+credential/account/epoch checks at commit. Session8/global4096 and PAT16/global8192 admission uses
+serialized counts after bounded128-per-purpose lookup reclamation. Ephemeral lookup deletion never
+deletes account/audit history. Self metadata excludes digest/binding/secret; owner/purpose filtering
+precedes row decoding, including corrupt foreign rows and page lookahead. Logout ends only the web
+session; self PAT revocation can remove its own caller. Actual SQLite/Postgres tests cover both
+admission races and revoke/logout audit rollback; the real worker/SQLite consumer keeps an independent
+writer available through five password operations. Actual HTTP KDF probes also keep the Controller
+shared mutex available during login and owner create/change/reset. Owned HTTP/HTTPS cookie/CSRF
+tests are foundation evidence; full two-user browser/Linux-Agent HTTPS acceptance remains separate.
+
+Owner create/change/reset HTTP requests require same-request current-password proof, with the
+canonical actor username's failure budget shared with login and the same bounded CPU admission.
+Only owner authority reaches those use cases; admin/operator/viewer cannot manage even themselves
+through administrative URLs. Known DTOs reject duplicate, unknown and explicit-null change fields.
+Application serializes current actor, target revision, last-owner guard, credential revocation and
+Security audit. Metadata-only/same-role changes keep proofs; role/disable/reset revokes the target's
+sessions, PATs and unused codes. Successful self revocation clears the caller cookie. A future-created
+credential causes a safe state conflict rather than an invalid revocation timestamp. The once-returned
+setup/reset code is a POST-body secret, not a link query. Audit failure rolls all effects back, and
+cancelled/revoked late KDF proofs cannot create accounts. Other people's credentials and accepted
+Agent work are outside this human-revocation effect. Command, DriftCheck, direct/catalog Runbook and approval/rejection/explicit-cancellation/manual-expiry/remediation approval and Job creation use canonical guards.
+
+Self password/PAT issuance HTTP accepts all four active roles and derives the target solely from
+the verified credential. Nominated user/role/expiry fields are rejected. Same-request password proof
+uses the same bounded admission as owner actions. Password replacement revokes all own proofs and
+clears a web caller's cookie without auto-login; PAT callers receive no Set-Cookie. PAT issuance
+returns one fixed thirty-day secret and keeps the caller session intact. Native HTTP covers per-user
+quota refusal followed by expired-row reclamation and fresh issuance, and safe audit rollback for both
+operations. Real KDF probes keep the shared store mutex available for own password verification/hash
+and PAT proof; revoked/cancelled late PAT proofs do not issue. The scoped two-user UI/CLI/API and Linux Agent journey has separate actual HTTPS evidence.
+
+The Admin HTTP client owns a memory-only authentication generation. Identity changes and successful
+logout abort prior effects; late JSON/errors cannot publish into a new identity. Only a current401
+retires authenticated authority;403 remains a permission failure. Cookie business mutations receive
+the current CSRF proof, while bearer effects omit cookies. Required authentication/account404 is an
+error. Direct and catalog submissions never automatically retry. Uncertain direct submissions retain
+only their Job ID and require an explicit stored-Job read before another submission; catalog intent
+cannot be replayed by a later authentication generation. This effect boundary is connected to the
+existing static Admin, including personal login, owner/self account forms and per-role Settings tabs. Scoped two-user HTTPS/Agent acceptance has passed.
+
+Own PAT metadata/revocation HTTP now consumes the bounded query and canonical revoke use cases.
+Queries are scoped by subject/purpose before row decoding and validate the whole lookahead. A
+corrupt foreign row stays invisible; a corrupt owned row fails without a partial page. GET never
+cleans/renews and returns only ID/label/timestamps/server-derived active state. The selected own PAT,
+including the caller PAT, may be revoked without current-password proof; cookie calls still require
+Origin/CSRF. Foreign/missing/non-PAT/already-revoked IDs return the same404 regardless of pending
+lookup cleanup. Audit failure rolls back revocation, and names/roles never replace immutable user IDs
+as audit actors. These HTTP fixtures are supplemented by separate actual browser/Linux-Agent acceptance.
+
+Core now provides a separately tested Unix data-directory lease: current effective OS
+owner, mode 0700 directory, mode 0600 singly linked regular lock, no final symlink or
+special-file lock, and nonblocking exclusive flock. Existing permissions and file contents
+are not changed; explicit Drop unlock prevents inherited descriptors from extending the
+operation's authority. Production Controller startup acquires this lease before transport,
+database and signing-identity access and retains it until runtime shutdown completes.
+The local `controller admin init-owner` CLI now borrows this authority while reading bounded
+hidden TTY input or explicit single-line stdin, running the bounded worker and committing the
+Application owner/mode/audit transaction. Local audit actors derive from the OS UID. Init and
+owner commands use the same custom SQLite settings as start. Personal/restored init preserves
+signing identity and never creates a shared token; missing original keys require backup recovery.
+CLI library/PTY tests cover these paths. The official debug-binary loopback rehearsal now verifies
+positive legacy authentication before cutover, process contention/SIGKILL, audit-fault rollback,
+one successful concurrent cutover, durable owner state and old-bearer rejection after restart,
+with Agent identity, signing keys and history preserved. Separate live personal login/HTTPS acceptance has passed. The owned rehearsal is reproducible with
+`python3 scripts/manual_admin_identity_smoke.py --build`; an existing marked fixture requires
+explicit `--reset-fixture`, and an implicit reset leaves both data and proof unchanged.
+Local `controller admin recover-owner --username <login-name>` now composes existing-person
+recovery with the same OS lease, database selection and hidden/stdin password boundary.
+It validates retained signing material before input and revokes only that person's old credentials;
+other people, the human epoch and Agent trust remain intact. Real target password crypto and
+SQLite composition tests and the fresh official-binary recovery/restore rehearsal pass on the owned private fixture.
+The lock is advisory between participating processes; an older binary must be stopped
+explicitly before upgrade, and a malicious process with the same OS identity is outside it.
+
+The Application restore boundary now rotates an independent CSPRNG human epoch and appends
+its Security audit atomically under local authority. Sessions/PAT/setup/reset grants from the
+snapshot fail their old epoch binding; accounts, verifiers and credential history remain intact.
+Without a loginable owner it selects local setup, never shared-token access. SQLite and actual
+owned Postgres tests cover rollback and nonhuman-history/delivery-epoch preservation. The CLI now
+composes this boundary in a private candidate under the target lease, independently rotates the
+Agent delivery epoch, syncs files and atomically exchanges the target directory. Older snapshots
+without a loginable owner require local setup. Actual filesystem/library tests cover four-purpose
+rejection, preserved history/keys, audit rollback, syscall failure, before/after-exchange process kill
+and distinct postcommit durability/cleanup warnings. The current official-binary rehearsal also
+passes local recovery, dry-run, two-epoch restore, corruption/audit rollback, busy offline commands
+and old-backup local setup. Its seeded credential rows prove native persistence/binding changes;
+the actual file-to-Application tests prove positive-before/negative-after authentication. Separate actual
+personal-login/HTTPS restore and four-purpose replay rejection have passed. See [storage safeguards](storage.md#backuprestore).
 
 Current behavior:
 
-- `fleet controller init` prints one raw admin token.
+- In legacy mode, `fleet controller init` prints one raw admin token; personal/restored modes skip shared-token issuance.
 - The raw admin token is shown once and is not stored in plaintext.
 - The controller stores only the admin token hash.
 - The stored bootstrap admin token maps to actor `bootstrap-admin`.
@@ -21,11 +158,204 @@ Current behavior:
 - The controller derives the request actor from the authenticated token, not
   from a request body field.
 - Audit events for admin actions use the authenticated actor.
+- Existing business-role permission rules are owned by the pure Domain layer; request
+  authentication/context assembly still uses the Controller adapter and Application repository.
+- SQLite output-page reads require `job_read` on every request and use `Cache-Control: no-store`,
+  bounded source/JSON budgets and typed errors without raw output/SQL. The opaque cursor is an
+  untrusted read position, never a credential or integrity claim. Scope, persisted generation,
+  restore epoch and UTF-8 position are rechecked; stale or unreadable state never becomes empty
+  success. Cursor/output/error bodies are not persisted or written to Product/Field logs.
 
-Phase 6 product admin identity must extend this model instead of replacing the
-authorization boundary. OIDC sessions or API tokens must produce explicit actor
-ids, roles, and project scope, but API handlers must still receive an
+IAM-001 product admin identity must extend this model instead of replacing the
+authorization boundary. Personal sessions and API tokens must produce explicit actor
+ids and roles; project scope is a separate IAM-002 extension. API handlers must still receive an
 authenticated request context and must not trust UI-provided actor fields.
+
+## Command Process Ownership
+
+Darwin/Linux command execution owns a fresh process group and polls output without detached reader
+threads. Output-consumer failure, output-limit failure, cancellation and timeout unwind that owner,
+which signals the group and reaps its child. `waitid(NOWAIT)` retains the leader until cleanup to avoid
+signalling a recycled PID. No PID from a previous Agent process is used. This is not a sandbox:
+already-completed effects are not rolled back, and a daemon that escapes the group is outside this
+cleanup boundary. A synchronous caller-provided callback must return before timeout/cancel can be
+checked again; runtime integration must keep disk work away from the session heartbeat owner.
+
+## Agent Journal Library Boundary
+
+The persistent CLI Agent connects its journal library to the active v2 session for Command and
+no-artifact Runbook stdout/stderr, no-artifact Command/Runbook final results, and DriftCheck evidence
+plus its separate terminal result.
+It stores bounded raw output as sensitive data, not as operational logs. Its
+SQLite adapter requires Unix effective-user ownership and owner-only permissions, rejects
+symlinks/hardlinks and identity mismatches, and redacts report bodies from Debug/errors. The adapter
+uses the Unix `rustix` process API for effective-user checks; it introduces no Domain/Application OS
+dependency. The journal is not encrypted at rest and cleanup is not a forensic-erasure claim.
+
+Persistent Command and no-artifact Runbook output sequence starts at zero independently for stdout and stderr. The Agent's
+final v2 report carries counts only after each corresponding output report is committed to its local
+journal. Before a persistent Command or no-artifact Runbook final effect or receipt, SQLite verifies
+exact `[0, count)` coverage in both stored streams; a gap leaves the final pending. `truncated=true` is never accepted as success.
+The Job audit contains only the counts and truncation flag, not output bytes. The local execution
+record also retains committed per-stream counts after individual output receipts delete report bodies,
+so restart recovery can produce a final accepted by the Controller's exact-prefix barrier. This
+boundary verifies delivery of the Agent-committed prefix; it cannot prove that the runner captured
+every byte produced by task execution. If a journal append returns an uncertain failure, the Agent
+does not guess the count or write a contradictory final report; the durable start intent is left for
+recovery.
+
+Execution journal admission requires prior durable nonce consumption and verified signed task ownership.
+Only a fresh admission and a committed start intent grant the live owner permission to begin host
+effects. After process restart, admission/start-intent records describe interruption, not an execution
+retry. Final-report persistence and execution completion share one transaction. Persistent WebSocket
+Command and no-artifact Runbook paths use this order: signature/target/expiry and nonce checks precede
+admission, start intent precedes host effects, and recovery after process restart or prior task-owner
+exit commits `failed` with `agent_interrupted_before_start` or `execution_outcome_unknown` without
+rerunning the task. A same-process reconnect while a task owner is still live skips recovery; an idle
+reconnect or next admitted task retries reconciliation. Artifact-producing Runbook, one-shot and Drift
+execution paths remain outside this integration; it does not replace signature and nonce checks.
+
+Agent journal schema v3 adds committed per-stream counts and schema v4 adds the `drift_evidence`
+class while preserving the v3 reports. Upgrading a v2 journal with an active
+`StartIntent` is rejected before changing its schema or stored reports because the older format cannot
+prove whether receipts already deleted output needed for exact recovery. Finish that execution with
+the existing Agent before upgrading. This is a local-data safety guard, not support for an older wire
+protocol; old wire compatibility is not supported.
+
+If a persistent Command or Runbook's matching no-artifact final report arrives after SQLite G2 has
+marked the owned Assignment `failed/execution_outcome_unknown`, the Controller commits a late-report disposition
+and one redacted audit, then returns a signed `stored` receipt. It does not revise the Assignment,
+Job aggregate, or G2 reason. An exact retry replays the persisted receipt without another audit;
+changed bodies and unrelated terminal states are not ACKed. The receipt confirms durable disposition,
+not that the earlier unknown outcome was success or that effects ran exactly once.
+
+An owner-matching TaskAck/TaskStarted/TaskRejected arriving after SQLite G2 marked its Assignment
+`failed/execution_outcome_unknown` receives an atomic late disposition and signed `stored` receipt.
+It appends one redacted audit and commits the inbox marker without changing Assignment, Job, or G2
+reason; exact retries replay the same receipt so ordered Agent replay can continue. This receipt is
+not evidence of acceptance, execution, or success. Conflicting bodies and owner mismatches remain
+fail-closed; the dispatched-cancellation exception below preserves the same terminal-state boundary.
+
+A report from the exact authenticated owner of a previously dispatched, now-canceled Assignment
+can also receive a terminal-preserving disposition. Supported no-artifact Command/Runbook finals
+must have exact stored output coverage and no remediation follow-up. A valid reported outcome may
+have raced cancellation; it never replaces the canonical canceled state, operator reason, completion
+time or Job aggregate. Matching lifecycle reports likewise acknowledge durable receipt only. These
+paths append a redacted disposition audit atomically with the inbox marker and replay the exact
+signed receipt. They neither authorize execution nor delete an unacknowledged Agent report.
+Undispatched cancellations, unrelated terminal states and unsupported final effects remain rejected.
+
+The Controller's SQLite recovery worker never treats envelope expiry or disconnection as proof that
+the Agent process stopped. After the persisted dispatch time plus Job timeout and a five-minute grace,
+it conditionally records an active Assignment as failed with the redacted typed reason
+`execution_outcome_unknown`; Assignment, Job aggregate, and audit commit atomically. It does not
+replay the signed task, and a concurrent terminal result/cancel wins. Startup recovery must finish
+before listener bind; a Postgres-selected runtime without this repository contract fails startup.
+
+The generic journal worker returns success only after its repository operation succeeds. Queue
+admission or a caller wait timeout grants neither transmission nor host-execution permission.
+Pending/replayed output and retained replies share bounded logical memory budgets. Receipts still
+require session authentication before reaching the worker. Shutdown joins the owner; it does not
+abandon a disk writer that could later commit unexpected state.
+
+The v2 receipt statement has validated, domain-separated canonical signing bytes covering
+Controller namespace/store epoch, report owner/key/digest, signing time, disposition and signer fingerprint.
+The active v2 report/receipt payload codec rejects wrong versions, Agent owner mismatch,
+malformed or oversized base64 report bodies, wrong SHA-256 digests and malformed receipts before
+an application handler can stage them. It redacts report body from Debug and errors. These checks
+do not authenticate the socket or verify Ed25519. The authenticated Controller session handles
+SQLite `lifecycle` TaskAck/TaskStarted/TaskRejected, `drift_evidence`, `output`, and supported
+Command/Runbook/DriftCheck `final-result` reports, including artifact-bearing Runbook finals. The persistent
+CLI Agent produces journal-backed reports for TaskAck/TaskStarted/TaskRejected, DriftCheck evidence,
+Command/no-artifact Runbook stdout/stderr, and no-artifact final results including DriftCheck terminal results with a strict required output summary. Artifact-bearing Runbook output/final bytes are ephemeral and not journaled. The Agent consumes receipts
+only after session identity, exact report, namespace, epoch and
+pinned/rotated signing-trust checks. The protocol module is a **shape and preimage contract only**.
+The separate Agent library verifier returns a cleanup candidate only for `stored`; the CLI then
+submits an exact-row ACK to the journal worker. A forged `auth_accepted` on test-only HTTP or a
+well-formed receipt shape cannot authorize journal deletion. Rejected receipts fail closed and retain
+the report; explicit rejection disposition handling remains future work.
+The Controller's stored-receipt helper refuses noncommitted inbox outcomes and checks the caller's
+authenticated Agent ID, durable namespace/epoch, signing-key pair and fingerprint before signing.
+The authenticated SQLite TaskAck/TaskStarted/TaskRejected, DriftEvidence, output, and supported final-result handlers call it only after
+committing their effects; the helper itself does not authenticate its caller and cannot grant ACK
+authority from a merely staged row. `ControllerIdentity` Debug output redacts its private key. Rejected receipts still need
+an explicit durable disposition and separate handling.
+SQLite schema v25 stores signed receipt bytes for an exact committed inbox key/digest; schema v26
+adds the `drift_evidence` inbox class while preserving existing inbox and receipt rows. The storage
+transaction checks active namespace/epoch and Assignment ownership; same-epoch, same-signer retries
+return the original bytes. If the active Controller signer changed, an exact candidate for the same
+committed digest/epoch replaces the old receipt atomically. The Controller helper signs and verifies
+that candidate with its active identity before persistence, then verifies the stored bytes and
+signature again before returning them. Pending, stale-epoch and digest mismatch do not produce an ACK.
+The authenticated SQLite TaskAck/TaskStarted/TaskRejected, DriftEvidence, output, and supported final-result
+handlers persist then queue this receipt through the session's bounded single-writer path. For
+persistent TaskAck/TaskStarted/TaskRejected, Command/no-artifact Runbook output, no-artifact Command/Runbook/DriftCheck final results,
+and DriftCheck evidence, the Agent verifies the receipt against current/rotation-grace
+trust and removes only the matching journal row. Direct one-shot and artifact-producing Runbook
+report producers and their output chunks remain outside that durable journal path; a receipt for an
+ephemeral artifact report is not Agent-side replay or cleanup authority.
+Controller schema v23 stores a random delivery namespace separate from signing/TLS keys and a
+store epoch that is explicitly rotated during actual backup restore. The Agent journal binds to
+namespace plus Agent ID and receipt verification uses the current authenticated epoch. A still-pending
+exact report can be replayed after restore; if its owner-bound inbox effect is already present, the
+Controller does not repeat it and issues a receipt for the current epoch. A prior-epoch receipt cannot
+authorize Agent cleanup, and missing owners remain fail-closed. This only covers reports still present
+in the Agent journal. A report already ACKed and deleted before restoring an older snapshot cannot be
+reconstructed; external backup/reconciliation is still required for that loss window.
+The Controller inbox Application admission rejects mismatched authenticated Agent ID,
+local Controller namespace, empty body and oversized body before calling a repository. It returns
+typed staging outcomes only; staging alone is never treated as effects-committed or a signed ACK.
+The SQLite Controller inbox separately checks Assignment ownership and stores raw report bytes
+under bounded per-Agent pending quotas in one transaction. Pending bytes are sensitive backup
+content. Neither a staged row nor a duplicate pending row can authorize Agent journal deletion.
+Its bounded final-result recovery read verifies the stored body digest and Assignment owner after
+reopen. A read does not commit effects or authorize an ACK; corrupt data is rejected without raw
+body in the error.
+For staged command/runbook finals, the SQLite effect adapter commits prepared artifact metadata,
+Assignment status, Job aggregate, redacted Job audit and inbox marker in one transaction. It
+requires body-put evidence to match id/class/checksum/size when present and leaves the raw staged
+report pending if a DB effect fails. A prepared remediation execution update and its Policy audit
+share that transaction and are guarded by the expected prior state; successful execution persists
+the existing `succeeded_pending_verify` recovery intent. A drift-check verification final can
+commit its own Assignment/Job/audit/marker without fabricating evidence or resolving remediation.
+The live `drift_evidence` path requires exact staged bytes, authenticated Assignment ownership, and
+Controller-stored policy/version/purpose; it atomically commits the correlated drift row, redacted
+audit, eligible remediation proposal and audit, and inbox marker before issuing a signed receipt.
+The evidence receipt confirms stored evidence/effects only and never sets TaskResult success or
+completes the Job. The live final-result handler supports Command, Runbook, and DriftCheck reports
+without remediation follow-up, including artifact-bearing Runbook finals. For a Runbook artifact
+body, the Controller validates size/checksum, performs an idempotent immutable file put, and then
+commits metadata and final effects atomically in SQLite. A failed DB effect leaves the exact report
+pending, but no worker reapplies it automatically; the Agent does not journal the artifact report/body
+for replay. No-artifact Command/Runbook finals and DriftCheck terminal results are journaled/replayed
+by the Agent through that path.
+The local artifact store now treats an object ID/class as immutable: an identical retry succeeds,
+while different or corrupted existing bytes are not overwritten. New bodies are synced in an
+owner-only temporary file before no-clobber publication; this does not make the filesystem and
+Controller database one atomic transaction.
+The current Controller `TaskAck`/`TaskRejected`/`TaskStarted`/`TaskResult` transitions check the
+authenticated Agent ID and claimed Job ID against the Assignment within the SQLite/Postgres
+transaction. A mismatch leaves the Assignment unchanged and records a
+`task_assignment_owner_mismatch` Security audit. Persistent TaskRejected is a strict v2 lifecycle
+report: only an owned `dispatched` Assignment can become `rejected`; its reason code and redacted
+reason commit with the Job aggregate, audit, and inbox marker before the signed receipt is issued.
+The direct one-shot path remains on the separate ephemeral TaskResult message. Artifact-producing
+persistent Runbook finals now use a strict v2 `FinalResult` message but remain ephemeral on the
+Agent. Persistent DriftCheck evidence and terminal results use separate durable reports:
+the evidence receipt does not change Job/Assignment status, while the final-result effect does.
+No-artifact Command/Runbook final results use the same durable journal and receipt flow; a matching
+no-artifact DriftCheck final arriving after G2 preserves the existing terminal state.
+For a staged output chunk, SQLite commits the output effect and inbox marker together; an injected
+failure rolls both back. The committed digest tombstone prevents retention from resurrecting an
+already-applied output on retry. The authenticated live Controller adapter parses strict TaskAck,
+TaskStarted, and TaskRejected lifecycle bodies, output, and supported final-result bodies including
+artifact-bearing Runbook reports, commits effects before signing and persisting a receipt, then queues
+it to the same session writer. DriftEvidence is also committed with its required evidence/proposal
+effects before receipt issuance. Other lifecycle reports, remediation final-result follow-up and
+Postgres remain unsupported in the live path. The Agent uses the receipt
+cleanup path for persistent TaskAck/TaskStarted/TaskRejected, DriftEvidence, Command/no-artifact Runbook
+stdout/stderr, no-artifact Command/Runbook final results, and DriftCheck terminal results. Direct
+one-shot results and artifact-producing Runbook output/final report replay remain outside this path.
 
 ## Authentication Result
 
@@ -44,11 +374,12 @@ overrides or ignores them when an authenticated admin actor is available.
 ## Authenticated Agent Drift Evidence
 
 An authenticated WebSocket session proves the reporting agent identity, but it
-does not make its drift-report payload authoritative. A report that supplies a
-job/task pair becomes automation-eligible only after the controller matches the
-pair and session agent to a persisted signed drift assignment with a stored
-policy id, version, and purpose. The controller, rather than the wire payload,
-constructs the typed provenance written to storage.
+does not make drift-evidence provenance agent-authoritative. The v2 ReportKey
+contains the correlated job/task identity; policy id, version, purpose, and
+assignment ownership must match the Controller-stored signed drift assignment.
+The strict `drift_evidence` body contains only status and observed expected/actual
+values. The Controller, rather than the evidence body, constructs the typed
+provenance written to storage.
 
 The application proposal boundary validates the Controller-verified report,
 policy id, and policy version before storage allocates the report id. The id is
@@ -95,7 +426,11 @@ policy/version, `remediation_verification` purpose, and compliant status while
 committing the remediation status, only its origin drift resolution metadata,
 and the redacted `remediation_resolved_by_verification` Policy audit. Stale,
 unknown, drifted, failed, missing, or mismatched evidence is never promoted to
-resolved and never updates an unrelated latest drift report.
+resolved and never updates an unrelated latest drift report. Before the
+listener binds, one bounded scan also feeds already-persisted successful
+final/evidence pairs through the same use case. Resolved rows are excluded on a
+repeat scan, preventing a duplicate resolution audit; this is not periodic or
+HA recovery.
 
 Legacy reports with no pair, reports from raw-policy drift jobs, and reports
 with missing, unknown, mismatched, or non-drift assignments remain visible as
@@ -230,8 +565,19 @@ manager integration.
   material.
 - Product Log, Field Debug Log, audit values, API responses, Web Admin state,
   and docs examples must contain secret references or redacted markers only.
-- Product provider source configuration, provider lease/rotation lifecycle, and
-  Vault/OpenBao adapters remain follow-up work.
+- Actual Agent Runbook entrypoints currently construct DisabledSecretProvider; helper/static tests
+  do not establish production provider injection. The next confirmed scope is
+  [SEC-002](../.docs/domains/security/features/SEC-002-openbao-kv-v2.md): OpenBao KV v2,
+  Agent-side AppRole authentication and preparation-scoped short-lived tokens. It is planned,
+  not implemented. Controller lookup/relay, dynamic secret leases and automatic file reapplication
+  are excluded. KV version changes and authentication-token lifetime have separate acceptance tests.
+- The confirmed review policy (D-015) keeps dryRun/checkMode/apply free of provider requests.
+  Actual execution must confirm token revocation after reads and before host mutation; a failed or
+  uncertain revoke ends preparation without applying files. This is planned behavior, not current support.
+  Dedicated private bootstrap credentials and required OpenBao HTTPS payloads are intentional boundaries;
+  they must never be copied into Fleet reports, ordinary persistence or operational diagnostics.
+  The planned Controller rejects secret-bearing artifact bodies before inbox staging, and accepts
+  supported body-free late metadata only as a terminal-preserving disposition with a verified receipt.
 
 ## API Boundary Rules
 
@@ -287,7 +633,7 @@ API calls.
 
 ## Trust And Identity Separation
 
-Phase 5 adds a typed trust settings boundary so transport identity and task
+The current SEC-001 trust settings boundary keeps transport identity and task
 signing identity cannot be accidentally treated as the same material.
 
 - TLS server identity is the HTTPS/WSS certificate and private key passed with
@@ -541,13 +887,19 @@ Audit/log policy:
 
 ## Current Limits
 
-- There is no OIDC/SAML/SSO integration. Phase 6 owns OIDC login, session
-  lifecycle, API token model, project/team RBAC, and route permission tests.
-- There is no product-grade multi-admin user lifecycle. Phase 6 must add
-  explicit admin identity, project membership state, and audit actor tests.
-- The current SQLite admin token table is a bootstrap foundation, not a full
-  user store.
-- `owner` and `admin` are intentionally equivalent for now.
+- There is no OIDC/SAML/SSO integration. IAM-001 owns the first confirmed identity/session
+  lifecycle, credential revocation, and route permission tests; IAM-002 owns separate project isolation.
+- The personal-account Domain/Application lifecycle, identity store, bounded password worker,
+  local cutover/recovery and human restore-epoch foundations exist. HTTP login/session/logout,
+  single-use setup, cookie/PAT authentication and origin/CSRF adapters are connected.
+  Account-management APIs, business-effect authorization guards and Admin/CLI integration
+  are connected and pass scoped two-person HTTPS/API/CLI/Linux-Agent acceptance.
+  Project membership is not included.
+- The legacy SQLite admin token table remains the bootstrap HTTP path; personal-mode
+  storage rejects its use. It is separate from the new account and credential tables.
+- `owner` and `admin` remain equivalent for existing business operations. The personal-account
+  policy grants management of other users to `owner` only; all active roles manage their own
+  password/PAT. Account-management HTTP enforcement and the scoped direct API matrix are tested.
 - Permission checks cover the current REST route boundary. Every new public
   API must add an explicit permission and table-driven authorization test before
   becoming public.
@@ -568,6 +920,39 @@ Audit/log policy:
   its strict parser and size limits, or the sync fails without changing the active revision.
   Private Git authentication remains unsupported; no URL, request, or runtime model accepts a Git
   token.
+  A nondefault fetched branch is resolved from its exact origin reference when it has no local
+  branch name in the bare staging repository. An absent requested branch never falls back to HEAD.
+  The sync-operation status GET requires `policy_read`, checks source and operation identity, and
+  returns only classified state, optional commit and a failure code. All responses are no-store;
+  missing and cross-source operations share 404, and repository failures reveal no raw details.
+  Reading status never fetches Git or activates a revision. HTTP 202 accepts an operation and does
+  not establish completion; callers follow the canonical ID returned by the start response.
+  Catalog Runbook creation prepares pending approval and body-free provenance audits before one
+  required composite persistence call. SQLite and feature-gated Postgres recheck the exact active,
+  ready Runbook document and body inside the transaction, then commit Job, signed assignments,
+  target snapshots, approval, audits and dispatch settings together. Store failure or a changed
+  selection does not authorize dispatch; duplicate Job IDs do not overwrite the original.
+  The internal port itself does not authenticate callers or execute a task. The additive
+  `POST /api/jobs/catalog-runbook` requires JobCreate and PolicyRead, derives the actor from the
+  authenticated token and rejects raw body/actor/approval/nonce overrides and unknown fields.
+  Application preflight rejects explicit unknown/disabled/duplicate targets and known incompatible
+  or stale Runbook/step capabilities before persistence. Selectors preserve existing disabled/offline
+  semantics; absent/unknown capability reports do not establish support and retain Agent validation.
+  The handler uses the composite port and committed approval/dispatch gate. Errors are classified
+  and no-store; an uncertain POST is reconciled by its stable Job ID, never automatically retried.
+  Protected Job detail reads the Job-owned provenance snapshot, not a later active revision.
+  Selector preview may use the Controller-owned active-session snapshot to display liveness.
+  This does not update persisted Agent state or authorize a disabled target.
+  Web Admin reviews the stored active Runbook and selector preview before submitting only the
+  immutable reference and exact selected Agent IDs. A review checkbox does not approve execution.
+  Route, token, selector and document changes retire review requests. An uncertain submission
+  retains one stable Job ID; reconciliation verifies its provenance and targets before the view
+  accepts it, and a confirmed missing Job permits only an explicit retry of the same request.
+  No automatic POST retry, newly generated recovery ID or browser-persisted intent/token is used.
+  For this POST only, a known `Fleet-Catalog-Rejection` response header classifies a definitive
+  selection/target rejection before creation. The client may retire that rejected intent and let
+  the operator review again. A duplicate ID or absent/unknown header keeps the original unresolved
+  ID. No error body or arbitrary header value is retained or logged.
 
 ## Post-MVP Security Phase Map
 
@@ -583,3 +968,5 @@ Audit/log policy:
 | HA coordination | Phase 10 | Lease/claim tests; no WebSocket handle persisted. |
 | Compliance audit hardening | Phase 11 | Tamper-evident chain and signed export manifest without claiming WORM storage. |
 | Plugin/external adapter | Phase 14 | Disabled by default, signed manifest, approval/capability/audit required. |
+
+The scoped IAM acceptance uses a private, short-lived test CA. API/CLI/Agent validate it and the hostname explicitly; a human passed the browser warning for that local site only. No OS/browser trust store was changed. Actual login bursts return typed401/429 while a connected Linux Agent continues heartbeat and a harmless approved Job. Debug/shared-host observations are cost reports, not production capacity or a whole-Fleet SLA. Follow-up heartbeat handling uses Controller receipt time, rejects a different Agent ID and preserves degraded health; ordinary valid ticks do not create Security-audit noise.

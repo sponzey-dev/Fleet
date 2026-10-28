@@ -81,6 +81,7 @@ OpenAPI 문서 범위:
 - `/api/catalog/sources`
 - `POST /api/catalog/sources`
 - `POST /api/catalog/sources/{source_id}/sync`
+- `GET /api/catalog/sources/{source_id}/sync-operations/{operation_id}`
 - `POST /api/catalog/sources/{source_id}/activate`
 - `/api/catalog/sources/{source_id}/revisions`
 - `/api/catalog/sources/{source_id}/revisions/{commit}/documents`
@@ -95,9 +96,11 @@ OpenAPI 문서 범위:
 - `/api/selectors/preview`
 - `/api/jobs/command`
 - `/api/jobs/runbook`
+- `POST /api/jobs/catalog-runbook`
 - `/api/jobs/drift-check`
 - `/api/jobs/{job_id}/cancel`
 - `/api/jobs/{job_id}/output`
+- `/api/jobs/{job_id}/output-page`
 - `/api/jobs/{job_id}/artifacts/{artifact_id}`
 - `/api/audit`
 - `/api/audit/export`
@@ -135,7 +138,7 @@ OpenAPI 문서 범위:
 | Admin API | `/api/agents`, `/api/jobs`, `/api/approvals`, `/api/enrollment-tokens`, `/api/catalog/*`, `/api/controller/signing-rotation/*`, `/api/audit`, `/api/audit/export`, telemetry page API | admin bearer token | 외부 자동화 후보. OpenAPI와 contract test 대상 |
 | Admin beta API | `/api/policies`, `/api/drift/scheduled`, `/api/selectors/preview`, label 변경, key revoke | admin bearer token | 구현되어 있지만 selector rollout과 UX가 더 바뀔 수 있음 |
 | Internal static | `/admin`, `/admin/*`, `/favicon.ico` | 없음 | Web Admin asset serving. REST API 계약이 아님 |
-| Agent WebSocket protocol | `/api/agents/ws` | agent identity proof | `docs/protocol.md` 범위. REST OpenAPI에 포함하지 않음 |
+| Agent WebSocket protocol | `/api/agents/ws` | agent identity proof | `docs/protocol.md` 범위. REST OpenAPI에 포함하지 않음. Persistent TaskAck/TaskStarted/TaskRejected, DriftCheck evidence와 별도 terminal result, Command/no-artifact Runbook output 및 no-artifact Command/Runbook final result는 SQLite report receipt path 사용; DriftEvidence receipt는 Job/Assignment 성공이 아니다. persistent Command/Runbook final은 output summary의 정확한 저장 구간도 확인한다. direct one-shot과 artifact-producing Runbook output/final report는 별도 경로 |
 
 Public readiness/docs endpoint와 agent enrollment endpoint는 admin bearer token을 쓰지
 않는다. 그 외 `/api/...` 운영 endpoint는 기본적으로 admin bearer token을 요구한다.
@@ -214,14 +217,17 @@ Catalog 목록은 같은 cursor 원칙을 쓰지만 오래된 immutable record�
 - `GET /api/catalog/sources/{source_id}/revisions`
 - `GET /api/catalog/sources/{source_id}/revisions/{commit}/documents`
 
-정렬은 최신순이다. `next_cursor`가 `null`이면 다음 page가 없다. cursor는 내부 저장소 key
-형식을 숨기기 위한 opaque string으로 취급하며, client가 분해하거나 생성하지 않는다.
+일반 snapshot 목록은 최신순이며 `next_cursor`를 사용한다. 위의 Catalog 세 목록은
+ID/commit/path 오름차순이고 `next_after`가 `null`이면 다음 page가 없다. client는 반환받은
+cursor를 그대로 다음 요청에 전달하며 분해하거나 생성하지 않는다.
 
 ### Catalog Read API
 
 Catalog read API는 이미 Controller에 저장된 source, immutable revision, 검증된 document를
 읽기만 한다. 조회 요청은 Git fetch, source sync, revision activation 또는 Policy/Runbook
-실행을 시작하지 않는다. 네 endpoint 모두 `Authorization: Bearer <admin-token>`을 요구하며,
+실행을 시작하지 않는다. Admin은 각 목록을 한 page씩 유지하고 source/revision/document를 명시적으로
+선택한다. 페이지를 바꿔도 선택했던 immutable metadata를 다른 항목으로 자동 교체하지 않는다.
+route/auth/상위 선택이 바뀌면 진행 중 조회를 취소하며 늦은 성공·오류는 반영하지 않는다. 네 endpoint 모두 `Authorization: Bearer <admin-token>`을 요구하며,
 현재 `policy_read` 권한을 사용한다.
 
 ```http
@@ -256,7 +262,85 @@ Catalog source mutation은 owner/admin의 `policy_write` 권한만 허용한다.
 `POST /api/catalog/sources/{source_id}/sync`는 `{ "operation_id": "..." }`로 durable operation을
 만든 뒤 bounded worker에 전달하고 `202`를 즉시 반환한다. 등록 및 sync 요청은 credential을 받거나
 HTTP handler에서 Git fetch를 실행하지 않는다.
-Activation은 `POST /api/catalog/sources/{source_id}/activate` body의 immutable `commit`을 받아 ready revision만 active pointer로 전환한다. sync 완료는 activation을 자동으로 수행하지 않는다.
+202 body의 `id`는 실제 canonical operation ID다. 같은 source에 진행 중인 operation이 있으면 요청한
+ID 대신 기존 ID가 반환될 수 있다. 202는 완료나 활성화를 뜻하지 않는다.
+`GET /api/catalog/sources/{source_id}/sync-operations/{operation_id}`는 `policy_read` 권한으로
+해당 source에 속한 operation만 조회한다. 응답은 `id`, `source_id`, nullable `commit`,
+`state`(`in_progress`/`completed`/`failed`/`cancelled`), nullable `failure`다. `completed`에는 commit이
+있고, `failed`의 failure는 `fetch_rejected`, `fetch_failed`, `validation_failed`, `limit_exceeded`,
+`cancelled` 중 하나이며 다른 state의 failure는 null이다. 기존 ready revision으로 새 operation의
+완료를 판정하지 않는다. 조회는 fetch·activation·audit mutation을 수행하지 않는다.
+모든 상태 조회 응답은 `Cache-Control: no-store`다. 잘못된 ID나 query는 400, 미인증은 401,
+권한 없음은 403, operation 부재 또는 source 불일치는 동일한 404다. query parameter는 받지 않는다.
+저장소 오류는 내부 SQL·URL·원인을 담지 않는 500 `catalog_sync_status_unavailable`로 반환한다.
+Admin 상태 관찰은 10초 요청 deadline과 최대 3분 관찰 기한을 소유하며, transient GET만 최대 3회/제한된 backoff로 재시도한다. 화면 이탈·인증·선택 변경은 관찰을 정리하고, 변경 POST의 응답을 잃으면 결과 불명으로 표시하며 자동 재전송하지 않는다.
+Activation은 `POST /api/catalog/sources/{source_id}/activate` body의 immutable `commit`을 받아 ready revision만 active pointer로 전환한다. sync 완료는 activation을 자동으로 수행하지 않는다. Admin은 선택한 source와 ready commit을 확인 창에서 명시적으로 확인한다. 이는 CAS/분산 잠금이 아니며 다른 관리자의 동시 변경을 막지 않는다.
+
+### Catalog Runbook Job API
+
+`POST /api/jobs/catalog-runbook`는 `job_create`와 `policy_read` 권한을 모두 요구한다.
+source를 sync/activate할 권한과 Job을 생성할 권한은 별도다. actor는 인증된 token에서 정하고
+request의 actor/confirmed_by/approval/nonce 또는 raw `runbook_document` 필드를 받지 않는다.
+unknown field와 DTO field의 중복 지정도 거절한다. 기존 `POST /api/jobs/runbook`은 유지한다.
+
+```json
+{
+  "job_id": "catalog-job-1",
+  "source_id": "public-catalog",
+  "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "path": "runbooks/sample.yaml",
+  "checksum": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "target_agent_ids": ["agent-web-01"],
+  "timeout_seconds": 30,
+  "expires_in_seconds": 300,
+  "confirmed_high_risk": true,
+  "strategy": {"concurrency": 1, "maxFailures": 1}
+}
+```
+
+필수 필드는 `job_id/source_id/commit/path/checksum`이다. commit은 소문자 hex40/64자,
+checksum은 소문자 SHA256 hex64자다. 본문은 서버 durable catalog에서만 읽는다.
+nonempty `target_agent_ids`, `selector`, `matchLabels` 중 하나만 사용한다. 모두 없으면
+저장된 Runbook의 target selector를 쓴다. selector는 disabled Agent를 제외하고 offline Agent는
+포함한다. explicit ID의 unknown/disabled/duplicate는 저장 전에 거절한다. 보고된 Runbook 및
+package/service/file capability가 incompatible하거나 24시간보다 오래되면 저장 전에 거절한다.
+미보고/unknown capability는 기존 dispatch 정책처럼 허용하며 Agent의 실행 검증을 대신하지 않는다.
+
+옵션 기본값은 timeout30초, expiration300초, concurrency1, maxFailures없음,
+confirmed_high_risk=false다. 기간은 양수이며 platform/persisted millisecond 범위 안이어야 한다.
+concurrency/maxFailures는 제공하면 양의u32다. confirmation은 acknowledgement이며 승인을 대신하지 않는다.
+Job/provenance/Assignment/target snapshot/Approval/audit/strategy/selector는 하나의 transaction으로
+저장한다. active/ready/path/checksum/body를 commit 안에서 다시 확인하며 commit 전에는 dispatch하지 않는다.
+성공201은 기존 CreateJobResponse(`job_id/target_count/assignment_count/status/approval_request_id`)다.
+Runbook 승인 대기에서는 active session이 있어도 전송하지 않고 기존 approval 경로를 사용한다.
+
+| HTTP | 코드·의미 |
+| --- | --- |
+| 400 | `invalid_catalog_job` 또는 `invalid_catalog_targets`: DTO/reference/options/문서/대상 선택 오류 |
+| 401 | `unauthorized` |
+| 403 | `forbidden`, `required_permission`: job_create 또는 policy_read 부족 |
+| 404 | `catalog_reference_not_found`: source/revision/document 부재 |
+| 409 | `catalog_selection_changed`: active/ready/checksum/immutable binding 변경; 선택을 다시 확인 |
+| 409 | `job_already_exists`: 같은 Job ID의 기존 상태를 변경하거나 다시 dispatch하지 않음 |
+| 409 | `catalog_target_unavailable`, `catalog_target_unsupported`, `catalog_target_capabilities_stale` |
+| 500 | `catalog_job_creation_unavailable`: 저장/서명/조립 실패의 분류된 응답, 내부 오류 없음 |
+
+POST의 모든 응답은 `Cache-Control: no-store`다. client는 제출용 Job ID를 한 번 정해 유지한다.
+응답을 잃었으면 같은 ID의 `GET /api/jobs/{job_id}`로 생성 여부를 확인하고 POST를 자동 재시도하거나
+새 ID로 조용히 바꾸지 않는다. `409`는 새 실행 성공이 아니다.
+
+`GET /api/jobs/{job_id}`는 기존 `job_read` 권한과 summary 필드를 유지하며
+`catalog_provenance: null | {source_id,commit,path,checksum}`를 추가한다. raw Job은 null이다.
+Job 소유 snapshot을 읽으므로 이후 source activation/labels 변경으로 다시 계산하지 않는다.
+Job 목록 shape와 raw Job 생성 API에는 이 필드를 추가하지 않는다. 본문/secret/output도 포함하지 않는다.
+생성 audit의 `catalog_runbook_job_created`는 같은 immutable 출처와 인증 actor를 보존한다.
+
+`POST /api/jobs/catalog-runbook`의 확정 거절 응답은 선택적으로
+`Fleet-Catalog-Rejection` header를 반환합니다. 값은 `catalog_selection_changed`,
+`catalog_target_unavailable`, `catalog_target_unsupported`, `catalog_target_capabilities_stale` 중
+하나이며 이 경우 Job이 생성되지 않았으므로 명시적인 새 검토를 할 수 있습니다.
+중복 ID(`job_already_exists`)나 header가 없거나 알 수 없는 응답은 원래 Job ID로 확인합니다.
+Admin은 오류 본문을 읽거나 보관하지 않으며 이 구분으로 자동 재전송하거나 새 Job을 만들지 않습니다.
 
 ### Job and Assignment
 
@@ -271,6 +355,8 @@ Job API는 job aggregate 상태와 target별 assignment 상태를 함께 반환�
 Client는 job 결과를 `status` 하나만 보고 판단하지 말고, target별 상태와 output endpoint를 함께
 확인해야 한다. output은 `/api/jobs/{job_id}/output`에 누적 저장되고, empty output은 실패를
 의미하지 않는다.
+
+
 
 ## Compatibility and Deprecation
 
@@ -769,7 +855,82 @@ Retry coordinator는 현재 session registry에서 관측 가능한 연결/queue
 session runtime state로만 사용하며 DB/domain object에 저장하지 않는다. Unattended
 background scheduler는 별도 hardening task다.
 
-## Admin Token
+## 개인 인증 HTTP 기반
+
+local 첫 owner 전환 뒤 `personal` mode에서는 아래 HTTP 경로와 기존 보호 API의 cookie/PAT 인증을 제공한다.
+단일 조직의 로컬 계정과 개인 인증 경로다. owner 계정 관리·본인 password/PAT API는 연결됐으며 Command·DriftCheck·직접/카탈로그 Runbook 생성·승인/거절·명시적 취소·수동 만료·remediation 승인 요청/Job 생성의 최신 권한 guard도 연결됐다.
+개인 Admin 로그인·계정/본인 credential 화면은 연결됐다. 개인 token CLI 입력/profile도 연결됐다. 실제 두 사용자 HTTPS browser/API/CLI·Linux Agent 작업 중 접근 회수·복구와 인증 부하를 격리 환경에서 검증했다.
+전환 전 `legacy` mode의 공용 token과 개인 credential 사이에 자동 fallback은 없다.
+`fleet login --controller-url <origin>`은 숨김 TTY에서 개인 token을 받고, 자동화는 `--token-stdin`으로 한 줄과 EOF를 전달한다. 개인 PAT는 필수 `GET /api/auth/session`200을 확인한 뒤 기존 `controller_url`/`admin_token` profile 형식으로 저장한다. 원격 password 로그인/저장은 없다. profile은 Unix 본인 소유600·원자 교체·server origin 범위이며, 다른 주소만 override하면 저장 credential을 보내지 않는다. 보호 요청은10초 기한·redirect 거절이며401은 무효/만료/회수 재인증,403은 권한 부족으로 표시한다. 기존 명시적 `--admin-token` 인자는 legacy 호환이며 새 개인 token의 권장 입력이 아니다.
+사설 CA는 login의 `--tls-ca-cert`로 공개 PEM 파일만 지정한다. profile의 선택적 `tls_ca_cert`에 canonical path를 기록하며 기존2필드 profile은 그대로 읽는다. 명령 bootstrap에서16KiB 이하 regular file을 한 번 읽고 유효한 인증서 집합을 확인한다. 특수 파일·private-key PEM은 거절하고 기본 roots/hostname 검증과 Origin 범위를 유지한다. 시스템/browser trust 변경이나 TLS 검증 우회 옵션은 없다. 이는 CLI local profile 계약이며 REST DTO는 바꾸지 않는다.
+정적 Admin client는 인증 generation 변경·logout 때 이전 요청과 선택을 종료하고 늦은 응답을 버린다.401은 재인증,403은 권한 부족으로 구분하며 필수 auth/계정404를 숨기지 않는다. 응답 불명 Job은 ID로 명시적 조회만 하고 다른 인증 generation으로 자동 재전송하지 않는다. Settings는 My account·owner 전용 People·Controller 탭으로 나뉜다. 입력한 비밀번호는 submit 직후 비우고, 일회성 값은 일반 상태나 HTML 속성에 저장하지 않으며 닫기·logout·페이지 이탈 때 지운다.
+
+| Method / 경로 | 입력·인증 | 결과 |
+| --- | --- | --- |
+| GET `/api/auth/status` | public | `mode`: `legacy`, `personal`, `local_setup_required`; `local_setup_required` boolean. 개인 정보 없음 |
+| POST `/api/auth/login` | 정확한 Origin, JSON `username`·`password` | `user`, 고정 UTC Unix seconds `expires_at`, `csrf_token`; session secret은 Set-Cookie로만 전달 |
+| GET `/api/auth/session` | 현재 cookie 또는 개인 PAT | 현재 `user`·고정 `expires_at`; cookie만 `csrf_token`, PAT는 null. 조회로 기한 연장 없음 |
+| POST `/api/auth/logout` | cookie, Origin, `X-Fleet-CSRF`; body 없거나 빈 JSON object | 현재 session만 회수하고 204·cookie 만료. 이미 만료/회수됐다면 401·cookie 만료. PAT logout은 403 |
+| POST `/api/auth/setup` | Origin, JSON `code`·`new_password` | 유효한 일회성 설정/reset 코드 소비·204. 자동 로그인하지 않음 |
+| POST `/api/auth/password` | 현재 개인 cookie/PAT·`current_password`, `new_password`만 | 204·본인 session/PAT/미사용 code 전체 회수. cookie caller는 cookie 만료·새 로그인 필요 |
+| POST `/api/auth/tokens` | 현재 개인 cookie/PAT·`current_password`, 선택적 `label` | 201 `token: {id, expires_at, secret}`; 고정30일 PAT secret을 이 응답에서만 표시 |
+| GET `/api/auth/tokens` | 현재 개인 cookie/PAT; 선택적 `limit`·`after` | 본인 PAT의 `items: [{id,label,created_at,expires_at,active}]`, `next_cursor`만. 원문·hash·binding 없음 |
+| DELETE `/api/auth/tokens/{token_id}` | 현재 개인 cookie/PAT; body/query 없음, current_password 불필요 | 본인 선택 PAT만 회수·204. 타인/없는 ID/다른 목적/이미 회수한 ID는 같은404 |
+| GET `/api/admin/users` | 현재 owner cookie 또는 PAT; 선택적 `limit`·`after` | bounded `items` metadata·`next_cursor` |
+| GET `/api/admin/users/{user_id}` | 현재 owner cookie 또는 PAT | 해당 계정의 `user` metadata; 없는 ID는404 |
+| POST `/api/admin/users` | 현재 owner·같은 요청의 `current_password`; `username`, `display_name`, `role` | 201 `user`와 한 번만 표시하는 `setup: {id, expires_at, code}`; pending 계정 |
+| PATCH `/api/admin/users/{user_id}` | 현재 owner·`current_password`; `display_name`, `role`, `disable:true` 중 하나 이상 | 200 `user`; username/id/status/actor 변경과 `disable:false`는 거절 |
+| POST `/api/admin/users/{user_id}/password-reset` | 현재 owner·`current_password`만 | 201 한 번만 표시하는 `reset: {id, expires_at, code}`; 새 비밀번호는 이 요청에서 받지 않음 |
+
+`user`는 `id`, `username`, `display_name`, `role`, `status`, `record_revision`의 metadata만 포함한다.
+password verifier, credential digest·binding, raw session/token/code는 이 projection에 없다.
+계정 조회는 owner만 가능하며 admin/operator/viewer는 본인 ID 조회도403이다. 본인 로그인 정보는 `/api/auth/session`을 사용한다.
+목록은 ID 오름차순·기본25/최대100이며 `after`는 이전 응답의 불투명 위치다. query는 collection의 `limit`/`after`만
+허용하고 중복·알 수 없는 field·빈/불량 cursor·다른 owner/목적/version은400으로 거절한다. detail에는 query를 받지 않는다.
+GET body는 받지 않으며 계정·credential·audit를 변경하거나 만료 연장/정리하지 않는다. pending/disabled 계정도 owner에게 보인다.
+조회 전후 현재 owner 권한을 재검증하고, 불량 저장 행은 부분 응답 대신 안전한503으로 처리한다.
+owner mutation은 같은 요청에서 현재 비밀번호를 증명하고 account·credential·audit의 원자 transaction 안에서
+현재 actor·target revision·마지막 로그인 가능한 owner를 다시 검증한다. 로그인과 같은 CPU admission과
+현재 actor의 canonical username 실패 한도를 공유한다. target 이름을 바꿔 비밀번호 추측 한도를 우회할 수 없다.
+Cookie mutation은 Origin/CSRF를, PAT mutation은 단독 bearer와 현재 비밀번호를 요구한다.
+표시 이름만 변경하거나 같은 role을 요청하면 기존 credential은 유지한다. role/차단/reset은 해당 사람의 모든
+session/PAT/미사용 code를 회수한다. 자기 credential이 폐기되는 성공 응답은 cookie도 지우며 타인 변경은 caller를 유지한다.
+마지막 owner 제거는409 `last_owner`, 중복 이름은409 `user_exists`, revision/clock 충돌은409 `state_conflict`다.
+실패 시 부분 계정 변경·발급·audit가 남지 않는다. audit 오류는 안전한503이다. 기존 Agent 작업은 이 인증 회수로 취소하지 않는다.
+setup/reset code의 고정 기한은15분이다. 차단 계정은 owner reset 후 새 code claim으로 복구하며 자동 로그인하지 않는다.
+mutation에는 query를 받지 않고 알 수 없는/중복 field와 명시적 null도 거절한다. 네트워크 결과가 불명확하면 POST를 자동 재시도하지 않는다.
+본인 password/PAT 발급은 모든 활성 role에서 허용한다. 본인 ID는 현재 credential에서만 정하며
+body의 user_id/username/actor/role/expiry 같은 임의 대상·권한·기한 입력은 거절한다. PAT 권한은 현재 사람의 role을 따른다.
+PAT label은 선택 입력이며 지정 시 비공백·제어 문자 없는 최대256 UTF-8 bytes다. null/빈 값은 거절하며 trim하지 않는다.
+PAT는 본인16개/전체 lookup8192행 한도이며 초과는429 `token_limit`, CPU/실패 한도는429 `authentication_busy`다.
+한도 거절에 새 token/audit는 없고 bounded 만료 lookup 정리는 허용한다. PAT 발급은 현 web session을 바꾸지 않으며
+password 변경은 본인의 모든 credential을 회수하되 타인의 credential과 이미 승인된 Agent 작업은 유지한다.
+본인 PAT 조회는 기본25/최대100이며 account 목록과 구분되는 subject/purpose/version-scoped 불투명 cursor를 쓴다.
+서버가 현재 binding·epoch·계정·상태·시각으로 `active`를 판정한다. 만료/미래 생성 행도 남아 있으면 false로 표시하며 GET이 정리·연장하지 않는다.
+owner/purpose 조건은 SQL에서 semantic decode 전에 적용한다. 손상된 타인 행은 조회에서 제외되고 회수는 같은404이며,
+본인 손상 행은 lookahead라도 부분 page 대신 안전한503이다. 선택 회수·audit는 원자적이며 audit 실패는 credential을 유지한다.
+본인 요청에 사용한 PAT 자체도 회수할 수 있다. 다른 PAT/web session/사람은 유지하며 cookie는 지우지 않는다.
+이미 회수된 lookup 행이 bounded cleanup을 기다려도 재차 DELETE는 같은404다. 표시 이름/role 변경은 audit의 불변 user ID를 바꾸지 않는다.
+auth body는 최대 16 KiB이고 UTF-8 JSON의 알려진 field만 허용한다. 중복 JSON field도 거절한다.
+일회성 code와 비밀번호는 POST body로만 전달하며 auth 경로의 query는 거절한다.
+
+canonical origin은 bootstrap `--external-url`에서만 만든다. personal/local-setup-required 시작에
+유효 origin이 없으면 fail-closed하며 요청 Host나 forwarded header를 신뢰하지 않는다.
+HTTPS cookie는 `__Host-fleet_session`, Secure·HttpOnly·SameSite=Strict·Path=/·host-only·Max-Age=28800이다.
+짧은 HTTP lab에서는 기존 insecure warning/audit와 `fleet_session`을 사용한다.
+login/설정 claim은 정확한 Origin과 `application/json`을 요구한다(UTF-8 charset parameter 허용).
+그 밖의 cookie mutation은 같은 Origin과 해당 session의 `X-Fleet-CSRF`를 요구한다.
+쿠키/Authorization 동시 입력·중복 credential header는 400 `ambiguous_authentication`으로 거절한다.
+Web session을 bearer로, PAT를 cookie로, 설정/reset 코드를 로그인 credential로 바꾸어 사용하지 않는다.
+
+auth와 사람 인증을 요구하는 보호 API 응답은 `Cache-Control: no-store`다. 401은 잘못된 비밀번호·없는/비활성 계정·만료/회수에 공통이다.
+403은 Origin/CSRF/용도·권한 거절, 429는 `authentication_busy` 또는 `session_limit`,
+503은 worker/store 일시 실패 또는 총 30초 인증 deadline이다. 원문 crypto/SQL 오류를 반환하지 않는다.
+기한은 웹 8시간·PAT 30일·설정/reset 15분 고정이며 별도 idle expiry는 없다.
+KDF의 native worker는 bootstrap에서 생성·종료하고 HTTP admission도 worker+pending 범위로 제한한다.
+KDF/entropy 동안 공용 store mutex나 DB transaction을 보유하지 않는다.
+
+## Legacy Admin Token
 
 `fleet controller init`은 최초 실행 시 admin token을 1회 출력한다.
 
@@ -791,7 +952,7 @@ admin token 원문은 DB에 저장하지 않는다. Controller는 token hash만 
 
 MVP에서 Controller와 CLI가 새로 생성하는 token, job, assignment nonce, message id는 사람이 읽을 수 있는 prefix와 ULID를 조합한 형태를 사용한다. 예: `admin-...`, `enroll-...`, `et-...`, `job-cli-...`, `nonce-...`, `msg-...`.
 
-보호 API는 다음 header를 요구한다.
+전환 전 legacy mode의 보호 API는 다음 header를 요구한다. personal mode에는 적용되지 않는다.
 
 ```http
 Authorization: Bearer <admin-token>
@@ -937,13 +1098,16 @@ Controller는 raw enrollment token을 hash로 검증하고, 성공 시 token use
 
 ## Command Job API
 
-Command job API는 admin token 인증 후 command job과 controller-signed task assignment를 생성한다. Controller는 job과 assignment를 DB에 저장한 뒤 active authenticated agent session이 있으면 즉시 `task_assignment`를 dispatch한다. 등록된 agent가 disconnected 상태이면 assignment는 queued 상태로 남고, agent가 reconnect하여 session registry에 등록되는 즉시 pending queue drain 대상으로 처리된다. Agent는 task를 받으면 `task_ack`, 실행을 시작하면 `task_started`, 실행을 거부하면 `task_rejected`, 실행 중 output은 `output_chunk`, 최종 결과는 `task_result`로 같은 WebSocket session에 돌려보낸다. 별도 output subscribe API는 아직 후속 범위다.
+Command job API는 admin token 인증 후 command job과 controller-signed task assignment를 생성한다. Controller는 job과 assignment를 DB에 저장한 뒤 active authenticated agent session이 있으면 즉시 `task_assignment`를 dispatch한다. 등록된 agent가 disconnected 상태이면 assignment는 queued 상태로 남고, agent가 reconnect하여 session registry에 등록되는 즉시 pending queue drain 대상으로 처리된다. Persistent v2 session에서 Agent는 TaskAck, TaskStarted, 실행 전 TaskRejected를 stable report ID `task-ack`/`task-started`/`task-rejected`의 `Lifecycle` class v2 `task_report`로 journal에 먼저 저장해 보낸다. Controller는 Agent/Job/Assignment owner를 확인하고 `dispatched -> accepted`, `accepted -> started`, `dispatched -> rejected` 상태 전이와 각 Job aggregate/audit/inbox marker를 한 transaction으로 commit한 뒤 signed `stored` receipt를 돌려준다. 거절 사유는 redacted 값으로 Assignment에 저장한다. 재전송은 같은 receipt를 재사용하며 중복 audit를 만들거나 terminal 상태를 되돌리지 않는다. Persistent v2의 Command 출력과 지원되는 no-artifact final report는 commit-before-send 및 receipt 경로를 사용한다. Artifact-producing Runbook의 출력/최종 결과와 직접 one-shot의 `task_result`는 별도 경로다. 별도 output subscribe API는 아직 후속 범위다.
 
 Job과 task assignment는 항상 DB에 먼저 저장된다. WebSocket send는 저장 이후에만 시도할 수 있으며, DB transaction과 WebSocket send는 하나의 원자적 작업으로 취급하지 않는다. 따라서 queued assignment가 source of truth이고, active session dispatch 실패 시 assignment는 queued 상태로 남아 재시도 대상이 된다.
 
-Assignment 상태 모델은 `queued -> dispatched -> accepted -> started -> succeeded/failed/canceled/expired`를 기본 경로로 사용한다. Agent가 검증, capability, local policy, busy 상태 등으로 실행을 거부하면 `rejected` terminal 상태가 된다. Operator cancel은 `canceled`, command timeout은 `expired`로 저장하며 둘 다 일반 `failed`와 구분한다. WebSocket write 성공은 `dispatched`까지만 의미하며, `accepted`, `started`, `succeeded`는 agent가 명시 event를 보냈을 때만 저장된다. `output_chunk`는 output storage event일 뿐 성공으로 처리하지 않는다. `task_result`가 와야 terminal result로 계산된다.
+Assignment 상태 모델은 `queued -> dispatched -> accepted -> started -> succeeded/failed/canceled/expired`와 실행 전 `dispatched -> rejected`를 사용한다. Agent가 검증, capability, local policy, busy 상태 등으로 실행을 거부하면 `rejected` terminal 상태가 된다. Operator cancel은 `canceled`, command timeout은 `expired`로 저장하며 둘 다 일반 `failed`와 구분한다. WebSocket write 성공은 `dispatched`까지만 의미하며, persistent TaskAck report 또는 별도 direct ACK가 `accepted`를 기록한다. Persistent TaskStarted report 또는 direct one-shot event가 `started`를 기록한다. Persistent TaskRejected는 이유를 가린 채 journal에 저장되고 exact signed receipt까지 보존되며, 아직 dispatched 상태인 Assignment만 `rejected`로 전이한다. 각 persistent transition은 owner 확인 후 Assignment/Job/audit/inbox marker를 함께 저장한다. G2가 `failed/execution_outcome_unknown`으로 terminal 처리한 뒤 exact owner의 TaskAck/TaskStarted/TaskRejected가 도착하면 audit/inbox disposition과 signed receipt만 추가하고 Assignment/Job/G2 사유는 바꾸지 않는다. G2 이후 matching no-artifact persistent Command/Runbook/DriftCheck final report도 terminal 상태를 유지한 채 signed receipt로 정리하며, 다른 terminal 상태나 사유는 fail-closed한다. receipt는 report/effect 저장 확인이지 실행 성공 증거가 아니다. `output_chunk`는 output 저장 event일 뿐 성공으로 처리하지 않는다. Persistent v2 `final_result`(DriftCheck terminal result 포함)가 persistent assignment 결과를 확정하며, direct one-shot은 별도 `task_result` event를 사용한다.
+Persistent Command와 no-artifact Runbook의 내부 v2 final report에는 필수 `output` summary가 있으며, Controller는 stdout/stderr 각각의 `[0, count)` 조각이 저장되기 전에는 final 결과나 receipt를 확정하지 않는다. `truncated=true` 결과는 성공으로 처리하지 않는다. summary가 없는 구형 final body에는 호환 fallback이 없으므로 Controller와 Agent를 함께 업그레이드해야 한다. 이 확인은 Agent가 journal에 기록한 조각의 전달을 보장할 뿐, task 실행이 만든 모든 출력 byte를 수집했다는 보장은 아니다.
 
-Agent가 running 중 disconnect되더라도 Controller는 task result 없이 job을 즉시 failed로 바꾸지 않는다. 이 경우 running 상태는 expiry/reconciler 정책이 최종 상태를 결정할 때까지 유지될 수 있다. Agent local command는 task timeout과 runner output limit을 계속 적용받는다. 이미 terminal 상태인 assignment에 늦은 result가 도착하면 Controller는 terminal 상태를 덮어쓰지 않는다.
+`output_chunk`는 output storage event일 뿐 성공으로 처리하지 않는다. Persistent session 결과는 `final_result` report로, direct one-shot 결과는 별도 `task_result`로 확정된다.
+
+Agent가 running 중 disconnect되면 Controller는 task result 없이 즉시 실패를 확정하지 않는다. SQLite Controller는 persisted `dispatched_at` + Job 실행 timeout + 5분 grace가 지난 뒤에도 `dispatched`/`accepted`/`started`인 Assignment를 listener bind 전과 30초 주기의 bounded recovery에서 `failed` + `execution_outcome_unknown`으로 수렴시킨다. 이 상태는 Agent process가 실패했다는 증명이 아니라 Controller가 결과를 확인하지 못했다는 뜻이며 자동 재실행하지 않는다. Agent local command는 task timeout과 runner output limit을 계속 적용받는다. 이미 terminal 상태인 assignment에 늦은 result가 도착하면 Controller는 terminal 상태를 덮어쓰지 않는다. Recovery 계약이 없는 Postgres 구성은 Controller가 listener를 열기 전에 startup failure를 반환한다.
 
 Dispatch 대상 선택 정책:
 
@@ -1085,6 +1249,9 @@ Preview 정책:
 
 - disabled/revoked agent는 `matched_count`에는 포함하지만 dispatch 대상에서는 제외한다.
 - offline agent는 dispatch target으로 선택될 수 있으며, reconnect 전까지 assignment가 queued 상태로 남는다.
+- 활성 session이 있는 agent는 오래된 저장 상태와 관계없이 preview에서 `online`으로 표시하며
+  `offline_count`와 해당 warning에서도 제외한다. 이 관찰 값은 Agent record나 heartbeat 시각을 갱신하지 않는다.
+  disabled/revoked 제외는 session보다 우선한다. 그 외 `pending`·`busy`·`degraded` 상태도 그대로 표시한다.
 - `warnings`는 선택 결과를 막지 않는 운영상 주의사항이다.
 - Web Admin UI의 Run과 Runbooks panel은 job 생성 전 같은 preview API를 호출해 `matched_count`, `selected_count`, `disabled_count`, `offline_count`, warning, agent row를 표시한다.
 - Web Admin UI는 preview 응답의 `selected_count`가 0이면 command/runbook job 생성을 중단한다. Selector 해석, disabled/revoked 제외, offline 허용 판단은 UI가 재구현하지 않고 controller 응답을 기준으로 한다.
@@ -1213,7 +1380,7 @@ Approval status:
 - `pending`: 승인 대기 중이다. 이 상태의 job은 `pending_approval`이고 dispatch되지 않는다.
 - `approved`: 승인자가 승인했다. 연결된 job은 `queued`로 전환되고 active agent session이 있으면 즉시 dispatch 대상이 된다.
 - `rejected`: 승인자가 거절했다. 연결된 job은 `failed`로 전환되고 dispatch되지 않는다.
-- `expired`: approval expiry가 지나 controller가 만료 처리했다. 연결된 job은 `expired`로 전환되고 dispatch되지 않는다.
+- `expired`: approval expiry가 지나 만료 처리됐다. 연결된 Job이 아직 pending_approval이면 expired로 전환되어 dispatch되지 않는다. 이미 취소/terminal이거나 접수된 Job 상태는 보존한다.
 - `canceled`: future policy 또는 operator workflow에서 사용할 reserved terminal 상태다.
 
 List pending approvals:
@@ -1256,8 +1423,18 @@ Content-Type: application/json
 ```
 
 호환성 때문에 legacy `actor` field를 보내도 request parse는 허용하지만 controller는
-그 값을 무시한다. `approver`와 approval audit actor는 Bearer token에서 인증된
-admin actor를 사용한다.
+그 값을 무시한다. approver와 approval audit actor는 cookie/PAT 또는 전환 전 공용 token으로
+서버가 인증한 불변 actor ID를 사용한다. 자기승인도 기존 정책대로 허용한다.
+
+Command·DriftCheck·직접/카탈로그 Runbook 생성과 승인/거절은 현재 credential·계정·역할·human epoch를 동일 업무 transaction에서
+다시 검증한다. 회수가 먼저 commit되면 401, 현재 권한 부족은 403이다. 이미 저장한 작업/결정은
+이후 사람의 logout·차단으로 취소하지 않는다. 승인/거절의 approval·pending Job 상태·audit는
+함께 commit하거나 rollback한다. 없는 승인은 404, 잘못된 상태 전이는 400이며,
+commit 전 만료·경합은 409 state_conflict, 저장소/요청 기한 실패는 민감한 진단 없이 503이다.
+이 네 생성 API에서 duplicate Job ID는 409 job_already_exists이며 새 생성 효과를 남기지 않는다.
+요청 기한/인증 저장소 오류는 503이며 서명 준비/업무 저장소 오류는 안전한 500이다.
+카탈로그의 활성 revision·문서 checksum·불변 provenance 검증도 같은 transaction에 유지한다.
+명시적 Job 취소·수동 승인 만료·remediation 승인 요청과 Job 생성도 같은 최신 권한·원자 저장 경계를 사용한다.
 
 Reject:
 
@@ -1274,6 +1451,11 @@ Content-Type: application/json
 ```
 
 Expire due requests:
+
+수동 만료는 기존 최대500 pending scan을 유지한다. 현재 요청자의 JobApprove 권한을 같은 batch transaction에서
+재검증하고 approval·아직 pending_approval인 Job·요청자 UID의 audit를 함께 저장한다. 중간 오류는 batch 전체를
+되돌리며, 이미 canceled/terminal이거나 접수된 Job은 덮어쓰지 않는다. 회수된 credential은401, 권한 부족403,
+상태 경합409, 저장소/기한 오류503이다. 반복 요청으로 이미 만료된 항목을 다시 변경하지 않는다.
 
 ```http
 POST /api/approvals/expire
@@ -1318,7 +1500,7 @@ Web Admin approval queue 요구사항:
 
 ### Remediation Requests
 
-Remediation API는 drifted policy에서 생성된 remediation request를 approval, signed runbook job, result verification으로 연결한다. 모든 mutation은 admin token 인증과 `job_approve` 권한이 필요하다. 조회는 remediation metadata만 반환하고 raw runbook document, rendered artifact body, command output, token, secret 값을 반환하지 않는다.
+Remediation API는 drifted policy에서 생성된 remediation request를 approval, signed runbook job, result verification으로 연결한다. 승인 요청과 실행 생성은 현재 사람의 cookie/PAT 인증(legacy mode에서는 공용 token)과 `job_approve` 권한이 필요하다. 조회는 remediation metadata만 반환하고 raw runbook document, rendered artifact body, command output, token, secret 값을 반환하지 않는다.
 
 Remediation status:
 
@@ -1396,6 +1578,8 @@ Content-Type: application/json
   "reason": "approved remediation window"
 }
 ```
+
+승인 요청은 remediation 상태·새 approval·요청자 UID audit를 한 transaction에 저장한다. 실행 생성은 서명 준비 후 현재 JobApprove 권한, 기존 remediation/approval snapshot과 만료를 다시 검사하고 Job·assignment·targets·승인 결정·remediation 상태·필수 audit를 함께 commit한다. 서명 중 로그아웃·권한 회수는401/403, 상태 경합·만료는409 state_conflict, 저장 실패는503이며 부분 효과를 남기지 않는다. 서명 실패는 민감한 진단 없는500이다. 요청자와 승인자의 불변 UID를 각각 보존하며 자기승인도 허용한다.
 
 응답은 remediation metadata, approval metadata, job id, assignment count만 포함한다. `runbook_document` 원문은 response와 audit value에 포함하지 않는다.
 
@@ -1680,6 +1864,13 @@ Authorization: Bearer <admin-token>
 - `target_connected`는 target 중 하나 이상이 현재 authenticated persistent session에 붙어 있으면 `true`다.
 - rejected/expired/failed 상태에서는 `last_error`가 비어 있을 수 있으므로, 운영자는 audit과 output을 함께 확인해야 한다.
 
+A persistent report racing an earlier Controller cancellation does not change the API's canonical
+canceled Assignment or its original reason. For a previously dispatched Assignment, exact-owner
+lifecycle reports and supported no-artifact Command/Runbook finals can receive a terminal-preserving
+storage disposition and signed receipt; finals still require exact stored output coverage and no
+remediation effects. A late Agent success is a recorded report, not an API success override. This
+introduces no new REST fields or permission and never authorizes automatic re-execution.
+
 ### Cancel Job
 
 Operator가 job을 취소한다. Body는 비워도 되며, reason을 넣으면 audit과 assignment `last_error`에 redaction 후 남긴다.
@@ -1715,6 +1906,10 @@ Content-Type: application/json
 
 정책:
 
+- 현재 사람의 JobCancel 권한·credential·epoch를 같은 취소 transaction에서 앞뒤 검증한다. 회수 선행은 401, 권한 부족은 403이며 변경 효과가 없다.
+- assignment 선택·Job aggregate·불변 사용자 actor의 감사 기록은 함께 commit/rollback한다. 저장소/기한 오류는 안전한 503, 상태 경합은 409 state_conflict다.
+- Agent queue 전송은 commit 뒤에만 시도한다. cancel_delivered=true/count는 queue 수락이며 Agent 수신/종료 확인이 아니다.
+- 감사 기록은 가려진 사유·canceled_count·cancel_dispatch_candidate_count를 저장한다. 전달 성공 수는 아직 모르는 commit 시점에 기록하지 않는다.
 - `queued` assignment는 DB에서 바로 `canceled` terminal 상태가 된다.
 - `dispatched`, `accepted`, `started` assignment는 DB에서 `canceled`로 바뀌고, active session이 있으면 Controller가 agent로 `task_cancel` message를 보낸다.
 - `cancel_delivered=false`는 active session이 없거나 outbound queue에 cancel message를 넣지 못했다는 뜻이다. 이 경우에도 DB의 job/assignment cancel 상태는 source of truth다.
@@ -1746,6 +1941,42 @@ Authorization: Bearer <admin-token>
 ```
 
 이 API는 job output storage를 조회한다. command stdout/stderr는 Product application log에 자동 기록하지 않는다.
+
+### Bounded Output Page
+
+기존 전체 배열 API와 별도로 SQLite의 저장 출력을 제한된 크기로 읽는다.
+
+```http
+GET /api/jobs/{job_id}/output-page?limit=128&max_bytes=65536
+Authorization: Bearer <admin-token>
+```
+
+매 요청 기존 `job_read` permission을 검사한다. 현재 owner/admin/operator/viewer는 모두 이
+읽기 권한을 갖는다. cursor는 인증이나 무결성 증명이 아니며 actor/role query는 받지 않는다.
+optional `agent_id`, `stream=stdout|stderr`, `after`를 지원한다. 중복·알 수 없는 query,
+빈 필터, 부호·소수·공백·overflow 정수는 400으로 거절한다. `limit`은1–256,
+`max_bytes`는4,096–262,144이고 clamp하지 않는다.
+
+응답은 `{items, next_after, has_more, caught_up, history, job_status}`다. `items`는 저장 append
+순서의 UTF-8 fragment이며 `chunk_key`, `sequence`, `offset_bytes`, `total_bytes`는 i64 범위의
+10진 **문자열**이다. 큰 row는 code point 경계로 나누고 NUL·Unicode·빈 row를 보존한다.
+예산은 fragment별 Agent ID·stream·data UTF-8 합계이며 uncompressed JSON은2MiB 이하,
+모든 응답은 `Cache-Control: no-store`다. `job_status`는 같은 read snapshot의 canonical 상태다.
+
+`after`는 `op1.` base64url/no-padding cursor다. decoded ASCII JSON은 최대2,048 bytes이며
+알 수 없는/중복/누락 field, 다른 type/version·scope·invalid offset/fence는 거절한다.
+Job·Agent·stream 필터를 바꾸면 처음부터 다시 읽는다. 보관 삭제나 공식 restore로 기존
+cursor가 무효화되면409 `output_cursor_stale`이며, 새 context와 이전 내용을 섞지 않는다.
+Job 없음은404, metadata가 예산에 들어가지 않으면413 `output_metadata_too_large`, read 상태
+확인 불가는500 `output_read_unavailable`이다. 실패를 빈 성공이나 기존 전체 fetch로 숨기지 않는다.
+
+`has_more`는 frozen prefix 안의 잔여 fragment이고 `caught_up`은 그 prefix를 읽은 뒤 현재
+저장 high-water와 일치한다는 뜻이다. terminal Job도 마지막 prefix와 새 prefix를 확인해야 한다.
+`history=tracked|unknown|pruned`는 저장 row 이력이며 capture 전체성·작업 성공의 증거가 아니다.
+정확한 cursor/재조립/terminal drain 계약은 [UI-001 출력 계약](../.docs/domains/execution/features/UI-001-output-paging-contract.md)을 따른다.
+Admin 결과 화면은 이 page API를 고정 사용한다. 실패 시 기존 전체 조회로 되돌아가지 않는다.
+Live window와 stored history를 구분하며 terminal prefix 뒤 fresh detail/open cursor를 확인한다.
+Postgres page adapter와 실제 Linux/브라우저 최종 인수·비용 검증은 미완료다.
 
 ### Get Rendered Artifact Body
 
@@ -1821,7 +2052,7 @@ Session summary 필드:
 
 - `connected`: controller session registry에 active authenticated persistent session이 있으면 `true`다.
 - `status`: 저장된 agent 상태와 현재 session 상태를 조합한 운영자용 상태다.
-- `last_seen_at_ms`: controller가 agent heartbeat 또는 session payload를 마지막으로 수신한 시각이다.
+- `last_seen_at_ms`: Controller가 인증된 Agent의 초기 연결 또는 heartbeat를 수신해 저장한 시각이다. 후속 heartbeat도 갱신하며 Agent가 보낸 timestamp·status를 신뢰하지 않는다. 일반 task/output payload의 session liveness는 별도 runtime registry가 관리한다.
 - `last_seen_age_seconds`: 응답 생성 시점 기준으로 계산한 age다.
 - 상세 queue depth, connection id, close reason history는 Product API 응답에 포함하지 않고 audit와 Field Debug 로그에서 확인한다.
 

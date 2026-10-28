@@ -1,9 +1,14 @@
+pub mod admin_account;
+pub mod admin_credential;
+pub mod admin_identity;
 pub mod agent;
 pub mod artifact;
+pub mod assignment_recovery;
 pub mod audit;
 pub mod capability;
 pub mod catalog;
 pub mod certificate;
+pub mod delivery;
 pub mod job;
 pub mod policy;
 pub mod runbook;
@@ -11,6 +16,9 @@ pub mod secret;
 pub mod selector;
 pub mod signing;
 
+pub use admin_account::*;
+pub use admin_credential::*;
+pub use admin_identity::*;
 pub use agent::*;
 pub use artifact::*;
 pub use audit::*;

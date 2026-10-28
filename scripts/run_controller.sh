@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# Rebuild embedded assets, then forward Controller subcommands or bare start options.
 set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -17,21 +18,20 @@ case "${1:-}" in
   controller)
     shift
     case "${1:-}" in
-      ""|-h|--help)
-        exec "$BIN" controller "$@"
-        ;;
-      init)
-        shift
-        exec "$BIN" controller init "$@"
-        ;;
       start)
         shift
+        ;;
+      *)
+        exec "$BIN" controller "$@"
         ;;
     esac
     ;;
   init)
     shift
     exec "$BIN" controller init "$@"
+    ;;
+  admin)
+    exec "$BIN" controller "$@"
     ;;
   start)
     shift
@@ -41,7 +41,7 @@ case "${1:-}" in
       exec "$BIN" agent --help
     fi
     cat >&2 <<EOF
-ERROR: run_controller.sh wraps only 'fleet controller start'
+ERROR: run_controller.sh is for Controller commands
 
 For agent commands, use:
 

@@ -109,9 +109,8 @@ impl std::error::Error for PublicCatalogDestinationResolutionError {}
 
 /// Resolves the already validated HTTPS authority before a catalog fetch begins.
 ///
-/// This is an infrastructure seam so deterministic tests can prove that every DNS answer must be
-/// public. The active `git2` transport cannot pin its later socket resolution to this answer, so
-/// callers must not treat this preflight check as complete DNS-rebinding protection.
+/// This seam lets deterministic tests reject any non-public DNS answer. The HTTPS proxy then
+/// pins upstream sockets to these checked addresses while libgit2 verifies the original TLS host.
 pub trait PublicCatalogDestinationResolver {
     fn resolve_public_catalog_destination(
         &self,
@@ -139,8 +138,8 @@ impl PublicCatalogDestinationResolver for SystemCatalogDestinationResolver {
 /// Fetches a public HTTPS repository into an ephemeral bare staging directory.
 ///
 /// The adapter uses a shallow, no-redirect, no-tag libgit2 fetch and drops the staging directory
-/// before returning. It rejects non-public DNS answers before fetch, while connection-pinned DNS
-/// rebinding prevention and worker timeout/cancellation remain controller lifecycle work.
+/// before returning. The connection-pinned proxy enforces the hard deadline and cancellation;
+/// the Controller worker owns the enclosing operation lifecycle.
 #[derive(Debug, Clone)]
 pub struct PublicGitCatalogFetcher<R = SystemCatalogDestinationResolver> {
     staging_root: PathBuf,
@@ -607,10 +606,24 @@ pub fn catalog_fetch_result_from_repository(
     reference: &str,
     limits: PublicGitCatalogFetchLimits,
 ) -> Result<CatalogFetchResult, PublicGitCatalogFetchError> {
-    let commit = repository
+    let direct = repository
         .revparse_single(reference)
-        .and_then(|object| object.peel_to_commit())
-        .map_err(|_| PublicGitCatalogFetchError::CommitNotFound)?;
+        .and_then(|object| object.peel_to_commit());
+    let commit = match direct {
+        Ok(commit) => commit,
+        Err(_) => {
+            // A bare clone creates a local branch for HEAD, but other fetched branches
+            // remain under origin. Resolve the requested branch there; never use HEAD.
+            let branch = reference.strip_prefix("refs/heads/").unwrap_or(reference);
+            if reference.starts_with("refs/") && !reference.starts_with("refs/heads/") {
+                return Err(PublicGitCatalogFetchError::CommitNotFound);
+            }
+            repository
+                .find_reference(&format!("refs/remotes/origin/{branch}"))
+                .and_then(|reference| reference.peel_to_commit())
+                .map_err(|_| PublicGitCatalogFetchError::CommitNotFound)?
+        }
+    };
     let tree = commit
         .tree()
         .map_err(|_| PublicGitCatalogFetchError::RepositoryReadFailed)?;
@@ -803,6 +816,70 @@ mod tests {
     }
 
     #[test]
+    fn resolves_a_fetched_nondefault_branch_without_substituting_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::init_bare(directory.path()).unwrap();
+        let signature = Signature::now("Fleet test", "fleet@example.invalid").unwrap();
+        let empty_tree = repository.treebuilder(None).unwrap().write().unwrap();
+        let empty_tree = repository.find_tree(empty_tree).unwrap();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "default",
+                &empty_tree,
+                &[],
+            )
+            .unwrap();
+        let body = b"apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: readonly\nselector: role=ui-smoke\nsteps:\n  - id: facts\n    facts.collect:\n";
+        assert!(parse_runbook_document(std::str::from_utf8(body).unwrap()).is_ok());
+        let blob = repository.blob(body).unwrap();
+        let mut tree = repository.treebuilder(None).unwrap();
+        tree.insert("readonly.yaml", blob, FileMode::Blob.into())
+            .unwrap();
+        let tree = repository.find_tree(tree.write().unwrap()).unwrap();
+        let selected = repository
+            .commit(
+                Some("refs/remotes/origin/test/catalog"),
+                &signature,
+                &signature,
+                "selected",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        let result = catalog_fetch_result_from_repository(
+            &repository,
+            "test/catalog",
+            PublicGitCatalogFetchLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.commit, selected.to_string());
+        assert_eq!(result.documents.len(), 1);
+        assert_eq!(result.documents[0].body.as_bytes(), body);
+        assert_eq!(
+            catalog_fetch_result_from_repository(
+                &repository,
+                "refs/heads/test/catalog",
+                PublicGitCatalogFetchLimits::default(),
+            )
+            .unwrap()
+            .commit,
+            selected.to_string()
+        );
+        assert_eq!(
+            catalog_fetch_result_from_repository(
+                &repository,
+                "missing/branch",
+                PublicGitCatalogFetchLimits::default(),
+            ),
+            Err(PublicGitCatalogFetchError::CommitNotFound)
+        );
+    }
+
+    #[test]
     fn public_git_fetcher_is_a_credential_free_catalog_fetcher() {
         fn assert_fetcher<F: CatalogFetcher<Error = PublicGitCatalogFetchError>>() {}
 
@@ -903,7 +980,9 @@ mod tests {
             "catalog.example",
             target_port,
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            Instant::now() + Duration::from_secs(1),
+            // The fixture deadline includes thread scheduling under parallel
+            // tests; production uses its caller-supplied deadline unchanged.
+            Instant::now() + Duration::from_secs(8),
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
@@ -938,7 +1017,7 @@ mod tests {
             "catalog.example",
             target_port,
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(8),
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
@@ -960,13 +1039,13 @@ mod tests {
         let target_port = upstream_listener.local_addr().unwrap().port();
         let upstream = std::thread::spawn(move || {
             let (_stream, _) = upstream_listener.accept().unwrap();
-            std::thread::sleep(Duration::from_secs(3));
+            std::thread::sleep(Duration::from_secs(9));
         });
         let proxy = PinnedHttpsProxy::start(
             "catalog.example",
             target_port,
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            Instant::now() + Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(8),
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
@@ -979,7 +1058,7 @@ mod tests {
             .unwrap();
         assert!(read_proxy_response(&mut client).starts_with("HTTP/1.1 200"));
         client
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(9)))
             .unwrap();
         let mut byte = [0_u8; 1];
         assert_eq!(client.read(&mut byte).unwrap(), 0);
@@ -992,16 +1071,19 @@ mod tests {
     fn pinned_https_proxy_closes_a_stalled_tunnel_when_cancelled() {
         let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let target_port = upstream_listener.local_addr().unwrap().port();
+        let (connection_sender, connection_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
         let upstream = std::thread::spawn(move || {
             let (_stream, _) = upstream_listener.accept().unwrap();
-            std::thread::sleep(Duration::from_secs(2));
+            connection_sender.send(()).unwrap();
+            let _ = release_receiver.recv();
         });
         let cancellation = Arc::new(AtomicBool::new(false));
         let proxy = PinnedHttpsProxy::start(
             "catalog.example",
             target_port,
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(15),
             Arc::clone(&cancellation),
         )
         .unwrap();
@@ -1013,12 +1095,20 @@ mod tests {
             )
             .unwrap();
         assert!(read_proxy_response(&mut client).starts_with("HTTP/1.1 200"));
+        connection_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
         cancellation.store(true, Ordering::Release);
         client
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let mut byte = [0_u8; 1];
-        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        match client.read(&mut byte) {
+            Ok(0) => {}
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+            result => panic!("expected closed tunnel, received {result:?}"),
+        }
+        release_sender.send(()).unwrap();
         drop(client);
         drop(proxy);
         upstream.join().unwrap();
@@ -1058,14 +1148,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires FLEET_TEST_PUBLIC_CATALOG_URL and public network access"]
+    #[ignore = "requires FLEET_TEST_PUBLIC_CATALOG_URL and public network access; optional FLEET_TEST_PUBLIC_CATALOG_REFERENCE"]
     fn public_git_fetcher_syncs_a_public_catalog_from_test_bootstrap() {
         let url = std::env::var("FLEET_TEST_PUBLIC_CATALOG_URL")
             .expect("test bootstrap must provide FLEET_TEST_PUBLIC_CATALOG_URL");
+        let reference = std::env::var("FLEET_TEST_PUBLIC_CATALOG_REFERENCE")
+            .unwrap_or_else(|_| "main".to_owned());
         let source = CatalogSource::new(
             fleet_domain::CatalogSourceId::new("external-smoke").unwrap(),
             fleet_domain::PublicCatalogUrl::new(url).unwrap(),
-            fleet_domain::CatalogReference::new("main").unwrap(),
+            fleet_domain::CatalogReference::new(reference).unwrap(),
         );
         let staging = tempfile::tempdir().unwrap();
         let result = PublicGitCatalogFetcher::new(staging.path())

@@ -1,3 +1,30 @@
+pub mod admin_approval;
+pub mod admin_cancel;
+mod admin_catalog;
+pub mod admin_remediation;
+pub use admin_catalog::{
+    AdminCatalogJobRepository, AuthorizedCatalogJobError, CreateAuthorizedCatalogRunbookJob,
+};
+pub mod admin_identity;
+pub mod assignment_recovery;
+pub mod catalog_execution;
+mod command_job;
+mod structured_job;
+pub use command_job::{
+    AdminCommandCommitError, AdminCommandJobRepository, AdminJobCommitError,
+    CommandCreationMetadata, CreateAuthorizedCommandJob, CreateAuthorizedCommandJobError,
+    JobCreationMetadata, PreparedCommandJob,
+};
+pub use structured_job::{
+    AdminStructuredJobError, AdminStructuredJobRepository, AuthorizedJobCreationOutput,
+    CreateAuthorizedStructuredJob, PreparedStructuredJob, PreparedStructuredTask,
+};
+pub mod delivery;
+pub mod output_read;
+pub use delivery::{
+    ControllerDeliveryIdentity, ControllerDeliveryIdentityRepository, RotateControllerStoreEpoch,
+};
+
 use fleet_domain::{
     Agent, AgentCapabilitySnapshot, AgentError, AgentId, AgentLabel, AgentStatus, ApprovalId,
     ApprovalRequest, ApprovalStatus, ArtifactChecksum, ArtifactId, ArtifactRetentionClass,
@@ -210,6 +237,12 @@ pub struct CatalogDocumentRecord {
 pub trait CatalogQueryRepository {
     type Error;
 
+    /// Reads one durable operation without fetching Git or changing its lifecycle.
+    fn find_catalog_sync_operation_status(
+        &self,
+        operation_id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, Self::Error>;
+
     fn list_catalog_sources_after(
         &self,
         after: Option<&CatalogSourceId>,
@@ -358,6 +391,29 @@ impl GetCatalogDocumentDetail {
         R: CatalogQueryRepository,
     {
         repository.find_catalog_document_detail(source_id, commit, path)
+    }
+}
+
+/// Reads one operation only within its requested source and operation identity.
+/// A missing operation or mismatched binding returns `None`; repository errors
+/// propagate without being mistaken for absence.
+pub struct GetCatalogSyncOperation;
+
+impl GetCatalogSyncOperation {
+    pub fn execute<R>(
+        repository: &R,
+        source_id: &CatalogSourceId,
+        operation_id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, R::Error>
+    where
+        R: CatalogQueryRepository,
+    {
+        repository
+            .find_catalog_sync_operation_status(operation_id)
+            .map(|operation| {
+                operation
+                    .filter(|value| value.source_id() == source_id && value.id() == operation_id)
+            })
     }
 }
 
@@ -1104,10 +1160,32 @@ mod catalog_application_tests {
         revisions: Vec<CatalogRevision>,
         documents: Vec<CatalogDocumentRecord>,
         requested_limits: RefCell<Vec<usize>>,
+        operations: Vec<CatalogSyncOperation>,
+        operation_reads: Cell<usize>,
+        operation_error: Option<&'static str>,
+        operation_override: Option<CatalogSyncOperation>,
     }
 
     impl CatalogQueryRepository for FakeCatalogQueryRepository {
-        type Error = Infallible;
+        type Error = &'static str;
+
+        fn find_catalog_sync_operation_status(
+            &self,
+            operation_id: &CatalogSyncOperationId,
+        ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+            self.operation_reads.set(self.operation_reads.get() + 1);
+            if let Some(error) = self.operation_error {
+                return Err(error);
+            }
+            if let Some(operation) = &self.operation_override {
+                return Ok(Some(operation.clone()));
+            }
+            Ok(self
+                .operations
+                .iter()
+                .find(|operation| operation.id() == operation_id)
+                .cloned())
+        }
 
         fn list_catalog_sources_after(
             &self,
@@ -1599,6 +1677,78 @@ mod catalog_application_tests {
             Err(CatalogPageQueryError::InvalidLimit { requested: 101 })
         ));
         assert_eq!(*repository.requested_limits.borrow(), vec![3, 3]);
+    }
+
+    #[test]
+    fn catalog_sync_operation_read_preserves_canonical_states_and_identity_scope() {
+        let source = CatalogSourceId::new("catalog-a").unwrap();
+        let other = CatalogSourceId::new("catalog-b").unwrap();
+        let commit = CatalogCommitId::new("a".repeat(40)).unwrap();
+        let states = [
+            CatalogSyncOperationState::InProgress,
+            CatalogSyncOperationState::Completed,
+            CatalogSyncOperationState::Failed(CatalogSyncFailure::FetchFailed),
+            CatalogSyncOperationState::Cancelled,
+        ];
+        let mut repository = FakeCatalogQueryRepository::default();
+        for (index, state) in states.into_iter().enumerate() {
+            repository.operations.push(
+                CatalogSyncOperation::restore(
+                    CatalogSyncOperationId::new(format!("sync-{index}")).unwrap(),
+                    source.clone(),
+                    Some(commit.clone()),
+                    state,
+                )
+                .unwrap(),
+            );
+        }
+        let before = repository.operations.clone();
+        for operation in &before {
+            assert_eq!(
+                GetCatalogSyncOperation::execute(&repository, &source, operation.id())
+                    .unwrap()
+                    .as_ref(),
+                Some(operation)
+            );
+        }
+        let missing = CatalogSyncOperationId::new("missing").unwrap();
+        assert!(
+            GetCatalogSyncOperation::execute(&repository, &other, before[0].id())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            GetCatalogSyncOperation::execute(&repository, &source, &missing)
+                .unwrap()
+                .is_none()
+        );
+        repository.operation_override = Some(before[0].clone());
+        assert!(
+            GetCatalogSyncOperation::execute(&repository, &source, &missing)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(repository.operation_reads.get(), 7);
+        assert_eq!(repository.operations, before);
+        assert!(repository.sources.is_empty());
+        assert!(repository.requested_limits.borrow().is_empty());
+    }
+
+    #[test]
+    fn catalog_sync_operation_read_does_not_hide_repository_failure_as_not_found() {
+        let repository = FakeCatalogQueryRepository {
+            operation_error: Some("injected read failure"),
+            ..Default::default()
+        };
+        assert_eq!(
+            GetCatalogSyncOperation::execute(
+                &repository,
+                &CatalogSourceId::new("catalog-a").unwrap(),
+                &CatalogSyncOperationId::new("sync-a").unwrap()
+            ),
+            Err("injected read failure")
+        );
+        assert_eq!(repository.operation_reads.get(), 1);
     }
 
     #[test]
@@ -4006,6 +4156,8 @@ pub trait RemediationRequestRepository {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemediationExecutionPersistenceInput {
     pub task_id: String,
+    pub job_id: String,
+    pub agent_id: String,
     pub assignment_status: String,
     pub assignment_last_error: Option<String>,
     pub occurred_at: SystemTime,
@@ -4073,6 +4225,41 @@ pub trait RemediationVerificationRecoveryRepository {
         &self,
         limit: usize,
     ) -> Result<Vec<RemediationRequestRecord>, Self::Error>;
+}
+
+/// Identifies a persisted verification result and evidence pair awaiting remediation resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemediationVerificationResolutionCandidate {
+    pub verification_job_id: String,
+    pub verification_task_id: String,
+}
+
+/// Selects restart-recovery candidates whose successful final and fresh compliant evidence
+/// are both already durable. The resolution use case must revalidate each candidate.
+pub trait RemediationVerificationResolutionRecoveryRepository {
+    type Error;
+
+    fn list_pending_remediation_verification_resolutions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemediationVerificationResolutionCandidate>, Self::Error>;
+}
+
+/// Selects the bounded durable resolution backlog before the controller accepts traffic.
+pub struct ListPendingRemediationVerificationResolutions;
+
+impl ListPendingRemediationVerificationResolutions {
+    pub fn execute<R>(
+        repo: &R,
+        limit: usize,
+    ) -> Result<Vec<RemediationVerificationResolutionCandidate>, R::Error>
+    where
+        R: RemediationVerificationResolutionRecoveryRepository,
+    {
+        repo.list_pending_remediation_verification_resolutions(
+            limit.clamp(1, MAX_REMEDIATION_VERIFICATION_RECOVERY_BATCH),
+        )
+    }
 }
 
 /// The hard upper bound for one controller-start recovery pass.
@@ -5073,26 +5260,23 @@ pub struct CreateRemediationRequestProposal;
 pub struct PersistVerifiedDriftProposal;
 
 impl PersistVerifiedDriftProposal {
-    pub fn execute<R>(
-        repo: &mut R,
+    /// Validates a candidate and prepares its report/proposal/audit records without I/O.
+    pub fn prepare(
         input: PersistVerifiedDriftProposalUseCaseInput,
-    ) -> Result<PersistVerifiedDriftProposalOutput, PolicyUseCaseError<R::Error, R::Error>>
-    where
-        R: VerifiedDriftProposalRepository,
-    {
+    ) -> Result<PersistVerifiedDriftProposalInput, String> {
         VerifiedDriftEvidence::validate_remediation_candidate(
             &input.report,
             &input.provenance,
             &input.policy,
         )
-        .map_err(|error| PolicyUseCaseError::Domain(format!("{error:?}")))?;
+        .map_err(|error| format!("{error:?}"))?;
         let request = RemediationRequest::propose_from_drift(
             input.remediation_id,
             &input.policy,
             input.agent_id.clone(),
             &input.report,
         )
-        .map_err(|error| PolicyUseCaseError::Domain(format!("{error:?}")))?;
+        .map_err(|error| format!("{error:?}"))?;
         let remediation = RemediationRequestRecord {
             id: request.id.clone(),
             policy_id: request.policy_id.clone(),
@@ -5134,7 +5318,7 @@ impl PersistVerifiedDriftProposal {
             )),
             occurred_at: input.requested_at,
         };
-        repo.save_verified_drift_proposal(PersistVerifiedDriftProposalInput {
+        Ok(PersistVerifiedDriftProposalInput {
             agent_id: input.agent_id,
             report: input.report,
             provenance: input.provenance,
@@ -5143,7 +5327,18 @@ impl PersistVerifiedDriftProposal {
             proposal_audit,
             checked_at: input.requested_at,
         })
-        .map_err(PolicyUseCaseError::Repository)
+    }
+
+    pub fn execute<R>(
+        repo: &mut R,
+        input: PersistVerifiedDriftProposalUseCaseInput,
+    ) -> Result<PersistVerifiedDriftProposalOutput, PolicyUseCaseError<R::Error, R::Error>>
+    where
+        R: VerifiedDriftProposalRepository,
+    {
+        let prepared = Self::prepare(input).map_err(PolicyUseCaseError::Domain)?;
+        repo.save_verified_drift_proposal(prepared)
+            .map_err(PolicyUseCaseError::Repository)
     }
 }
 
@@ -6075,108 +6270,29 @@ impl CreateCommandJob {
         A: AuditWriter,
         S: TaskEnvelopeSigner,
     {
-        if input.target_agent_ids.is_empty() {
-            return Err(CreateCommandJobError::NoTargets);
-        }
-
-        let task = CommandTask::new(input.program, input.args, input.timeout)
-            .map_err(CreateCommandJobError::Domain)?;
-        let task_kind = TaskKind::Command(task.clone());
-        let approval_requirement =
-            approval_requirement_for_task(&task_kind, input.target_agent_ids.len());
-        let mut job = Job::new(
-            JobId::new(input.job_id.clone()).map_err(CreateCommandJobError::Domain)?,
-            task.risk(),
+        let command_job::CommandJobParts {
+            job,
+            task,
+            targets,
+            envelopes,
             approval_requirement,
-            input.timeout,
-        );
-        if approval_requirement == fleet_domain::ApprovalRequirement::NotRequired {
-            job.queue(false).map_err(CreateCommandJobError::Domain)?;
-        }
-
-        let targets = input
-            .target_agent_ids
-            .iter()
-            .map(|id| {
-                AgentId::new(id.clone())
-                    .map(|agent_id| JobTarget { agent_id })
-                    .map_err(CreateCommandJobError::Agent)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut envelopes = Vec::with_capacity(targets.len());
-        for (index, target) in targets.iter().enumerate() {
-            let payload_hash = command_payload_hash(&task, target, index);
-            let signature = signer
-                .sign(&payload_hash)
-                .map_err(CreateCommandJobError::Sign)?;
-            envelopes.push(TaskEnvelope {
-                job_id: JobId::new(input.job_id.clone()).map_err(CreateCommandJobError::Domain)?,
-                task_id: TaskId::new(format!("{}-task-{index}", input.job_id))
-                    .map_err(CreateCommandJobError::Domain)?,
-                target_agent_id: target.agent_id.clone(),
-                issued_at: input.issued_at,
-                expires_at: TaskExpiry::new(input.expires_at),
-                nonce: TaskNonce::new(format!("{}-{index}", input.nonce_prefix))
-                    .map_err(CreateCommandJobError::Domain)?,
-                payload_hash,
-                signature: Some(
-                    TaskSignature::new(signature).map_err(CreateCommandJobError::Domain)?,
-                ),
-            });
-        }
+        } = command_job::prepare_parts::<<R as TaskAssignmentRepository>::Error, A::Error, S>(
+            &input, signer,
+        )?;
 
         repo.save_command_job_with_assignments(job, &task, &envelopes)
             .map_err(CreateCommandJobError::Repository)?;
-        let approval_request =
-            if approval_requirement != fleet_domain::ApprovalRequirement::NotRequired {
-                let approval = ApprovalRequest::new(
-                    ApprovalId::new(input.approval_request_id.clone())
-                        .map_err(CreateCommandJobError::Domain)?,
-                    JobId::new(input.job_id.clone()).map_err(CreateCommandJobError::Domain)?,
-                    input.confirmed_by.clone(),
-                    "high-risk command requires manual approval",
-                    input.approval_expires_at,
-                    input.issued_at,
-                )
-                .map_err(CreateCommandJobError::Domain)?;
-                let record = approval_request_to_record(&approval);
-                repo.insert_approval_request(record.clone())
-                    .map_err(CreateCommandJobError::Repository)?;
-                audit
-                    .write(AuditEvent {
-                        category: AuditCategory::Approval,
-                        action: "approval_requested".to_owned(),
-                        actor: AuditActor::new(input.confirmed_by.clone()),
-                        target: AuditTarget::new(input.job_id.clone()),
-                        value: AuditValue::Plain(format!(
-                            "approval_id={},reason={},confirmed_high_risk={},target_count={}",
-                            record.id,
-                            record.reason,
-                            input.confirmed_high_risk,
-                            targets.len()
-                        )),
-                        occurred_at: input.issued_at,
-                    })
-                    .map_err(CreateCommandJobError::Audit)?;
-                Some(record)
-            } else {
-                None
-            };
+        let approval_request = command_job::prepare_approval(&input, approval_requirement)
+            .map_err(CreateCommandJobError::Domain)?;
+        if let Some(record) = &approval_request {
+            repo.insert_approval_request(record.clone())
+                .map_err(CreateCommandJobError::Repository)?;
+            audit
+                .write(command_job::approval_audit(&input, record, targets.len()))
+                .map_err(CreateCommandJobError::Audit)?;
+        }
         audit
-            .write(AuditEvent {
-                category: AuditCategory::Job,
-                action: "job_created".to_owned(),
-                actor: AuditActor::new(input.confirmed_by.clone()),
-                target: AuditTarget::new(input.job_id),
-                value: AuditValue::Plain(format!(
-                    "confirmed_high_risk={},confirmed_by={},target_count={}",
-                    input.confirmed_high_risk,
-                    input.confirmed_by,
-                    targets.len()
-                )),
-                occurred_at: input.issued_at,
-            })
+            .write(command_job::creation_audit(&input, targets.len()))
             .map_err(CreateCommandJobError::Audit)?;
 
         Ok(CreateCommandJobOutput {
@@ -6272,57 +6388,18 @@ impl CreateDriftCheckJob {
         A: AuditWriter,
         S: TaskEnvelopeSigner,
     {
-        if input.target_agent_ids.is_empty() {
-            return Err(CreateDriftCheckJobError::NoTargets);
-        }
-
-        let task = DriftCheckTask::new(input.policy_document, input.timeout)
-            .map_err(CreateDriftCheckJobError::Domain)?;
-        let task_kind = TaskKind::DriftCheck(task.clone());
-        let approval_requirement =
-            approval_requirement_for_task(&task_kind, input.target_agent_ids.len());
-        let mut job = Job::new(
-            JobId::new(input.job_id.clone()).map_err(CreateDriftCheckJobError::Domain)?,
-            task.risk(),
+        let audit_input = structured_job::JobAuditInput::drift(&input);
+        let structured_job::DriftJobParts {
+            job,
+            task,
+            targets,
+            envelopes,
             approval_requirement,
-            input.timeout,
-        );
-        if approval_requirement == fleet_domain::ApprovalRequirement::NotRequired {
-            job.queue(false).map_err(CreateDriftCheckJobError::Domain)?;
-        }
-
-        let targets = input
-            .target_agent_ids
-            .iter()
-            .map(|id| {
-                AgentId::new(id.clone())
-                    .map(|agent_id| JobTarget { agent_id })
-                    .map_err(CreateDriftCheckJobError::Agent)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut envelopes = Vec::with_capacity(targets.len());
-        for (index, target) in targets.iter().enumerate() {
-            let payload_hash = drift_check_payload_hash(&task, target, index);
-            let signature = signer
-                .sign(&payload_hash)
-                .map_err(CreateDriftCheckJobError::Sign)?;
-            envelopes.push(TaskEnvelope {
-                job_id: JobId::new(input.job_id.clone())
-                    .map_err(CreateDriftCheckJobError::Domain)?,
-                task_id: TaskId::new(format!("{}-task-{index}", input.job_id))
-                    .map_err(CreateDriftCheckJobError::Domain)?,
-                target_agent_id: target.agent_id.clone(),
-                issued_at: input.issued_at,
-                expires_at: TaskExpiry::new(input.expires_at),
-                nonce: TaskNonce::new(format!("{}-{index}", input.nonce_prefix))
-                    .map_err(CreateDriftCheckJobError::Domain)?,
-                payload_hash,
-                signature: Some(
-                    TaskSignature::new(signature).map_err(CreateDriftCheckJobError::Domain)?,
-                ),
-            });
-        }
+        } = structured_job::prepare_drift_parts::<
+            <R as TaskAssignmentRepository>::Error,
+            A::Error,
+            S,
+        >(&input, signer)?;
 
         repo.save_drift_check_job_with_assignments_and_provenance(
             job,
@@ -6331,53 +6408,18 @@ impl CreateDriftCheckJob {
             input.provenance.as_ref(),
         )
         .map_err(CreateDriftCheckJobError::Repository)?;
-        let approval_request =
-            if approval_requirement != fleet_domain::ApprovalRequirement::NotRequired {
-                let approval = ApprovalRequest::new(
-                    ApprovalId::new(input.approval_request_id.clone())
-                        .map_err(CreateDriftCheckJobError::Domain)?,
-                    JobId::new(input.job_id.clone()).map_err(CreateDriftCheckJobError::Domain)?,
-                    input.created_by.clone(),
-                    "broad drift check requires manual approval",
-                    input.approval_expires_at,
-                    input.issued_at,
-                )
-                .map_err(CreateDriftCheckJobError::Domain)?;
-                let record = approval_request_to_record(&approval);
-                repo.insert_approval_request(record.clone())
-                    .map_err(CreateDriftCheckJobError::Repository)?;
-                audit
-                    .write(AuditEvent {
-                        category: AuditCategory::Approval,
-                        action: "approval_requested".to_owned(),
-                        actor: AuditActor::new(input.created_by.clone()),
-                        target: AuditTarget::new(input.job_id.clone()),
-                        value: AuditValue::Plain(format!(
-                            "approval_id={},reason={},target_count={}",
-                            record.id,
-                            record.reason,
-                            targets.len()
-                        )),
-                        occurred_at: input.issued_at,
-                    })
-                    .map_err(CreateDriftCheckJobError::Audit)?;
-                Some(record)
-            } else {
-                None
-            };
+        let approval_request = audit_input
+            .approval(approval_requirement)
+            .map_err(CreateDriftCheckJobError::Domain)?;
+        if let Some(record) = &approval_request {
+            repo.insert_approval_request(record.clone())
+                .map_err(CreateDriftCheckJobError::Repository)?;
+            audit
+                .write(audit_input.requested_audit(record, targets.len()))
+                .map_err(CreateDriftCheckJobError::Audit)?;
+        }
         audit
-            .write(AuditEvent {
-                category: AuditCategory::Drift,
-                action: "drift_check_job_created".to_owned(),
-                actor: AuditActor::new(input.created_by.clone()),
-                target: AuditTarget::new(input.job_id),
-                value: AuditValue::Plain(format!(
-                    "created_by={},target_count={}",
-                    input.created_by,
-                    targets.len()
-                )),
-                occurred_at: input.issued_at,
-            })
+            .write(audit_input.created_audit(targets.len()))
             .map_err(CreateDriftCheckJobError::Audit)?;
 
         Ok(CreateDriftCheckJobOutput {
@@ -6474,6 +6516,7 @@ impl CreateRunbookJob {
         A: AuditWriter,
         S: TaskEnvelopeSigner,
     {
+        let audit_input = structured_job::JobAuditInput::runbook(&input);
         let mut signed = build_signed_runbook_job(
             signer,
             BuildSignedRunbookJobInput {
@@ -6496,55 +6539,18 @@ impl CreateRunbookJob {
 
         repo.save_runbook_job_with_assignments(signed.job, &signed.task, &signed.envelopes)
             .map_err(CreateRunbookJobError::Repository)?;
-        let approval_request =
-            if signed.approval_requirement != fleet_domain::ApprovalRequirement::NotRequired {
-                let approval = ApprovalRequest::new(
-                    ApprovalId::new(input.approval_request_id.clone())
-                        .map_err(CreateRunbookJobError::Domain)?,
-                    JobId::new(input.job_id.clone()).map_err(CreateRunbookJobError::Domain)?,
-                    input.confirmed_by.clone(),
-                    "runbook execution requires manual approval",
-                    input.approval_expires_at,
-                    input.issued_at,
-                )
-                .map_err(CreateRunbookJobError::Domain)?;
-                let record = approval_request_to_record(&approval);
-                repo.insert_approval_request(record.clone())
-                    .map_err(CreateRunbookJobError::Repository)?;
-                audit
-                    .write(AuditEvent {
-                        category: AuditCategory::Approval,
-                        action: "approval_requested".to_owned(),
-                        actor: AuditActor::new(input.confirmed_by.clone()),
-                        target: AuditTarget::new(input.job_id.clone()),
-                        value: AuditValue::Plain(format!(
-                            "approval_id={},reason={},confirmed_high_risk={},target_count={}",
-                            record.id,
-                            record.reason,
-                            input.confirmed_high_risk,
-                            signed.targets.len()
-                        )),
-                        occurred_at: input.issued_at,
-                    })
-                    .map_err(CreateRunbookJobError::Audit)?;
-                Some(record)
-            } else {
-                None
-            };
+        let approval_request = audit_input
+            .approval(signed.approval_requirement)
+            .map_err(CreateRunbookJobError::Domain)?;
+        if let Some(record) = &approval_request {
+            repo.insert_approval_request(record.clone())
+                .map_err(CreateRunbookJobError::Repository)?;
+            audit
+                .write(audit_input.requested_audit(record, signed.targets.len()))
+                .map_err(CreateRunbookJobError::Audit)?;
+        }
         audit
-            .write(AuditEvent {
-                category: AuditCategory::Job,
-                action: "runbook_job_created".to_owned(),
-                actor: AuditActor::new(input.confirmed_by.clone()),
-                target: AuditTarget::new(input.job_id),
-                value: AuditValue::Plain(format!(
-                    "confirmed_high_risk={},confirmed_by={},target_count={}",
-                    input.confirmed_high_risk,
-                    input.confirmed_by,
-                    signed.targets.len()
-                )),
-                occurred_at: input.issued_at,
-            })
+            .write(audit_input.created_audit(signed.targets.len()))
             .map_err(CreateRunbookJobError::Audit)?;
 
         Ok(CreateRunbookJobOutput {
@@ -6570,13 +6576,173 @@ fn map_create_runbook_job_error<RepoError, AuditError, SignError>(
     }
 }
 
-/// Input for creating a Runbook Job from one immutable, already activated catalog document.
-///
-/// The runbook body deliberately is not caller supplied. The application reads it from the
+/// Dispatch settings captured with the catalog Job, never patched after creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogJobCreationStrategy {
+    pub concurrency: std::num::NonZeroU32,
+    pub max_failures: Option<std::num::NonZeroU32>,
+}
+
+impl Default for CatalogJobCreationStrategy {
+    fn default() -> Self {
+        Self {
+            concurrency: std::num::NonZeroU32::MIN,
+            max_failures: None,
+        }
+    }
+}
+
+/// Records how the caller selected the already-resolved immutable target IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogJobTargetSelection {
+    ExplicitIds,
+    Selector(String),
+    MatchLabels(BTreeMap<String, String>),
+    Runbook,
+}
+
+/// Validated selection metadata. Adapters serialize it without resolving labels again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogJobSelectorSnapshot {
+    ExplicitIds(Vec<AgentId>),
+    Selector(Selector),
+    MatchLabels(BTreeMap<String, String>),
+    Runbook(Selector),
+}
+
+/// All creation effects prepared before the first durable write. The repository
+/// must commit them together, rechecking the active/ready/document binding inside
+/// that transaction. It must not dispatch tasks or fall back to sequential writes.
+/// Only this Application boundary constructs the bundle; adapters get read-only access.
+pub struct CatalogRunbookJobCreation<'a> {
+    job: &'a Job,
+    task: &'a RunbookExecutionTask,
+    provenance: &'a fleet_domain::CatalogRunbookProvenance,
+    assignments: &'a [TaskEnvelope],
+    approval_request: Option<&'a ApprovalRequestRecord>,
+    audit_events: &'a [AuditEvent],
+    strategy: &'a CatalogJobCreationStrategy,
+    selector_snapshot: &'a CatalogJobSelectorSnapshot,
+}
+
+impl CatalogRunbookJobCreation<'_> {
+    /// Runs inside the same serialized identity/catalog transaction as all effects.
+    /// Audit metadata must name the authenticated actor and never grants authority itself.
+    pub fn authorize<R: admin_identity::AdminWriteRead + ?Sized>(
+        &self,
+        repository: &R,
+        principal: &admin_identity::AdminMutationPrincipal,
+        operation: &dyn admin_identity::AdminOperation,
+    ) -> Result<(), admin_identity::AdminAccessError> {
+        let actor = admin_identity::AuthorizeAdminWrite::execute(
+            repository,
+            principal,
+            operation,
+            fleet_domain::AdminPermission::JobCreate,
+        )?;
+        if self.audit_events.is_empty()
+            || self
+                .audit_events
+                .iter()
+                .any(|event| event.actor.as_str() != actor.as_str())
+            || self
+                .approval_request
+                .is_some_and(|approval| approval.requester != actor.as_str())
+        {
+            return Err(admin_identity::AdminAccessError::Unauthorized);
+        }
+        Ok(())
+    }
+    pub fn job(&self) -> &Job {
+        self.job
+    }
+    pub fn task(&self) -> &RunbookExecutionTask {
+        self.task
+    }
+    pub fn provenance(&self) -> &fleet_domain::CatalogRunbookProvenance {
+        self.provenance
+    }
+    pub fn assignments(&self) -> &[TaskEnvelope] {
+        self.assignments
+    }
+    pub fn approval_request(&self) -> Option<&ApprovalRequestRecord> {
+        self.approval_request
+    }
+    pub fn audit_events(&self) -> &[AuditEvent] {
+        self.audit_events
+    }
+    pub fn strategy(&self) -> &CatalogJobCreationStrategy {
+        self.strategy
+    }
+    pub fn selector_snapshot(&self) -> &CatalogJobSelectorSnapshot {
+        self.selector_snapshot
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Non-saved outcomes must leave every creation effect unchanged.
+pub enum CatalogRunbookJobCreationOutcome {
+    Saved,
+    SelectionChanged,
+    DuplicateJob,
+}
+
+/// Only immutable catalog reads needed to prepare one Job. Registration, sync and
+/// activation writes do not belong to this execution boundary.
+pub trait CatalogJobCreationRead {
+    type Error;
+    fn execution_source(&self, id: &CatalogSourceId) -> Result<Option<CatalogSource>, Self::Error>;
+    fn execution_revision(
+        &self,
+        id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+    ) -> Result<Option<CatalogRevision>, Self::Error>;
+    fn execution_document(
+        &self,
+        id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<CatalogDocumentRecord>, Self::Error>;
+}
+impl<R: CatalogRepository + ?Sized> CatalogJobCreationRead for R {
+    type Error = R::Error;
+    fn execution_source(&self, id: &CatalogSourceId) -> Result<Option<CatalogSource>, Self::Error> {
+        self.find_catalog_source(id)
+    }
+    fn execution_revision(
+        &self,
+        id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+    ) -> Result<Option<CatalogRevision>, Self::Error> {
+        self.find_catalog_revision(id, commit)
+    }
+    fn execution_document(
+        &self,
+        id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<CatalogDocumentRecord>, Self::Error> {
+        self.find_catalog_document(id, commit, path)
+    }
+}
+
+/// Trusted atomic write boundary for catalog execution; no default fallback.
+/// Human interfaces use AdminCatalogJobRepository through CreateAuthorizedCatalogRunbookJob.
+pub trait CatalogRunbookJobCreationRepository: CatalogJobCreationRead {
+    fn commit_catalog_runbook_job(
+        &mut self,
+        creation: CatalogRunbookJobCreation<'_>,
+    ) -> Result<CatalogRunbookJobCreationOutcome, Self::Error>;
+}
+
+/// Input for one immutable, already activated catalog document. The runbook body
+/// deliberately is not caller supplied. The application reads it from the
 /// durable catalog record after verifying the source, active revision, document path, and
 /// checksum supplied by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateCatalogRunbookJobInput {
+    pub strategy: CatalogJobCreationStrategy,
+    pub target_selection: CatalogJobTargetSelection,
     pub source_id: String,
     pub commit: String,
     pub path: String,
@@ -6594,7 +6760,7 @@ pub struct CreateCatalogRunbookJobInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CreateCatalogRunbookJobError<RepoError, AuditError, SignError> {
+pub enum CreateCatalogRunbookJobError<RepoError, SignError> {
     Catalog(CatalogError),
     SourceNotFound,
     RevisionNotFound,
@@ -6602,29 +6768,29 @@ pub enum CreateCatalogRunbookJobError<RepoError, AuditError, SignError> {
     RevisionNotReady,
     DocumentNotFound,
     ChecksumMismatch,
+    InvalidTargetSelection,
+    DuplicateTargets,
+    SelectionChanged,
+    DuplicateJob,
     Domain(JobError),
     Agent(AgentError),
     InvalidRunbook(String),
     NoTargets,
     Repository(RepoError),
-    Audit(AuditError),
     Sign(SignError),
 }
 
-pub type CreateCatalogRunbookJobResult<R, A, S> = Result<
+pub type CreateCatalogRunbookJobResult<R, S> = Result<
     CreateRunbookJobOutput,
     CreateCatalogRunbookJobError<
-        <R as TaskAssignmentRepository>::Error,
-        <A as AuditWriter>::Error,
+        <R as CatalogJobCreationRead>::Error,
         <S as TaskEnvelopeSigner>::Error,
     >,
 >;
 
-impl<RepoError, AuditError, SignError> Display
-    for CreateCatalogRunbookJobError<RepoError, AuditError, SignError>
+impl<RepoError, SignError> Display for CreateCatalogRunbookJobError<RepoError, SignError>
 where
     RepoError: Display,
-    AuditError: Display,
     SignError: Display,
 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
@@ -6638,30 +6804,42 @@ where
             Self::ChecksumMismatch => {
                 formatter.write_str("catalog document checksum does not match")
             }
+            Self::InvalidTargetSelection => {
+                formatter.write_str("catalog target selection is invalid")
+            }
+            Self::DuplicateTargets => formatter.write_str("catalog targets must be unique"),
+            Self::SelectionChanged => {
+                formatter.write_str("catalog selection changed before commit")
+            }
+            Self::DuplicateJob => formatter.write_str("catalog job id already exists"),
             Self::Domain(error) => write!(formatter, "{error}"),
             Self::Agent(error) => write!(formatter, "{error}"),
             Self::InvalidRunbook(error) => write!(formatter, "invalid runbook: {error}"),
             Self::NoTargets => formatter.write_str("runbook job requires at least one target"),
             Self::Repository(error) => write!(formatter, "repository error: {error}"),
-            Self::Audit(error) => write!(formatter, "audit error: {error}"),
             Self::Sign(error) => write!(formatter, "sign error: {error}"),
         }
     }
 }
 
-/// Creates an approved-and-signed Runbook Job using a durable, active catalog snapshot.
+impl<R: Debug + Display, S: Debug + Display> std::error::Error
+    for CreateCatalogRunbookJobError<R, S>
+{
+}
+
+/// Prepares signed assignments, pending approval and audits from a durable active
+/// catalog document, then requests one atomic creation commit. It never dispatches.
+/// Human interfaces must call CreateAuthorizedCatalogRunbookJob to bind current authority.
 pub struct CreateCatalogRunbookJob;
 
 impl CreateCatalogRunbookJob {
-    pub fn execute<R, A, S>(
+    pub fn execute<R, S>(
         repo: &mut R,
-        audit: &mut A,
         signer: &mut S,
         input: CreateCatalogRunbookJobInput,
-    ) -> CreateCatalogRunbookJobResult<R, A, S>
+    ) -> CreateCatalogRunbookJobResult<R, S>
     where
-        R: RunbookJobRepository + CatalogRepository<Error = <R as TaskAssignmentRepository>::Error>,
-        A: AuditWriter,
+        R: CatalogRunbookJobCreationRepository,
         S: TaskEnvelopeSigner,
     {
         let source_id = CatalogSourceId::new(input.source_id.clone())
@@ -6669,28 +6847,47 @@ impl CreateCatalogRunbookJob {
         let commit = CatalogCommitId::new(input.commit.clone())
             .map_err(CreateCatalogRunbookJobError::Catalog)?;
         let source = repo
-            .find_catalog_source(&source_id)
+            .execution_source(&source_id)
             .map_err(CreateCatalogRunbookJobError::Repository)?
             .ok_or(CreateCatalogRunbookJobError::SourceNotFound)?;
+        if source.id() != &source_id {
+            return Err(CreateCatalogRunbookJobError::SelectionChanged);
+        }
         if source.active_revision() != Some(&commit) {
             return Err(CreateCatalogRunbookJobError::RevisionNotActive);
         }
         let revision = repo
-            .find_catalog_revision(&source_id, &commit)
+            .execution_revision(&source_id, &commit)
             .map_err(CreateCatalogRunbookJobError::Repository)?
             .ok_or(CreateCatalogRunbookJobError::RevisionNotFound)?;
+        if revision.source_id() != &source_id || revision.commit() != &commit {
+            return Err(CreateCatalogRunbookJobError::SelectionChanged);
+        }
         if !matches!(revision.state(), CatalogRevisionState::Ready { .. }) {
             return Err(CreateCatalogRunbookJobError::RevisionNotReady);
         }
         let record = repo
-            .find_catalog_document(&source_id, &commit, &input.path)
+            .execution_document(&source_id, &commit, &input.path)
             .map_err(CreateCatalogRunbookJobError::Repository)?
             .ok_or(CreateCatalogRunbookJobError::DocumentNotFound)?;
+        if record.document.source_id() != &source_id
+            || record.document.commit() != &commit
+            || record.document.path() != input.path
+        {
+            return Err(CreateCatalogRunbookJobError::SelectionChanged);
+        }
         if record.document.checksum() != input.checksum {
             return Err(CreateCatalogRunbookJobError::ChecksumMismatch);
         }
         let provenance = fleet_domain::CatalogRunbookProvenance::from_document(&record.document)
             .map_err(CreateCatalogRunbookJobError::Catalog)?;
+        let strategy = input.strategy;
+        let selection = input.target_selection;
+        if input.target_agent_ids.iter().collect::<BTreeSet<_>>().len()
+            != input.target_agent_ids.len()
+        {
+            return Err(CreateCatalogRunbookJobError::DuplicateTargets);
+        }
         let runbook_input = CreateRunbookJobInput {
             job_id: input.job_id.clone(),
             target_agent_ids: input.target_agent_ids,
@@ -6723,13 +6920,32 @@ impl CreateCatalogRunbookJob {
                 .queue(false)
                 .map_err(CreateCatalogRunbookJobError::Domain)?;
         }
-        repo.save_catalog_runbook_job_with_assignments(
-            signed.job,
-            &signed.task,
-            &provenance,
-            &signed.envelopes,
-        )
-        .map_err(CreateCatalogRunbookJobError::Repository)?;
+        let selector_snapshot = match selection {
+            CatalogJobTargetSelection::ExplicitIds => CatalogJobSelectorSnapshot::ExplicitIds(
+                signed
+                    .targets
+                    .iter()
+                    .map(|target| target.agent_id.clone())
+                    .collect(),
+            ),
+            CatalogJobTargetSelection::Selector(source) => CatalogJobSelectorSnapshot::Selector(
+                Selector::parse(&source)
+                    .map_err(|_| CreateCatalogRunbookJobError::InvalidTargetSelection)?,
+            ),
+            CatalogJobTargetSelection::MatchLabels(labels) => {
+                Selector::from_match_labels(labels.clone())
+                    .map_err(|_| CreateCatalogRunbookJobError::InvalidTargetSelection)?;
+                CatalogJobSelectorSnapshot::MatchLabels(labels)
+            }
+            CatalogJobTargetSelection::Runbook => CatalogJobSelectorSnapshot::Runbook(
+                parse_runbook_document(signed.task.runbook_document())
+                    .map_err(|error| {
+                        CreateCatalogRunbookJobError::InvalidRunbook(error.to_string())
+                    })?
+                    .target_selector,
+            ),
+        };
+        let mut audit_events = Vec::new();
         let approval_request =
             if signed.approval_requirement != fleet_domain::ApprovalRequirement::NotRequired {
                 let approval = ApprovalRequest::new(
@@ -6744,30 +6960,25 @@ impl CreateCatalogRunbookJob {
                 )
                 .map_err(CreateCatalogRunbookJobError::Domain)?;
                 let record = approval_request_to_record(&approval);
-                repo.insert_approval_request(record.clone())
-                    .map_err(CreateCatalogRunbookJobError::Repository)?;
-                audit
-                    .write(AuditEvent {
-                        category: AuditCategory::Approval,
-                        action: "approval_requested".to_owned(),
-                        actor: AuditActor::new(runbook_input.confirmed_by.clone()),
-                        target: AuditTarget::new(runbook_input.job_id.clone()),
-                        value: AuditValue::Plain(format!(
-                            "approval_id={},reason={},confirmed_high_risk={},target_count={}",
-                            record.id,
-                            record.reason,
-                            runbook_input.confirmed_high_risk,
-                            signed.targets.len()
-                        )),
-                        occurred_at: runbook_input.issued_at,
-                    })
-                    .map_err(CreateCatalogRunbookJobError::Audit)?;
+                audit_events.push(AuditEvent {
+                    category: AuditCategory::Approval,
+                    action: "approval_requested".to_owned(),
+                    actor: AuditActor::new(runbook_input.confirmed_by.clone()),
+                    target: AuditTarget::new(runbook_input.job_id.clone()),
+                    value: AuditValue::Plain(format!(
+                        "approval_id={},reason={},confirmed_high_risk={},target_count={}",
+                        record.id,
+                        record.reason,
+                        runbook_input.confirmed_high_risk,
+                        signed.targets.len()
+                    )),
+                    occurred_at: runbook_input.issued_at,
+                });
                 Some(record)
             } else {
                 None
             };
-        audit
-            .write(AuditEvent {
+        audit_events.push(AuditEvent {
                 category: AuditCategory::Job,
                 action: "catalog_runbook_job_created".to_owned(),
                 actor: AuditActor::new(runbook_input.confirmed_by.clone()),
@@ -6783,8 +6994,28 @@ impl CreateCatalogRunbookJob {
                     signed.targets.len()
                 )),
                 occurred_at: runbook_input.issued_at,
+            });
+        match repo
+            .commit_catalog_runbook_job(CatalogRunbookJobCreation {
+                job: &signed.job,
+                task: &signed.task,
+                provenance: &provenance,
+                assignments: &signed.envelopes,
+                approval_request: approval_request.as_ref(),
+                audit_events: &audit_events,
+                strategy: &strategy,
+                selector_snapshot: &selector_snapshot,
             })
-            .map_err(CreateCatalogRunbookJobError::Audit)?;
+            .map_err(CreateCatalogRunbookJobError::Repository)?
+        {
+            CatalogRunbookJobCreationOutcome::Saved => {}
+            CatalogRunbookJobCreationOutcome::SelectionChanged => {
+                return Err(CreateCatalogRunbookJobError::SelectionChanged);
+            }
+            CatalogRunbookJobCreationOutcome::DuplicateJob => {
+                return Err(CreateCatalogRunbookJobError::DuplicateJob);
+            }
+        }
 
         Ok(CreateRunbookJobOutput {
             task: signed.task,
@@ -6795,9 +7026,9 @@ impl CreateCatalogRunbookJob {
     }
 }
 
-fn map_create_catalog_runbook_job_error<RepoError, AuditError, SignError>(
+fn map_create_catalog_runbook_job_error<RepoError, SignError>(
     error: BuildSignedRunbookJobError<SignError>,
-) -> CreateCatalogRunbookJobError<RepoError, AuditError, SignError> {
+) -> CreateCatalogRunbookJobError<RepoError, SignError> {
     match error {
         BuildSignedRunbookJobError::Domain(error) => CreateCatalogRunbookJobError::Domain(error),
         BuildSignedRunbookJobError::Agent(error) => CreateCatalogRunbookJobError::Agent(error),
@@ -7302,6 +7533,19 @@ impl PreviewSelector {
     where
         R: AgentInventoryRepository,
     {
+        Self::execute_with_connected_agents(repo, input, &BTreeSet::new())
+    }
+
+    /// Uses the caller's current session snapshot for preview liveness only.
+    /// Disabled targets stay excluded; no Agent record or dispatch authority is changed.
+    pub fn execute_with_connected_agents<R>(
+        repo: &R,
+        input: SelectorPreviewInput,
+        connected_agent_ids: &BTreeSet<String>,
+    ) -> Result<SelectorPreviewOutput, R::Error>
+    where
+        R: AgentInventoryRepository,
+    {
         let agents = ListInventoryAgents::execute(repo)?;
         let matched = select_agents(&agents, &input.selector);
         let selection = select_dispatch_targets(&agents, &input.selector);
@@ -7315,7 +7559,14 @@ impl PreviewSelector {
             .map(|agent| SelectorPreviewAgentRecord {
                 agent_id: agent.id().as_str().to_owned(),
                 name: agent.name().as_str().to_owned(),
-                status: agent_status_to_str(agent.status()).to_owned(),
+                status: if agent.status() != AgentStatus::Disabled
+                    && connected_agent_ids.contains(agent.id().as_str())
+                {
+                    "online"
+                } else {
+                    agent_status_to_str(agent.status())
+                }
+                .to_owned(),
                 labels: agent
                     .labels()
                     .iter()
@@ -7324,6 +7575,10 @@ impl PreviewSelector {
                 selected_for_dispatch: selected_agent_ids.contains(agent.id().as_str()),
             })
             .collect::<Vec<_>>();
+        let offline_count = agents
+            .iter()
+            .filter(|agent| agent.status == "offline")
+            .count();
         let mut warnings = Vec::new();
         if selection.disabled_count > 0 {
             warnings.push(SelectorPreviewWarningRecord {
@@ -7334,12 +7589,12 @@ impl PreviewSelector {
                 ),
             });
         }
-        if selection.offline_count > 0 {
+        if offline_count > 0 {
             warnings.push(SelectorPreviewWarningRecord {
                 code: "offline_agents_will_queue".to_owned(),
                 message: format!(
                     "{} offline agent(s) match the selector and will remain queued until connected",
-                    selection.offline_count
+                    offline_count
                 ),
             });
         }
@@ -7354,7 +7609,7 @@ impl PreviewSelector {
             matched_count: selection.matched_count,
             selected_count: selection.targets.len(),
             disabled_count: selection.disabled_count,
-            offline_count: selection.offline_count,
+            offline_count,
             agents,
             warnings,
         })
@@ -9103,6 +9358,235 @@ mod tests {
     }
 
     #[test]
+    fn catalog_creation_requests_one_commit_with_approval_audits_and_dispatch_snapshots() {
+        let mut repo = catalog_creation_repository();
+        let mut input = catalog_runbook_input();
+        input.target_agent_ids = vec!["agent-2".to_owned(), "agent-1".to_owned()];
+        input.strategy = CatalogJobCreationStrategy {
+            concurrency: std::num::NonZeroU32::new(3).unwrap(),
+            max_failures: std::num::NonZeroU32::new(2),
+        };
+        let expected_strategy = input.strategy;
+        let output = CreateCatalogRunbookJob::execute(&mut repo, &mut FakeSigner, input).unwrap();
+        assert_eq!(repo.catalog_creation_calls, 1);
+        assert_eq!(repo.catalog_creation_strategy, Some(expected_strategy));
+        assert_eq!(
+            repo.catalog_creation_selector,
+            Some(CatalogJobSelectorSnapshot::ExplicitIds(vec![
+                AgentId::new("agent-2").unwrap(),
+                AgentId::new("agent-1").unwrap(),
+            ]))
+        );
+        assert_eq!(repo.catalog_creation_audits.len(), 2);
+        assert_eq!(repo.catalog_creation_audits[0].action, "approval_requested");
+        assert_eq!(
+            repo.catalog_creation_audits[1].action,
+            "catalog_runbook_job_created"
+        );
+        assert!(
+            repo.catalog_creation_audits
+                .iter()
+                .all(|event| !plain_audit_value(event).contains("tasks:"))
+        );
+        assert_eq!(repo.approval_requests.len(), 1);
+        assert_eq!(repo.approval_requests[0].status, "pending");
+        assert_eq!(repo.approval_requests[0].job_id, "catalog-runbook-job-1");
+        assert_eq!(output.envelopes.len(), 2);
+        assert_eq!(output.envelopes, repo.saved_assignments);
+        assert!(
+            output
+                .envelopes
+                .iter()
+                .all(|envelope| envelope.signature.is_some())
+        );
+    }
+
+    #[test]
+    fn catalog_creation_captures_the_chosen_selector_without_replacing_the_target_snapshot() {
+        for selection in [
+            CatalogJobTargetSelection::Selector("role=web".to_owned()),
+            CatalogJobTargetSelection::MatchLabels(BTreeMap::from([(
+                "role".to_owned(),
+                "web".to_owned(),
+            )])),
+            CatalogJobTargetSelection::Runbook,
+        ] {
+            let mut repo = catalog_creation_repository();
+            let mut input = catalog_runbook_input();
+            input.target_selection = selection.clone();
+            let output =
+                CreateCatalogRunbookJob::execute(&mut repo, &mut FakeSigner, input).unwrap();
+            assert_eq!(output.targets[0].agent_id.as_str(), "agent-1");
+            match (selection, repo.catalog_creation_selector.unwrap()) {
+                (
+                    CatalogJobTargetSelection::Selector(_),
+                    CatalogJobSelectorSnapshot::Selector(selector),
+                )
+                | (
+                    CatalogJobTargetSelection::Runbook,
+                    CatalogJobSelectorSnapshot::Runbook(selector),
+                ) => assert_eq!(selector, Selector::parse("role=web").unwrap()),
+                (
+                    CatalogJobTargetSelection::MatchLabels(labels),
+                    CatalogJobSelectorSnapshot::MatchLabels(snapshot),
+                ) => assert_eq!(snapshot, labels),
+                other => panic!("selection origin changed: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_creation_rejects_invalid_targets_selection_kind_and_approval_before_commit() {
+        for case in 0..14 {
+            let mut repo = catalog_creation_repository();
+            let mut input = catalog_runbook_input();
+            match case {
+                0 => input.target_agent_ids.clear(),
+                1 => input.target_agent_ids.push("agent-1".to_owned()),
+                2 => input.target_agent_ids[0].clear(),
+                3 => {
+                    input.target_selection =
+                        CatalogJobTargetSelection::Selector("invalid".to_owned())
+                }
+                4 => {
+                    input.target_selection = CatalogJobTargetSelection::MatchLabels(BTreeMap::new())
+                }
+                5 => input.approval_expires_at = input.issued_at,
+                6 => input.confirmed_by.clear(),
+                7 => {
+                    let document = &repo.catalog_documents[0].document;
+                    repo.catalog_documents[0].document = CatalogDocument::new(
+                        document.source_id().clone(),
+                        document.commit().clone(),
+                        CatalogDocumentKind::Policy,
+                        document.path(),
+                        document.checksum(),
+                    )
+                    .unwrap();
+                }
+                8 => input.source_id.clear(),
+                9 => input.source_id = "source-missing".to_owned(),
+                10 => repo.catalog_revisions.clear(),
+                11 => input.checksum = "d".repeat(64),
+                12 => input.path = "runbooks/missing.yaml".to_owned(),
+                13 => input.timeout = Duration::ZERO,
+                _ => unreachable!(),
+            }
+            let result = CreateCatalogRunbookJob::execute(&mut repo, &mut FakeSigner, input);
+            assert!(result.is_err(), "invalid case {case} was accepted");
+            let classified = match case {
+                0 => matches!(result, Err(CreateCatalogRunbookJobError::NoTargets)),
+                1 => matches!(result, Err(CreateCatalogRunbookJobError::DuplicateTargets)),
+                2 => matches!(result, Err(CreateCatalogRunbookJobError::Agent(_))),
+                3 | 4 => matches!(
+                    result,
+                    Err(CreateCatalogRunbookJobError::InvalidTargetSelection)
+                ),
+                5 | 6 | 13 => matches!(result, Err(CreateCatalogRunbookJobError::Domain(_))),
+                7 | 8 => matches!(result, Err(CreateCatalogRunbookJobError::Catalog(_))),
+                9 => matches!(result, Err(CreateCatalogRunbookJobError::SourceNotFound)),
+                10 => matches!(result, Err(CreateCatalogRunbookJobError::RevisionNotFound)),
+                11 => matches!(result, Err(CreateCatalogRunbookJobError::ChecksumMismatch)),
+                12 => matches!(result, Err(CreateCatalogRunbookJobError::DocumentNotFound)),
+                _ => false,
+            };
+            assert!(classified, "invalid case {case} returned another error");
+            assert_eq!(
+                repo.catalog_creation_calls, 0,
+                "invalid case {case} reached the write boundary"
+            );
+            assert_eq!(repo.saved_count, 0);
+            assert!(repo.saved_assignments.is_empty());
+            assert!(repo.approval_requests.is_empty());
+            assert!(repo.catalog_creation_audits.is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_creation_signing_failure_on_a_later_target_has_no_persistence_effect() {
+        struct FailingSigner(usize);
+        impl TaskEnvelopeSigner for FailingSigner {
+            type Error = &'static str;
+            fn sign(&mut self, _payload: &str) -> Result<String, Self::Error> {
+                self.0 += 1;
+                if self.0 == 2 {
+                    Err("signing unavailable")
+                } else {
+                    Ok("signature".to_owned())
+                }
+            }
+        }
+        let mut repo = catalog_creation_repository();
+        let mut signer = FailingSigner(0);
+        let mut input = catalog_runbook_input();
+        input.target_agent_ids.push("agent-2".to_owned());
+        assert!(matches!(
+            CreateCatalogRunbookJob::execute(&mut repo, &mut signer, input),
+            Err(CreateCatalogRunbookJobError::Sign("signing unavailable"))
+        ));
+        assert_eq!(signer.0, 2);
+        assert_eq!(repo.catalog_creation_calls, 0);
+        assert_eq!(repo.saved_count, 0);
+        assert!(repo.saved_assignments.is_empty());
+        assert!(repo.approval_requests.is_empty());
+        assert!(repo.catalog_creation_audits.is_empty());
+    }
+
+    #[test]
+    fn catalog_creation_conflict_returns_no_success_or_assignment_for_dispatch() {
+        for outcome in [
+            CatalogRunbookJobCreationOutcome::SelectionChanged,
+            CatalogRunbookJobCreationOutcome::DuplicateJob,
+        ] {
+            let mut repo = catalog_creation_repository();
+            repo.catalog_creation_outcome = Some(outcome);
+            let result = CreateCatalogRunbookJob::execute(
+                &mut repo,
+                &mut FakeSigner,
+                catalog_runbook_input(),
+            );
+            match outcome {
+                CatalogRunbookJobCreationOutcome::SelectionChanged => assert!(matches!(
+                    result,
+                    Err(CreateCatalogRunbookJobError::SelectionChanged)
+                )),
+                CatalogRunbookJobCreationOutcome::DuplicateJob => assert!(matches!(
+                    result,
+                    Err(CreateCatalogRunbookJobError::DuplicateJob)
+                )),
+                _ => unreachable!(),
+            }
+            assert_eq!(repo.catalog_creation_calls, 1);
+            assert_eq!(repo.saved_count, 0);
+            assert!(repo.saved_assignments.is_empty());
+            assert!(repo.approval_requests.is_empty());
+            assert!(repo.catalog_creation_audits.is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_job_invalid_approval_is_rejected_before_any_persistence() {
+        let mut repo = FakeCommandJobRepository::default();
+        let (source, revision, document) = ready_active_catalog_runbook();
+        repo.catalog_sources.push(source);
+        repo.catalog_revisions.push(revision);
+        repo.catalog_documents.push(CatalogDocumentRecord {
+            document,
+            body: remediation_runbook_document(),
+        });
+        let mut input = catalog_runbook_input();
+        input.approval_request_id.clear();
+        let result = CreateCatalogRunbookJob::execute(&mut repo, &mut FakeSigner, input);
+        assert!(matches!(
+            result,
+            Err(CreateCatalogRunbookJobError::Domain(_))
+        ));
+        assert_eq!(repo.saved_count, 0, "invalid approval must not leave a Job");
+        assert!(repo.saved_assignments.is_empty());
+        assert!(repo.approval_requests.is_empty());
+    }
+
+    #[test]
     fn active_catalog_runbook_creates_an_approved_signed_job_from_the_durable_snapshot() {
         let mut repo = FakeCommandJobRepository::default();
         let (source, revision, document) = ready_active_catalog_runbook();
@@ -9112,16 +9596,11 @@ mod tests {
             document,
             body: remediation_runbook_document(),
         });
-        let mut audit = FakeAuditWriter::default();
         let mut signer = FakeSigner;
 
-        let output = CreateCatalogRunbookJob::execute(
-            &mut repo,
-            &mut audit,
-            &mut signer,
-            catalog_runbook_input(),
-        )
-        .unwrap();
+        let output =
+            CreateCatalogRunbookJob::execute(&mut repo, &mut signer, catalog_runbook_input())
+                .unwrap();
 
         assert_eq!(repo.atomic_save_count, 1);
         assert_eq!(repo.saved_assignments.len(), 1);
@@ -9144,8 +9623,7 @@ mod tests {
         );
         assert!(output.envelopes[0].signature.is_some());
         assert!(
-            audit
-                .events
+            repo.catalog_creation_audits
                 .iter()
                 .all(|event| !plain_audit_value(event).contains("tasks:"))
         );
@@ -9166,15 +9644,10 @@ mod tests {
             document,
             body: remediation_runbook_document(),
         });
-        let mut audit = FakeAuditWriter::default();
         let mut signer = FakeSigner;
 
-        let result = CreateCatalogRunbookJob::execute(
-            &mut repo,
-            &mut audit,
-            &mut signer,
-            catalog_runbook_input(),
-        );
+        let result =
+            CreateCatalogRunbookJob::execute(&mut repo, &mut signer, catalog_runbook_input());
 
         assert!(matches!(
             result,
@@ -9183,7 +9656,7 @@ mod tests {
         assert_eq!(repo.saved_count, 0);
         assert!(repo.saved_assignments.is_empty());
         assert!(repo.approval_requests.is_empty());
-        assert!(audit.events.is_empty());
+        assert!(repo.catalog_creation_audits.is_empty());
     }
 
     #[test]
@@ -9219,22 +9692,18 @@ mod tests {
         stale_input.checksum =
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned();
 
-        let mut audit = FakeAuditWriter::default();
         let mut signer = FakeSigner;
         let unready = CreateCatalogRunbookJob::execute(
             &mut unready_repo,
-            &mut audit,
             &mut signer,
             catalog_runbook_input(),
         );
         let missing = CreateCatalogRunbookJob::execute(
             &mut missing_repo,
-            &mut audit,
             &mut signer,
             catalog_runbook_input(),
         );
-        let stale =
-            CreateCatalogRunbookJob::execute(&mut stale_repo, &mut audit, &mut signer, stale_input);
+        let stale = CreateCatalogRunbookJob::execute(&mut stale_repo, &mut signer, stale_input);
 
         assert!(matches!(
             unready,
@@ -9253,7 +9722,11 @@ mod tests {
             assert!(repo.saved_assignments.is_empty());
             assert!(repo.approval_requests.is_empty());
         }
-        assert!(audit.events.is_empty());
+        assert!(
+            [&unready_repo, &missing_repo, &stale_repo]
+                .iter()
+                .all(|repo| repo.catalog_creation_audits.is_empty())
+        );
     }
 
     #[test]
@@ -10734,6 +11207,8 @@ spec:
 
     fn catalog_runbook_input() -> CreateCatalogRunbookJobInput {
         CreateCatalogRunbookJobInput {
+            strategy: CatalogJobCreationStrategy::default(),
+            target_selection: CatalogJobTargetSelection::ExplicitIds,
             source_id: "catalog-main".to_owned(),
             commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             path: "runbooks/nginx-basic.yaml".to_owned(),
@@ -10749,6 +11224,18 @@ spec:
             approval_request_id: "approval-catalog-runbook".to_owned(),
             approval_expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
         }
+    }
+
+    fn catalog_creation_repository() -> FakeCommandJobRepository {
+        let mut repo = FakeCommandJobRepository::default();
+        let (source, revision, document) = ready_active_catalog_runbook();
+        repo.catalog_sources.push(source);
+        repo.catalog_revisions.push(revision);
+        repo.catalog_documents.push(CatalogDocumentRecord {
+            document,
+            body: remediation_runbook_document(),
+        });
+        repo
     }
 
     fn ready_active_catalog_runbook() -> (CatalogSource, CatalogRevision, CatalogDocument) {
@@ -10856,6 +11343,11 @@ spec:
         catalog_revisions: Vec<CatalogRevision>,
         catalog_documents: Vec<CatalogDocumentRecord>,
         catalog_sync_operations: Vec<CatalogSyncOperation>,
+        catalog_creation_audits: Vec<AuditEvent>,
+        catalog_creation_calls: usize,
+        catalog_creation_outcome: Option<CatalogRunbookJobCreationOutcome>,
+        catalog_creation_strategy: Option<CatalogJobCreationStrategy>,
+        catalog_creation_selector: Option<CatalogJobSelectorSnapshot>,
     }
 
     impl TaskAssignmentRepository for FakeCommandJobRepository {
@@ -10952,6 +11444,35 @@ spec:
                 provenance.checksum().to_owned(),
             ));
             self.save_runbook_job_with_assignments(job, task, assignments)
+        }
+    }
+
+    impl CatalogRunbookJobCreationRepository for FakeCommandJobRepository {
+        fn commit_catalog_runbook_job(
+            &mut self,
+            creation: CatalogRunbookJobCreation<'_>,
+        ) -> Result<CatalogRunbookJobCreationOutcome, Self::Error> {
+            self.catalog_creation_calls += 1;
+            let outcome = self
+                .catalog_creation_outcome
+                .unwrap_or(CatalogRunbookJobCreationOutcome::Saved);
+            if outcome != CatalogRunbookJobCreationOutcome::Saved {
+                return Ok(outcome);
+            }
+            self.save_catalog_runbook_job_with_assignments(
+                creation.job.clone(),
+                creation.task,
+                creation.provenance,
+                creation.assignments,
+            )?;
+            if let Some(approval) = creation.approval_request {
+                self.approval_requests.push(approval.clone());
+            }
+            self.catalog_creation_audits
+                .extend_from_slice(creation.audit_events);
+            self.catalog_creation_strategy = Some(*creation.strategy);
+            self.catalog_creation_selector = Some(creation.selector_snapshot.clone());
+            Ok(outcome)
         }
     }
 
